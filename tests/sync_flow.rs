@@ -1036,3 +1036,32 @@ async fn chunking_skips_ignored_local_only_files() {
     let bytes = std::fs::read(test.dir.path().join("grande.log")).unwrap();
     assert_eq!(bytes, vec![3u8; 200], "ignorado não pode ser convertido em manifest");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn sweep_conversion_raises_refresh_so_mount_sees_new_chunked_file() {
+    use drive_sync::fs::GitDriveFS;
+
+    let test = init_repo();
+    commit_file(&test.repo, "seed.txt", b"x", "seed");
+    let repo_path = test.dir.path().to_str().unwrap();
+    let sync = mgr(repo_path, "main", Some(("Alice", "a@x.com")));
+    sync.set_chunking(64, 32);
+
+    // Mount ativo ANTES do arquivo grande chegar por fora do FUSE
+    let mut fs = GitDriveFS::new(repo_path, "main".to_string(), sync.clone()).expect("fs");
+    assert_eq!(fs.find_inode("externo.bin"), None);
+
+    let payload = vec![8u8; 150];
+    std::fs::write(test.dir.path().join("externo.bin"), &payload).unwrap();
+    sync.queue_write("gatilho.txt", b"x".to_vec());
+    wait_flush().await;
+
+    // A conversão da varredura criou um path novo no HEAD que o índice do
+    // mount não conhece — o drain precisa levantar o refresh flag.
+    fs.refresh_if_needed();
+    let ino = fs
+        .find_inode("externo.bin")
+        .expect("arquivo convertido deve aparecer no mount após o refresh");
+    assert_eq!(fs.apply_getattr(ino).unwrap().size, 150, "tamanho real, não do manifest");
+    assert_eq!(fs.apply_read(ino, 0, 200).unwrap(), payload);
+}

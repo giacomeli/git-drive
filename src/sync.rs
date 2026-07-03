@@ -554,9 +554,11 @@ impl DrainCtx {
         // do FUSE. Invariante: nenhum blob acima do limiar é stageado. O GC
         // remove chunks que nenhum manifest do working tree referencia mais.
         let chunk_threshold = self.chunk_threshold_bytes.load(Ordering::SeqCst);
+        let mut converted = 0usize;
         if chunk_threshold > 0 {
             let chunk_size = self.chunk_size_bytes.load(Ordering::SeqCst).max(1);
-            convert_oversized_worktree_files(&self.repo_path, chunk_threshold, chunk_size);
+            converted =
+                convert_oversized_worktree_files(&self.repo_path, chunk_threshold, chunk_size);
             gc_orphan_chunks(&self.repo_path);
         }
         let commit_oid = commit_batch(
@@ -569,6 +571,15 @@ impl DrainCtx {
         let mut pushed: Option<bool> = None;
         if let Some(_oid) = commit_oid {
             self.commit_generation.fetch_add(1, Ordering::SeqCst);
+            // Conversão da varredura cria paths novos no HEAD que o índice do
+            // FUSE pode não conhecer (arquivo chegou por fora do mount) — sem
+            // o refresh, o arquivo ficaria invisível no drive até um pull real
+            // (incidente da migração do zip, 03-07-2026). Flag DEPOIS do
+            // commit: rebuild antes dele leria o HEAD antigo e consumiria a
+            // flag à toa.
+            if converted > 0 {
+                self.refresh_flag.store(true, Ordering::SeqCst);
+            }
             if let Some(ref remote) = self.remote_name {
                 let ok = push_batch(&self.repo_path, &self.branch, remote, &self.remote_token);
                 if ok {
@@ -897,14 +908,15 @@ fn build_commit_message(ops: &[&SyncOp]) -> String {
 /// Varre o working tree e converte em manifest + chunks todo arquivo regular
 /// acima de `threshold` que não seja ignorado nem já manifest. Pula `.git`
 /// (em qualquer nível) e `.chunks`. Streaming: RAM limitada a um chunk.
-fn convert_oversized_worktree_files(repo_path: &Path, threshold: u64, chunk_size: u64) {
+fn convert_oversized_worktree_files(repo_path: &Path, threshold: u64, chunk_size: u64) -> usize {
     let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[{}] chunk: erro ao abrir repo: {}", log_ts(), e);
-            return;
+            return 0;
         }
     };
+    let mut converted = 0usize;
     for (full, rel) in walk_worktree_files(repo_path) {
         let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
         if !meta.is_file() || meta.len() <= threshold {
@@ -918,16 +930,20 @@ fn convert_oversized_worktree_files(repo_path: &Path, threshold: u64, chunk_size
             continue;
         }
         match convert_file_to_chunks(repo_path, &full, chunk_size) {
-            Ok(manifest) => println!(
-                "[{}] chunk: {} -> {} chunk(s) de até {} bytes",
-                log_ts(),
-                rel,
-                manifest.hashes.len(),
-                chunk_size
-            ),
+            Ok(manifest) => {
+                converted += 1;
+                println!(
+                    "[{}] chunk: {} -> {} chunk(s) de até {} bytes",
+                    log_ts(),
+                    rel,
+                    manifest.hashes.len(),
+                    chunk_size
+                );
+            }
             Err(e) => eprintln!("[{}] chunk: erro ao converter {}: {}", log_ts(), rel, e),
         }
     }
+    converted
 }
 
 /// Converte um arquivo bruto em chunks + manifest (substitui o arquivo pelo
