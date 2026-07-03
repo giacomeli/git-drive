@@ -19,6 +19,9 @@ pub enum SyncOp {
     Mkdir { path: String },
     Rmdir { path: String },
     Rename { from: String, to: String },
+    /// Criação de symlink com alvo opaco (texto). Barreira na fila, como as
+    /// demais ops não-Write — nunca coalesce.
+    Symlink { path: String, target: String },
 }
 
 impl SyncOp {
@@ -29,6 +32,7 @@ impl SyncOp {
             SyncOp::Mkdir { path } => path,
             SyncOp::Rmdir { path } => path,
             SyncOp::Rename { to, .. } => to,
+            SyncOp::Symlink { path, .. } => path,
         }
     }
 }
@@ -393,6 +397,13 @@ impl SyncManager {
         });
     }
 
+    pub fn queue_symlink(&self, path: &str, target: &str) {
+        self.enqueue(SyncOp::Symlink {
+            path: path.to_string(),
+            target: target.to_string(),
+        });
+    }
+
     fn enqueue(&self, op: SyncOp) {
         if op_touches_ephemeral(&op) {
             return;
@@ -599,6 +610,25 @@ fn apply_op_to_disk(repo_path: &Path, op: &SyncOp) {
                     log_ts(),
                     from,
                     to,
+                    e
+                ),
+            }
+        }
+        SyncOp::Symlink { path, target } => {
+            let full = repo_path.join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            // symlink(2) falha com EEXIST se o path existe — remover antes
+            // reproduz a semântica da fila (o estado final é o symlink).
+            let _ = std::fs::remove_file(&full);
+            match std::os::unix::fs::symlink(target, &full) {
+                Ok(_) => println!("[{}] disk: symlink {} -> {}", log_ts(), path, target),
+                Err(e) => eprintln!(
+                    "[{}] disk: erro ao criar symlink {} -> {}: {}",
+                    log_ts(),
+                    path,
+                    target,
                     e
                 ),
             }
@@ -828,7 +858,7 @@ fn is_textedit_scratch_path(path: &str) -> bool {
 
 fn op_touches_ephemeral(op: &SyncOp) -> bool {
     match op {
-        SyncOp::Write { path, .. } | SyncOp::Mkdir { path } => {
+        SyncOp::Write { path, .. } | SyncOp::Mkdir { path } | SyncOp::Symlink { path, .. } => {
             is_fully_ephemeral_path(path) || is_textedit_scratch_path(path)
         }
         SyncOp::Delete { path } | SyncOp::Rmdir { path } => is_fully_ephemeral_path(path),
@@ -1031,6 +1061,34 @@ mod tests {
         assert_eq!(q.len(), 2);
         assert!(matches!(&q[0], SyncOp::Write { path, content }
             if path == "a.txt" && content.as_slice() == b"v2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn queue_symlink_appends_and_respects_ephemeral_filter() {
+        let m = mgr();
+        m.queue_symlink("alias.txt", "real.txt");
+        m.queue_symlink(".DS_Store", "x");
+        let snap = m.buffer_snapshot();
+        assert_eq!(snap.len(), 1, "path efêmero deve ser filtrado: {:?}", snap);
+        match &snap[0] {
+            SyncOp::Symlink { path, target } => {
+                assert_eq!(path, "alias.txt");
+                assert_eq!(target, "real.txt");
+            }
+            other => panic!("esperado Symlink, obtido {:?}", other),
+        }
+    }
+
+    #[test]
+    fn push_coalescing_symlink_is_barrier_for_write() {
+        // Write pós-symlink não pode coalescer com Write pré-symlink no mesmo
+        // path: `rm f && ln -s alvo f && echo x > f` são três estados causais.
+        let mut q = Vec::new();
+        push_coalescing(&mut q, SyncOp::Write { path: "f.txt".into(), content: b"pre".to_vec() });
+        push_coalescing(&mut q, SyncOp::Symlink { path: "f.txt".into(), target: "alvo".into() });
+        push_coalescing(&mut q, SyncOp::Write { path: "f.txt".into(), content: b"post".to_vec() });
+        assert_eq!(q.len(), 3, "Symlink deve ser barreira: {:?}", q);
+        assert!(matches!(&q[2], SyncOp::Write { content, .. } if content.as_slice() == b"post"));
     }
 
     #[test]

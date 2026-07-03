@@ -903,3 +903,118 @@ async fn mkdir_trashes_at_root_is_allowed_in_memory() {
     let (sub, _) = fs.apply_mkdir(ino, "501").unwrap();
     assert!(sub > 0);
 }
+
+// ---- Fase 2.5, Bloco B: symlinks ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn symlink_in_head_appears_with_symlink_kind() {
+    let test = init_repo();
+    commit_file(&test.repo, "real.txt", b"data", "add real");
+    common::commit_symlink(&test.repo, "alias.txt", "real.txt", "add alias");
+    let fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+
+    let ino = fs.find_inode("alias.txt").expect("alias deve estar no índice");
+    assert_eq!(fs.apply_getattr(ino).unwrap().kind, FileType::Symlink);
+    assert_eq!(fs.apply_lookup(1, "alias.txt").unwrap().kind, FileType::Symlink);
+
+    // Arquivo regular não regride
+    let rino = fs.find_inode("real.txt").unwrap();
+    assert_eq!(fs.apply_getattr(rino).unwrap().kind, FileType::RegularFile);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn apply_readlink_returns_target_text() {
+    let test = init_repo();
+    commit_file(&test.repo, "docs/real.md", b"conteudo", "add real");
+    common::commit_symlink(&test.repo, "docs/alias.md", "real.md", "add alias");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+
+    let ino = fs.find_inode("docs/alias.md").unwrap();
+    assert_eq!(fs.apply_readlink(ino).unwrap(), b"real.md".to_vec());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn apply_readlink_on_regular_file_is_einval() {
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"x", "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("a.txt").unwrap();
+    assert_eq!(fs.apply_readlink(ino), Err(libc::EINVAL));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn readdir_reports_symlink_kind() {
+    let test = init_repo();
+    commit_file(&test.repo, "real.txt", b"data", "add real");
+    common::commit_symlink(&test.repo, "alias.txt", "real.txt", "add alias");
+    let fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+
+    let entries = fs.apply_readdir(1).unwrap();
+    let alias = entries.iter().find(|(_, _, n)| n == "alias.txt").unwrap();
+    assert_eq!(alias.1, FileType::Symlink);
+    let real = entries.iter().find(|(_, _, n)| n == "real.txt").unwrap();
+    assert_eq!(real.1, FileType::RegularFile);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn symlink_kind_survives_refresh() {
+    let test = init_repo();
+    common::commit_symlink(&test.repo, "alias.txt", "alvo.txt", "add alias");
+    let sync = SyncManager::new(test.dir.path().to_str().unwrap(), 5);
+    let sync_handle = sync.clone();
+    let mut fs = GitDriveFS::new(test.dir.path().to_str().unwrap(), "main".to_string(), sync)
+        .expect("GitDriveFS::new");
+
+    let ino = fs.find_inode("alias.txt").unwrap();
+    sync_handle.raise_refresh_flag();
+    fs.refresh_if_needed();
+    assert_eq!(fs.find_inode("alias.txt"), Some(ino), "inode preservado no refresh");
+    assert_eq!(fs.apply_getattr(ino).unwrap().kind, FileType::Symlink);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn apply_symlink_creates_entry_and_enqueues_op() {
+    let test = init_repo();
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+
+    let (ino, attr) = fs.apply_symlink(1, "alias.txt", "real.txt").expect("apply_symlink");
+    assert_eq!(attr.kind, FileType::Symlink);
+    assert_eq!(attr.size, "real.txt".len() as u64);
+    assert_eq!(fs.find_inode("alias.txt"), Some(ino));
+    assert_eq!(fs.apply_readlink(ino).unwrap(), b"real.txt".to_vec());
+
+    let snap = fs.sync_snapshot_for_test();
+    assert_eq!(snap.len(), 1);
+    assert!(
+        matches!(&snap[0], drive_sync::sync::SyncOp::Symlink { path, target }
+            if path == "alias.txt" && target == "real.txt"),
+        "esperado SyncOp::Symlink, obtido {:?}",
+        snap
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn apply_symlink_duplicate_name_is_eexist() {
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"x", "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    assert_eq!(
+        fs.apply_symlink(1, "a.txt", "alvo").unwrap_err(),
+        libc::EEXIST
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn apply_unlink_of_symlink_queues_delete() {
+    let test = init_repo();
+    common::commit_symlink(&test.repo, "alias.txt", "alvo.txt", "add alias");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    assert_eq!(fs.apply_unlink(1, "alias.txt"), Ok(()));
+    assert_eq!(fs.find_inode("alias.txt"), None);
+    let snap = fs.sync_snapshot_for_test();
+    assert!(
+        matches!(&snap[..], [drive_sync::sync::SyncOp::Delete { path }] if path == "alias.txt"),
+        "esperado Delete do symlink, obtido {:?}",
+        snap
+    );
+}

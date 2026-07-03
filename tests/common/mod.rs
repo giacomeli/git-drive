@@ -70,6 +70,32 @@ pub fn commit_file(repo: &Repository, relpath: &str, content: &[u8], msg: &str) 
         .expect("commit")
 }
 
+/// Cria um symlink real no working tree e o commita (entrada 120000 na tree).
+pub fn commit_symlink(repo: &Repository, relpath: &str, target: &str, msg: &str) -> git2::Oid {
+    let workdir = repo.workdir().expect("workdir");
+    let full = workdir.join(relpath);
+    if let Some(parent) = full.parent() {
+        fs::create_dir_all(parent).expect("mkdir -p");
+    }
+    std::os::unix::fs::symlink(target, &full).expect("symlink");
+
+    let mut index = repo.index().expect("index");
+    index.add_path(Path::new(relpath)).expect("index add");
+    index.write().expect("index write");
+    let tree_id = index.write_tree().expect("write tree");
+    let tree = repo.find_tree(tree_id).expect("find tree");
+
+    let sig = Signature::now("Test User", "test@example.com").expect("signature");
+    let parent = repo
+        .head()
+        .ok()
+        .and_then(|h| h.peel_to_commit().ok());
+    let parents: Vec<&git2::Commit> = parent.as_ref().map(|c| vec![c]).unwrap_or_default();
+
+    repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
+        .expect("commit")
+}
+
 pub fn read_file(dir: &Path, relpath: &str) -> Vec<u8> {
     fs::read(dir.join(relpath)).expect("read file")
 }

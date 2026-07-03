@@ -19,10 +19,30 @@ pub fn read_file_at_commit(repo: &Repository, commit: &git2::Commit, file_path: 
     Ok(blob.content().to_vec())
 }
 
+/// Tipo de uma entrada de arquivo numa tree do Git. Symlink é um blob com
+/// filemode 120000 cujo conteúdo é o texto do alvo — sem distinguir o
+/// filemode, um symlink seria achatado em arquivo regular.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    Regular,
+    Symlink,
+}
+
+/// Entrada de arquivo listada de uma tree (blob), com path completo.
+#[derive(Debug, Clone)]
+pub struct ListedFile {
+    pub path: String,
+    pub size: u64,
+    pub kind: FileKind,
+}
+
+/// Filemode de symlink nas trees do Git (S_IFLNK).
+const FILEMODE_SYMLINK: i32 = 0o120000;
+
 pub fn list_files_at_commit(
     repo: &Repository,
     commit: &git2::Commit,
-) -> Result<Vec<(String, u64)>, Error> {
+) -> Result<Vec<ListedFile>, Error> {
     let tree = commit.tree()?;
     let mut files = Vec::new();
 
@@ -31,7 +51,16 @@ pub fn list_files_at_commit(
             if let Some(ObjectType::Blob) = entry.kind() {
                 if let Ok(obj) = entry.to_object(repo) {
                     if let Some(blob) = obj.as_blob() {
-                        files.push((format!("{}{}", root, name), blob.size() as u64));
+                        let kind = if entry.filemode() == FILEMODE_SYMLINK {
+                            FileKind::Symlink
+                        } else {
+                            FileKind::Regular
+                        };
+                        files.push(ListedFile {
+                            path: format!("{}{}", root, name),
+                            size: blob.size() as u64,
+                            kind,
+                        });
                     }
                 }
             }
@@ -462,13 +491,65 @@ mod tests {
             .unwrap();
     }
 
+    /// Cria um symlink real no working tree e o commita (entrada 120000).
+    fn commit_symlink(repo: &Repository, relpath: &str, target: &str) {
+        let workdir = repo.workdir().unwrap();
+        let full = workdir.join(relpath);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::os::unix::fs::symlink(target, &full).unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new(relpath)).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let parent_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "add symlink", &tree, &[&parent_commit])
+            .unwrap();
+    }
+
+    #[test]
+    fn list_files_at_commit_distinguishes_symlink_kind() {
+        let (_dir, repo) = init_repo_with_commit();
+        commit_file(&repo, "regular.txt", b"data");
+        commit_symlink(&repo, "link.txt", "regular.txt");
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
+        let files = list_files_at_commit(&repo, &commit).unwrap();
+
+        let regular = files.iter().find(|f| f.path == "regular.txt").unwrap();
+        let link = files.iter().find(|f| f.path == "link.txt").unwrap();
+        assert_eq!(regular.kind, FileKind::Regular);
+        assert_eq!(link.kind, FileKind::Symlink);
+        // O blob de um symlink é o texto do alvo.
+        assert_eq!(link.size, "regular.txt".len() as u64);
+    }
+
+    #[test]
+    fn list_files_at_commit_nested_symlink_kind() {
+        let (_dir, repo) = init_repo_with_commit();
+        commit_file(&repo, "docs/real.md", b"conteudo");
+        commit_symlink(&repo, "docs/alias.md", "real.md");
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
+        let files = list_files_at_commit(&repo, &commit).unwrap();
+        let link = files.iter().find(|f| f.path == "docs/alias.md").unwrap();
+        assert_eq!(link.kind, FileKind::Symlink);
+    }
+
     #[test]
     fn list_files_at_commit_flat_repo() {
         let (_dir, repo) = init_repo_with_commit();
         commit_file(&repo, "a.txt", b"aa");
         commit_file(&repo, "b.txt", b"bbb");
         let commit = repo.head().unwrap().peel_to_commit().unwrap();
-        let mut files = list_files_at_commit(&repo, &commit).unwrap();
+        let mut files: Vec<(String, u64)> = list_files_at_commit(&repo, &commit)
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.path, f.size))
+            .collect();
         files.sort();
         assert_eq!(
             files,
@@ -483,7 +564,11 @@ mod tests {
         commit_file(&repo, "foo/b.txt", b"yy");
         commit_file(&repo, "foo/bar/c.txt", b"zzz");
         let commit = repo.head().unwrap().peel_to_commit().unwrap();
-        let mut files = list_files_at_commit(&repo, &commit).unwrap();
+        let mut files: Vec<(String, u64)> = list_files_at_commit(&repo, &commit)
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.path, f.size))
+            .collect();
         files.sort();
         assert_eq!(
             files,

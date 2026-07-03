@@ -25,6 +25,8 @@ const APPLE_RENAME_EXCL: u32 = 0x4;
 type SubtreeEntries = Vec<(u64, String)>;
 const FILE_MODE: u16 = 0o644;
 const DIR_MODE: u16 = 0o755;
+/// Modo default exposto para symlinks (lrwxr-xr-x, como o macOS cria).
+const SYMLINK_MODE: u16 = 0o755;
 
 /// Cache LRU de blobs de leitura, keyed por inode. Orçamento em bytes; blob
 /// maior que o orçamento inteiro não entra (leitura serve direto do repo).
@@ -130,6 +132,9 @@ pub(crate) struct FileEntry {
     pub(crate) path: String,
     pub(crate) parent: u64,
     pub(crate) size: u64,
+    /// Regular ou Symlink (filemode 120000 no Git). Para symlink, o conteúdo
+    /// do blob é o texto do alvo e o attr expõe `FileType::Symlink`.
+    pub(crate) kind: git::FileKind,
 }
 
 #[derive(Debug, Clone)]
@@ -235,7 +240,7 @@ impl GitDriveFS {
                 .insert(inode);
         }
 
-        for (file_path, size) in files {
+        for git::ListedFile { path: file_path, size, kind } in files {
             // `.gitkeep` é artefato interno da ilusão "Git não rastreia dir
             // vazio" (decisão 8 da Fase 2): não entra nos índices nem aparece
             // no readdir — sem isso, o rmdir de pasta "vazia" falhava com
@@ -256,6 +261,7 @@ impl GitDriveFS {
                 path: file_path.clone(),
                 parent: parent_inode,
                 size,
+                kind,
             };
             files_by_inode.insert(inode, entry);
             inodes_by_path.insert(file_path, inode);
@@ -308,13 +314,18 @@ impl GitDriveFS {
     }
 
     fn file_attr_for(&self, ino: u64, size: u64) -> FileAttr {
+        let (ftype, default_mode) = match self.files_by_inode.get(&ino).map(|f| f.kind) {
+            Some(git::FileKind::Symlink) => (FileType::Symlink, SYMLINK_MODE),
+            _ => (FileType::RegularFile, FILE_MODE),
+        };
         file_attr(
             ino,
             size,
-            self.perm_for(ino, FILE_MODE),
+            self.perm_for(ino, default_mode),
             self.uid,
             self.gid,
             self.time_for(ino),
+            ftype,
         )
     }
 
@@ -523,6 +534,17 @@ impl GitDriveFS {
         Ok(out)
     }
 
+    /// Alvo de um symlink (conteúdo do blob = texto do alvo). EINVAL para
+    /// arquivo regular, ENOENT para inode desconhecido.
+    pub fn apply_readlink(&mut self, ino: u64) -> Result<Vec<u8>, i32> {
+        match self.files_by_inode.get(&ino) {
+            Some(f) if f.kind == git::FileKind::Symlink => {}
+            Some(_) => return Err(libc::EINVAL),
+            None => return Err(libc::ENOENT),
+        }
+        self.apply_read(ino, 0, usize::MAX)
+    }
+
     /// Flush de um inode: enfileira o buffer no sync APENAS se houve escrita
     /// desde o último flush (dirty). Retorna o path enfileirado, ou `None` se
     /// não havia nada a fazer (ex.: close de fd aberto só para leitura).
@@ -599,6 +621,7 @@ impl GitDriveFS {
             path: full_path.clone(),
             parent,
             size: 0,
+            kind: git::FileKind::Regular,
         };
         self.files_by_inode.insert(inode, entry);
         self.inodes_by_path.insert(full_path.clone(), inode);
@@ -615,6 +638,58 @@ impl GitDriveFS {
         self.write_buffers.lock().insert(inode, Vec::new());
 
         Ok((inode, self.file_attr_for(inode, 0)))
+    }
+
+    /// Cria um symlink `parent/name -> target`. O alvo é texto opaco (nunca
+    /// resolvido pelo drive-sync); o blob commitado é o próprio texto.
+    pub fn apply_symlink(
+        &mut self,
+        parent: u64,
+        name: &str,
+        target: &str,
+    ) -> Result<(u64, FileAttr), i32> {
+        if !self.dirs_by_inode.contains_key(&parent) {
+            if self.files_by_inode.contains_key(&parent) {
+                return Err(libc::ENOTDIR);
+            }
+            return Err(libc::ENOENT);
+        }
+        if self.child_exists(parent, name) {
+            return Err(libc::EEXIST);
+        }
+
+        let parent_path = self.dirs_by_inode.get(&parent).unwrap().path.clone();
+        let full_path = if parent_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", parent_path, name)
+        };
+
+        let inode = self.alloc_inode();
+        let entry = FileEntry {
+            inode,
+            path: full_path.clone(),
+            parent,
+            size: target.len() as u64,
+            kind: git::FileKind::Symlink,
+        };
+        self.files_by_inode.insert(inode, entry);
+        self.inodes_by_path.insert(full_path.clone(), inode);
+        self.dirs_by_inode
+            .get_mut(&parent)
+            .unwrap()
+            .children
+            .insert(inode);
+
+        // Buffer (não-dirty) com o texto do alvo: readlink funciona antes do
+        // commit — o path ainda não existe no HEAD.
+        self.write_buffers
+            .lock()
+            .insert(inode, target.as_bytes().to_vec());
+        self.sync.queue_symlink(&full_path, target);
+        self.touch(inode);
+
+        Ok((inode, self.file_attr_for(inode, target.len() as u64)))
     }
 
     pub fn apply_unlink(&mut self, parent: u64, name: &str) -> Result<(), i32> {
@@ -784,7 +859,7 @@ impl GitDriveFS {
                 .insert(inode);
         }
 
-        for (file_path, size) in files {
+        for git::ListedFile { path: file_path, size, kind } in files {
             // Mesma regra da ingestão inicial: `.gitkeep` fica fora dos índices.
             if leaf_name(&file_path) == ".gitkeep" {
                 continue;
@@ -800,6 +875,7 @@ impl GitDriveFS {
                 path: file_path.clone(),
                 parent: parent_inode,
                 size,
+                kind,
             };
             files_by_inode.insert(inode, entry);
             inodes_by_path.insert(file_path, inode);
@@ -1306,7 +1382,11 @@ impl GitDriveFS {
             .iter()
             .filter_map(|child| {
                 if let Some(f) = self.files_by_inode.get(child) {
-                    Some((*child, FileType::RegularFile, leaf_name(&f.path).to_string()))
+                    let ftype = match f.kind {
+                        git::FileKind::Symlink => FileType::Symlink,
+                        git::FileKind::Regular => FileType::RegularFile,
+                    };
+                    Some((*child, ftype, leaf_name(&f.path).to_string()))
                 } else {
                     self.dirs_by_inode
                         .get(child)
@@ -1520,12 +1600,18 @@ impl Filesystem for GitDriveFS {
             format!("{}/{}", parent_path, newname_str)
         };
 
+        let src_kind = self
+            .files_by_inode
+            .get(&ino)
+            .map(|f| f.kind)
+            .unwrap_or(git::FileKind::Regular);
         let new_inode = self.alloc_inode();
         let entry = FileEntry {
             inode: new_inode,
             path: full_path.clone(),
             parent: newparent,
             size,
+            kind: src_kind,
         };
         self.files_by_inode.insert(new_inode, entry);
         self.inodes_by_path.insert(full_path.clone(), new_inode);
@@ -1744,7 +1830,9 @@ impl Filesystem for GitDriveFS {
                 for (i, (child_ino, kind, name)) in entries.iter().enumerate().skip(start) {
                     let attr = match kind {
                         FileType::Directory => self.dir_attr_for(*child_ino),
-                        FileType::RegularFile => {
+                        // RegularFile e Symlink: o kind correto sai do índice
+                        // dentro de `file_attr_for`.
+                        _ => {
                             let size = self
                                 .files_by_inode
                                 .get(child_ino)
@@ -1752,7 +1840,6 @@ impl Filesystem for GitDriveFS {
                                 .unwrap_or(0);
                             self.file_attr_for(*child_ino, size)
                         }
-                        _ => self.file_attr_for(*child_ino, 0),
                     };
                     let full = reply.add(
                         *child_ino,
@@ -1994,9 +2081,49 @@ impl Filesystem for GitDriveFS {
             Err(code) => reply.error(code),
         }
     }
+
+    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        match self.apply_readlink(ino) {
+            Ok(target) => reply.data(&target),
+            Err(code) => reply.error(code),
+        }
+    }
+
+    fn symlink(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        link_name: &OsStr,
+        target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        let (Some(name), Some(target_str)) = (link_name.to_str(), target.to_str()) else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        println!(
+            "[{}] SYMLINK parent={} name={:?} -> {:?}",
+            log_ts(),
+            parent,
+            name,
+            target_str
+        );
+        match self.apply_symlink(parent, name, target_str) {
+            Ok((_, attr)) => reply.entry(&TTL, &attr, 0),
+            Err(code) => reply.error(code),
+        }
+    }
 }
 
-fn file_attr(ino: u64, size: u64, perm: u16, uid: u32, gid: u32, time: SystemTime) -> FileAttr {
+fn file_attr(
+    ino: u64,
+    size: u64,
+    perm: u16,
+    uid: u32,
+    gid: u32,
+    time: SystemTime,
+    kind: FileType,
+) -> FileAttr {
     FileAttr {
         ino,
         size,
@@ -2006,7 +2133,7 @@ fn file_attr(ino: u64, size: u64, perm: u16, uid: u32, gid: u32, time: SystemTim
         mtime: time,
         ctime: time,
         crtime: time,
-        kind: FileType::RegularFile,
+        kind,
         perm,
         nlink: 1,
         uid,

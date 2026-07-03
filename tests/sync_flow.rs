@@ -721,3 +721,55 @@ async fn drain_now_with_empty_queue_is_noop() {
     let head_after = test.repo.head().unwrap().peel_to_commit().unwrap().id();
     assert_eq!(head_before, head_after);
 }
+
+// ---- Fase 2.5, Bloco B: symlinks no drain e no commit ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn sync_flow_symlink_materializes_and_commits_as_120000() {
+    let test = init_repo();
+    commit_file(&test.repo, "real.txt", b"data", "add real");
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    sync.queue_symlink("alias.txt", "real.txt");
+    wait_flush().await;
+
+    let link_path = test.dir.path().join("alias.txt");
+    let meta = std::fs::symlink_metadata(&link_path).expect("symlink deve existir no disco");
+    assert!(meta.file_type().is_symlink(), "deve ser symlink real no working tree");
+    assert_eq!(
+        std::fs::read_link(&link_path).unwrap(),
+        std::path::PathBuf::from("real.txt")
+    );
+
+    let head = test.repo.head().unwrap().peel_to_commit().unwrap();
+    let tree = head.tree().unwrap();
+    let entry = tree.get_path(std::path::Path::new("alias.txt")).unwrap();
+    assert_eq!(entry.filemode(), 0o120000, "entrada da tree deve ser symlink (120000)");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn symlink_roundtrip_created_in_fs_read_back_by_new_mount() {
+    use drive_sync::fs::GitDriveFS;
+    use fuser::FileType;
+
+    let test = init_repo();
+    commit_file(&test.repo, "real.txt", b"data", "add real");
+    let repo_path = test.dir.path().to_str().unwrap();
+    let sync = mgr(repo_path, "main", Some(("Alice", "a@x.com")));
+    let mut fs = GitDriveFS::new(repo_path, "main".to_string(), sync).expect("fs");
+
+    let (ino, attr) = fs.apply_symlink(1, "alias.txt", "real.txt").expect("apply_symlink");
+    assert_eq!(attr.kind, FileType::Symlink);
+    assert_eq!(fs.apply_readlink(ino).unwrap(), b"real.txt".to_vec());
+    wait_flush().await;
+
+    // Novo mount lê o symlink de volta do HEAD
+    let sync2 = mgr(repo_path, "main", Some(("Alice", "a@x.com")));
+    let mut fs2 = GitDriveFS::new(repo_path, "main".to_string(), sync2).expect("fs2");
+    let ino2 = fs2.find_inode("alias.txt").expect("alias no índice do novo mount");
+    assert_eq!(fs2.apply_getattr(ino2).unwrap().kind, FileType::Symlink);
+    assert_eq!(fs2.apply_readlink(ino2).unwrap(), b"real.txt".to_vec());
+}
