@@ -167,10 +167,34 @@ pub fn push_to_remote(
             git2::Cred::default()
         }
     });
+    // git2 retorna Ok no nível de transporte mesmo quando o servidor REJEITA a
+    // atualização do ref (ex.: GH001 do GitHub para blob > 100 MB) — a rejeição
+    // só chega pelo callback push_update_reference. Sem coletá-la, o drain
+    // logava "push ok" com o remote parado e o retry de reconciliação nunca
+    // disparava (incidente da validação de 03-07-2026).
+    let rejections: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let rejections_cb = rejections.clone();
+    callbacks.push_update_reference(move |refname, status| {
+        if let Some(msg) = status {
+            rejections_cb
+                .borrow_mut()
+                .push(format!("{}: {}", refname, msg));
+        }
+        Ok(())
+    });
     let mut push_opts = git2::PushOptions::new();
     push_opts.remote_callbacks(callbacks);
     let refspec = format!("refs/heads/{0}:refs/heads/{0}", branch);
-    remote.push(&[&refspec], Some(&mut push_opts))
+    remote.push(&[&refspec], Some(&mut push_opts))?;
+    let rejections = rejections.borrow();
+    if !rejections.is_empty() {
+        return Err(Error::from_str(&format!(
+            "push rejeitado pelo remote: {}",
+            rejections.join("; ")
+        )));
+    }
+    Ok(())
 }
 
 /// Faz `git fetch` do remote indicado (apenas o branch requerido). Reutiliza
@@ -1129,6 +1153,41 @@ mod tests {
         commit_file_at(&repo, "docs/a.md", b"x", 1_620_000_000);
         let times = commit_times_by_path(&repo, 100).unwrap();
         assert_eq!(times.get("docs/a.md"), Some(&epoch(1_620_000_000)));
+    }
+
+    #[test]
+    fn push_to_remote_detects_server_side_ref_rejection() {
+        // Reproduz o GH001 do GitHub (arquivo > 100 MB): o servidor aceita a
+        // conexão mas rejeita a atualização do REF. git2 retorna Ok no nível
+        // de transporte — a rejeição só aparece no callback
+        // push_update_reference. Sem tratá-lo, o drive logava "push ok" com o
+        // remote parado (incidente da validação de 03-07-2026).
+        let (_dir, repo, bare) = setup_local_with_bare_remote();
+        commit_file(&repo, "novo.txt", b"x");
+        let branch = current_branch_name(&repo).unwrap();
+
+        // Lock no ref do bare: a atualização do ref falha server-side.
+        let lock = bare
+            .path()
+            .join(format!("refs/heads/{}.lock", branch));
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        std::fs::write(&lock, b"").unwrap();
+
+        let result = push_to_remote(&repo, &branch, "origin", None);
+        assert!(
+            result.is_err(),
+            "push com ref rejeitado pelo servidor deve retornar Err"
+        );
+
+        // E o remote de fato não avançou.
+        let bare_repo = Repository::open(bare.path()).unwrap();
+        let bare_head = bare_repo
+            .find_reference(&format!("refs/heads/{}", branch))
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        let local_head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_ne!(bare_head.id(), local_head.id(), "ref remoto não pode ter avançado");
     }
 
     #[test]
