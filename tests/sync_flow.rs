@@ -852,3 +852,187 @@ async fn spooled_write_drains_and_commits_correct_content() {
         "arquivo spooled deve ser commitado normalmente"
     );
 }
+
+// ---- Fase 2.6: chunking no drain (conversão, varredura pré-commit, GC) ----
+
+use drive_sync::chunk::{shard_rel_path, Manifest};
+
+/// Nenhum blob BRUTO acima do limite na tree do HEAD — manifests são isentos
+/// (em escala de teste o manifest pode exceder o limiar minúsculo; em produção
+/// ele é ordens de grandeza menor que o limiar).
+fn tree_has_no_blob_above(repo: &Repository, limit: u64) -> bool {
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    let tree = head.tree().unwrap();
+    let mut ok = true;
+    tree.walk(git2::TreeWalkMode::PreOrder, |_, entry| {
+        if entry.kind() == Some(git2::ObjectType::Blob) {
+            if let Ok(obj) = entry.to_object(repo) {
+                if let Some(blob) = obj.as_blob() {
+                    if blob.size() as u64 > limit && !Manifest::is_manifest_bytes(blob.content()) {
+                        ok = false;
+                    }
+                }
+            }
+        }
+        git2::TreeWalkResult::Ok
+    })
+    .unwrap();
+    ok
+}
+
+fn read_manifest_at(dir: &std::path::Path, rel: &str) -> Manifest {
+    let bytes = std::fs::read(dir.join(rel)).expect("manifest deve existir no working tree");
+    assert!(
+        Manifest::is_manifest_bytes(&bytes),
+        "arquivo deveria ser manifest, obtido: {:?}...",
+        &bytes[..bytes.len().min(40)]
+    );
+    Manifest::parse(&bytes).expect("manifest parseável")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn chunked_write_commits_manifest_and_chunks() {
+    let test = init_repo();
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    sync.set_chunking(64, 32); // limiar 64 bytes, chunks de 32 (teste)
+
+    let payload: Vec<u8> = (0..200u8).collect();
+    sync.queue_write("grande.bin", payload.clone());
+    wait_flush().await;
+
+    // Working tree: manifest no path, chunks íntegros em .chunks/
+    let manifest = read_manifest_at(test.dir.path(), "grande.bin");
+    assert_eq!(manifest.total_size, 200);
+    assert_eq!(manifest.hashes.len(), 7); // ceil(200/32)
+    let mut reassembled = Vec::new();
+    for h in &manifest.hashes {
+        reassembled.extend_from_slice(&std::fs::read(test.dir.path().join(shard_rel_path(h))).unwrap());
+    }
+    assert_eq!(reassembled, payload, "chunks remontados devem reproduzir o original");
+
+    // Commit: manifest + chunks na tree, nenhum blob acima do limiar
+    let head = test.repo.head().unwrap().peel_to_commit().unwrap();
+    let tree = head.tree().unwrap();
+    assert!(tree.get_path(std::path::Path::new("grande.bin")).is_ok());
+    assert!(
+        tree.get_path(&shard_rel_path(&manifest.hashes[0])).is_ok(),
+        "chunks devem estar commitados"
+    );
+    assert!(
+        tree_has_no_blob_above(&test.repo, 64),
+        "nenhum blob acima do limiar pode ser stageado"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn precommit_sweep_converts_raw_file_written_outside_fuse() {
+    let test = init_repo();
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    sync.set_chunking(64, 32);
+
+    // Arquivo grande chega ao working tree por FORA da fila (caso do zip do
+    // incidente): a varredura pré-commit deve convertê-lo mesmo assim.
+    let payload = vec![9u8; 150];
+    std::fs::write(test.dir.path().join("externo.bin"), &payload).unwrap();
+    sync.queue_write("gatilho.txt", b"pequeno".to_vec());
+    wait_flush().await;
+
+    let manifest = read_manifest_at(test.dir.path(), "externo.bin");
+    assert_eq!(manifest.total_size, 150);
+    assert!(tree_has_no_blob_above(&test.repo, 64));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn chunked_update_and_delete_gc_orphan_chunks() {
+    let test = init_repo();
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    sync.set_chunking(64, 32);
+
+    sync.queue_write("dado.bin", vec![1u8; 100]);
+    wait_flush().await;
+    let old = read_manifest_at(test.dir.path(), "dado.bin");
+
+    // Update: conteúdo novo -> manifest novo, chunks antigos órfãos somem
+    sync.queue_write("dado.bin", vec![2u8; 100]);
+    wait_flush().await;
+    let new = read_manifest_at(test.dir.path(), "dado.bin");
+    assert_ne!(old.hashes, new.hashes);
+    for h in &old.hashes {
+        assert!(
+            !test.dir.path().join(shard_rel_path(h)).exists(),
+            "chunk órfão do manifest antigo deve ser removido do working tree"
+        );
+    }
+    for h in &new.hashes {
+        assert!(test.dir.path().join(shard_rel_path(h)).exists());
+    }
+
+    // Delete: manifest e chunks somem
+    sync.queue_delete("dado.bin");
+    wait_flush().await;
+    assert!(!test.dir.path().join("dado.bin").exists());
+    for h in &new.hashes {
+        assert!(!test.dir.path().join(shard_rel_path(h)).exists());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn shared_chunk_survives_delete_of_one_referencing_file() {
+    let test = init_repo();
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    sync.set_chunking(64, 32);
+
+    let payload = vec![5u8; 100];
+    sync.queue_write("a.bin", payload.clone());
+    sync.queue_write("b.bin", payload.clone());
+    wait_flush().await;
+
+    let ma = read_manifest_at(test.dir.path(), "a.bin");
+    let mb = read_manifest_at(test.dir.path(), "b.bin");
+    assert_eq!(ma.hashes, mb.hashes, "conteúdo idêntico compartilha chunks (dedup)");
+
+    sync.queue_delete("a.bin");
+    wait_flush().await;
+    for h in &mb.hashes {
+        assert!(
+            test.dir.path().join(shard_rel_path(h)).exists(),
+            "chunk ainda referenciado por b.bin não pode ser coletado"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn chunking_skips_ignored_local_only_files() {
+    let test = init_repo();
+    commit_file(&test.repo, ".gitignore", b"*.log\n", "gitignore");
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    sync.set_chunking(64, 32);
+
+    // Local-only grande fica INTACTO (não é commitado, chunkar quebraria a leitura)
+    std::fs::write(test.dir.path().join("grande.log"), vec![3u8; 200]).unwrap();
+    sync.queue_write("gatilho.txt", b"x".to_vec());
+    wait_flush().await;
+
+    let bytes = std::fs::read(test.dir.path().join("grande.log")).unwrap();
+    assert_eq!(bytes, vec![3u8; 200], "ignorado não pode ser convertido em manifest");
+}

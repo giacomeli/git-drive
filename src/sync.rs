@@ -95,6 +95,11 @@ pub struct SyncManager {
     status: Arc<StatusState>,
     /// Notificações macOS (nasce desligado; o modo mount real habilita).
     notifier: Arc<Notifier>,
+    /// Limiar em bytes para conversão em manifest + chunks no commit
+    /// (0 = chunking desligado). Setter pós-construção, como o status file.
+    chunk_threshold_bytes: Arc<AtomicU64>,
+    /// Tamanho de cada chunk, em bytes.
+    chunk_size_bytes: Arc<AtomicU64>,
 }
 
 struct Inner {
@@ -188,6 +193,8 @@ impl SyncManager {
             repo_lock: Arc::new(Mutex::new(())),
             status,
             notifier: Arc::new(Notifier::new()),
+            chunk_threshold_bytes: Arc::new(AtomicU64::new(95 * 1024 * 1024)),
+            chunk_size_bytes: Arc::new(AtomicU64::new(80 * 1024 * 1024)),
         };
 
         manager.spawn_watcher();
@@ -220,6 +227,16 @@ impl SyncManager {
         self.status.enable_file(path);
     }
 
+    /// Configura o chunking de arquivos grandes (Fase 2.6). `threshold_bytes`
+    /// 0 desativa. Setter pós-construção para não estender a assinatura já
+    /// extensa de `new_full_with_pull`.
+    pub fn set_chunking(&self, threshold_bytes: u64, chunk_size_bytes: u64) {
+        self.chunk_threshold_bytes
+            .store(threshold_bytes, Ordering::SeqCst);
+        self.chunk_size_bytes
+            .store(chunk_size_bytes.max(1), Ordering::SeqCst);
+    }
+
     /// Snapshot dos campos compartilhados do ciclo de drain.
     fn drain_ctx(&self) -> DrainCtx {
         DrainCtx {
@@ -235,6 +252,8 @@ impl SyncManager {
             repo_lock: self.repo_lock.clone(),
             status: self.status.clone(),
             notifier: self.notifier.clone(),
+            chunk_threshold_bytes: self.chunk_threshold_bytes.clone(),
+            chunk_size_bytes: self.chunk_size_bytes.clone(),
         }
     }
 
@@ -516,6 +535,8 @@ struct DrainCtx {
     repo_lock: Arc<Mutex<()>>,
     status: Arc<StatusState>,
     notifier: Arc<Notifier>,
+    chunk_threshold_bytes: Arc<AtomicU64>,
+    chunk_size_bytes: Arc<AtomicU64>,
 }
 
 impl DrainCtx {
@@ -527,6 +548,16 @@ impl DrainCtx {
         let ops: Vec<&SyncOp> = changes.iter().collect();
         for op in &ops {
             apply_op_to_disk(&self.repo_path, op);
+        }
+        // Chunking (Fase 2.6): a varredura converte QUALQUER arquivo bruto
+        // acima do limiar — dos ops recém-aplicados aos que chegaram por fora
+        // do FUSE. Invariante: nenhum blob acima do limiar é stageado. O GC
+        // remove chunks que nenhum manifest do working tree referencia mais.
+        let chunk_threshold = self.chunk_threshold_bytes.load(Ordering::SeqCst);
+        if chunk_threshold > 0 {
+            let chunk_size = self.chunk_size_bytes.load(Ordering::SeqCst).max(1);
+            convert_oversized_worktree_files(&self.repo_path, chunk_threshold, chunk_size);
+            gc_orphan_chunks(&self.repo_path);
         }
         let commit_oid = commit_batch(
             &self.repo_path,
@@ -861,6 +892,158 @@ fn build_commit_message(ops: &[&SyncOp]) -> String {
         String::new()
     };
     format!("drive-sync: {} changes ({}{})", n, preview.join(", "), more)
+}
+
+/// Varre o working tree e converte em manifest + chunks todo arquivo regular
+/// acima de `threshold` que não seja ignorado nem já manifest. Pula `.git`
+/// (em qualquer nível) e `.chunks`. Streaming: RAM limitada a um chunk.
+fn convert_oversized_worktree_files(repo_path: &Path, threshold: u64, chunk_size: u64) {
+    let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[{}] chunk: erro ao abrir repo: {}", log_ts(), e);
+            return;
+        }
+    };
+    for (full, rel) in walk_worktree_files(repo_path) {
+        let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
+        if !meta.is_file() || meta.len() <= threshold {
+            continue;
+        }
+        // Ignorados são local-only: nunca commitam, chunkar quebraria a leitura.
+        if repo.is_path_ignored(&rel).unwrap_or(false) {
+            continue;
+        }
+        if file_starts_with_manifest_magic(&full) {
+            continue;
+        }
+        match convert_file_to_chunks(repo_path, &full, chunk_size) {
+            Ok(manifest) => println!(
+                "[{}] chunk: {} -> {} chunk(s) de até {} bytes",
+                log_ts(),
+                rel,
+                manifest.hashes.len(),
+                chunk_size
+            ),
+            Err(e) => eprintln!("[{}] chunk: erro ao converter {}: {}", log_ts(), rel, e),
+        }
+    }
+}
+
+/// Converte um arquivo bruto em chunks + manifest (substitui o arquivo pelo
+/// manifest via temp + rename).
+fn convert_file_to_chunks(
+    repo_root: &Path,
+    full: &Path,
+    chunk_size: u64,
+) -> std::io::Result<crate::chunk::Manifest> {
+    let mut reader = std::fs::File::open(full)?;
+    let manifest = crate::chunk::chunk_reader_into_repo(&mut reader, chunk_size, repo_root)?;
+    let tmp = full.with_extension("drive-sync-manifest.tmp");
+    std::fs::write(&tmp, manifest.serialize())?;
+    std::fs::rename(&tmp, full)?;
+    Ok(manifest)
+}
+
+/// Remove de `.chunks/` os arquivos que nenhum manifest do working tree
+/// referencia. Barato quando não há chunks (early return).
+fn gc_orphan_chunks(repo_path: &Path) {
+    let chunks_root = repo_path.join(crate::chunk::CHUNKS_DIR);
+    let existing: Vec<std::path::PathBuf> = walk_dir_files(&chunks_root);
+    if existing.is_empty() {
+        return;
+    }
+    let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (full, _) in walk_worktree_files(repo_path) {
+        let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
+        if !meta.is_file() || meta.len() > crate::chunk::MANIFEST_MAX_BYTES {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&full) else { continue };
+        if crate::chunk::Manifest::is_manifest_bytes(&bytes) {
+            if let Ok(m) = crate::chunk::Manifest::parse(&bytes) {
+                referenced.extend(m.hashes);
+            }
+        }
+    }
+    for chunk_file in existing {
+        let name = chunk_file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !referenced.contains(&name) {
+            match std::fs::remove_file(&chunk_file) {
+                Ok(_) => println!("[{}] chunk: gc removeu órfão {}", log_ts(), name),
+                Err(e) => eprintln!("[{}] chunk: gc falhou em {}: {}", log_ts(), name, e),
+            }
+            // Shard vazio some junto (best-effort).
+            if let Some(parent) = chunk_file.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+    }
+}
+
+/// Arquivos do working tree como (path completo, path relativo), pulando
+/// `.git` em qualquer nível e `.chunks` na raiz. Não segue symlinks.
+fn walk_worktree_files(repo_path: &Path) -> Vec<(std::path::PathBuf, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![repo_path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let full = entry.path();
+            let name = entry.file_name();
+            if name == ".git" {
+                continue;
+            }
+            if dir == repo_path && name == crate::chunk::CHUNKS_DIR {
+                continue;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
+            if meta.is_dir() {
+                stack.push(full);
+            } else if meta.is_file() {
+                let rel = full
+                    .strip_prefix(repo_path)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                out.push((full, rel));
+            }
+        }
+    }
+    out
+}
+
+/// Arquivos (recursivo) sob um diretório. Vazio se o diretório não existe.
+fn walk_dir_files(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
+            if meta.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// `true` se o arquivo começa com a magic line de manifest (leitura de poucos
+/// bytes, sem carregar o arquivo).
+fn file_starts_with_manifest_magic(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 64];
+    let Ok(n) = f.read(&mut buf) else { return false };
+    crate::chunk::Manifest::is_manifest_bytes(&buf[..n])
 }
 
 /// Paths que o macOS gera como ruído e que nunca devem vazar pro working tree/commit.

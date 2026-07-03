@@ -231,6 +231,12 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
         config.pull_interval_secs,
     );
     let sync_handle = sync.clone();
+    // Chunking de arquivos grandes (Fase 2.6): nenhum blob acima do limiar
+    // chega ao commit — vira manifest + .chunks/.
+    sync.set_chunking(
+        config.chunk_threshold_mb * 1024 * 1024,
+        config.chunk_size_mb * 1024 * 1024,
+    );
     // Status observável (lido por `drive-sync status` e pela tray)
     sync.enable_status_file(status_file);
     sync.status_state().set_runtime_info(
