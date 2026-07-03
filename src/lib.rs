@@ -1,6 +1,7 @@
 pub mod config;
 pub mod fs;
 pub mod git;
+pub mod paths;
 pub mod status;
 pub mod sync;
 
@@ -65,8 +66,11 @@ fn filename_ts() -> String {
 ///
 /// `println!` em macOS passa a usar buffer de bloco quando stdout não é tty,
 /// então a gente desativa o buffer do handle de escrita imediatamente.
-pub fn redirect_io_to_log_file(verbose: bool) -> std::io::Result<std::path::PathBuf> {
-    let dir = std::path::PathBuf::from("logs");
+pub fn redirect_io_to_log_file(
+    verbose: bool,
+    log_dir: &std::path::Path,
+) -> std::io::Result<std::path::PathBuf> {
+    let dir = log_dir.to_path_buf();
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("drive-sync-{}.log", filename_ts()));
 

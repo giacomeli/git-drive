@@ -180,6 +180,39 @@ impl SyncManager {
         self.status.enable_file(path);
     }
 
+    /// Snapshot dos campos compartilhados do ciclo de drain.
+    fn drain_ctx(&self) -> DrainCtx {
+        DrainCtx {
+            inner: self.inner.clone(),
+            repo_path: self.repo_path.clone(),
+            branch: self.branch.clone(),
+            user_name: self.user_name.clone(),
+            user_email: self.user_email.clone(),
+            remote_name: self.remote_name.clone(),
+            remote_token: self.remote_token.clone(),
+            refresh_flag: self.refresh_flag.clone(),
+            commit_generation: self.commit_generation.clone(),
+            repo_lock: self.repo_lock.clone(),
+            status: self.status.clone(),
+        }
+    }
+
+    /// Drena a fila AGORA, de forma síncrona (aplica + commita + push, sob o
+    /// `repo_lock`). Usado no shutdown limpo: depois do unmount, garante que
+    /// nenhuma op enfileirada se perca com a morte do processo.
+    pub fn drain_now(&self) {
+        let changes = { std::mem::take(&mut self.inner.lock().buffer) };
+        if changes.is_empty() {
+            return;
+        }
+        println!(
+            "[{}] drain_now: drenando {} op(s) pendentes no shutdown",
+            log_ts(),
+            changes.len()
+        );
+        self.drain_ctx().run(changes);
+    }
+
     /// Acesso ao estado observável (snapshot para testes/CLI embutido).
     pub fn status_state(&self) -> Arc<StatusState> {
         self.status.clone()
@@ -365,17 +398,7 @@ impl SyncManager {
     fn spawn_watcher(&self) {
         let debounce_secs = self.debounce_secs;
         let notify = self.notify.clone();
-        let inner = self.inner.clone();
-        let repo_path = self.repo_path.clone();
-        let branch = self.branch.clone();
-        let user_name = self.user_name.clone();
-        let user_email = self.user_email.clone();
-        let remote_name = self.remote_name.clone();
-        let remote_token = self.remote_token.clone();
-        let refresh_flag = self.refresh_flag.clone();
-        let commit_generation = self.commit_generation.clone();
-        let repo_lock = self.repo_lock.clone();
-        let status = self.status.clone();
+        let ctx = Arc::new(self.drain_ctx());
 
         task::spawn(async move {
             loop {
@@ -385,7 +408,7 @@ impl SyncManager {
                     sleep(Duration::from_secs(debounce_secs)).await;
 
                     let drained = {
-                        let mut inner = inner.lock();
+                        let mut inner = ctx.inner.lock();
                         let should_drain = inner
                             .last_op
                             .map(|l| l.elapsed() >= Duration::from_secs(debounce_secs))
@@ -400,58 +423,79 @@ impl SyncManager {
 
                     if let Some(changes) = drained {
                         println!("[{}] drain: sincronizando alterações", log_ts());
-                        // Serializa o ciclo inteiro (apply + commit + push +
-                        // reconcile) com o pull watcher (RF4). Sem .await no
-                        // escopo do guard.
-                        let _repo_guard = repo_lock.lock();
-                        // Aplicação na ordem de chegada — a fila já é causal.
-                        let ops: Vec<&SyncOp> = changes.iter().collect();
-                        for op in &ops {
-                            apply_op_to_disk(&repo_path, op);
-                        }
-                        let commit_oid = commit_batch(
-                            &repo_path,
-                            &branch,
-                            &user_name,
-                            &user_email,
-                            &ops,
-                        );
-                        let mut pushed: Option<bool> = None;
-                        if let Some(_oid) = commit_oid {
-                            commit_generation.fetch_add(1, Ordering::SeqCst);
-                            if let Some(ref remote) = remote_name {
-                                let ok = push_batch(&repo_path, &branch, remote, &remote_token);
-                                if ok {
-                                    pushed = Some(true);
-                                } else {
-                                    let recovered = reconcile_and_retry_push(
-                                        &repo_path,
-                                        &branch,
-                                        remote,
-                                        &remote_token,
-                                        &user_name,
-                                        &user_email,
-                                        &status,
-                                    );
-                                    pushed = Some(recovered);
-                                    if recovered {
-                                        refresh_flag.store(true, Ordering::SeqCst);
-                                    }
-                                }
-                            }
-                        }
-                        let pending = inner.lock().buffer.len();
-                        status.record_drain(
-                            ops.len(),
-                            commit_oid.map(|o| o.to_string()),
-                            pushed,
-                            pending,
-                        );
+                        ctx.run(changes);
                         break;
                     }
                 }
             }
         });
+    }
+}
+
+/// Contexto compartilhado do ciclo de drain — o watcher de debounce e o
+/// `drain_now` do shutdown executam exatamente o mesmo corpo.
+struct DrainCtx {
+    inner: Arc<Mutex<Inner>>,
+    repo_path: PathBuf,
+    branch: String,
+    user_name: Option<String>,
+    user_email: Option<String>,
+    remote_name: Option<String>,
+    remote_token: Option<String>,
+    refresh_flag: Arc<AtomicBool>,
+    commit_generation: Arc<AtomicU64>,
+    repo_lock: Arc<Mutex<()>>,
+    status: Arc<StatusState>,
+}
+
+impl DrainCtx {
+    fn run(&self, changes: Vec<SyncOp>) {
+        // Serializa o ciclo inteiro (apply + commit + push + reconcile) com o
+        // pull watcher (RF4 da Fase 0). Sem .await no escopo do guard.
+        let _repo_guard = self.repo_lock.lock();
+        // Aplicação na ordem de chegada — a fila já é causal.
+        let ops: Vec<&SyncOp> = changes.iter().collect();
+        for op in &ops {
+            apply_op_to_disk(&self.repo_path, op);
+        }
+        let commit_oid = commit_batch(
+            &self.repo_path,
+            &self.branch,
+            &self.user_name,
+            &self.user_email,
+            &ops,
+        );
+        let mut pushed: Option<bool> = None;
+        if let Some(_oid) = commit_oid {
+            self.commit_generation.fetch_add(1, Ordering::SeqCst);
+            if let Some(ref remote) = self.remote_name {
+                let ok = push_batch(&self.repo_path, &self.branch, remote, &self.remote_token);
+                if ok {
+                    pushed = Some(true);
+                } else {
+                    let recovered = reconcile_and_retry_push(
+                        &self.repo_path,
+                        &self.branch,
+                        remote,
+                        &self.remote_token,
+                        &self.user_name,
+                        &self.user_email,
+                        &self.status,
+                    );
+                    pushed = Some(recovered);
+                    if recovered {
+                        self.refresh_flag.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+        let pending = self.inner.lock().buffer.len();
+        self.status.record_drain(
+            ops.len(),
+            commit_oid.map(|o| o.to_string()),
+            pushed,
+            pending,
+        );
     }
 }
 

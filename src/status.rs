@@ -14,8 +14,17 @@ pub struct SyncStatus {
     pub pid: u32,
     pub repo: String,
     pub branch: String,
+    /// Ponto de montagem do volume (para "Abrir no Finder" na tray).
+    #[serde(default)]
+    pub mount: String,
+    /// Log da sessão corrente (para o tail em tempo real na tray).
+    #[serde(default)]
+    pub log_file: String,
     pub started_at: u64,
     pub updated_at: u64,
+    /// Preenchido na parada limpa (SIGTERM/eject com drain final).
+    #[serde(default)]
+    pub stopped_at: Option<u64>,
     pub pending_ops: usize,
     pub last_drain: Option<DrainInfo>,
     pub last_pull: Option<PullInfo>,
@@ -75,6 +84,8 @@ impl StatusState {
         s.branch = branch.to_string();
         s.started_at = now;
         s.updated_at = now;
+        // Sessão nova invalida a parada da anterior (mesmo arquivo de status).
+        s.stopped_at = None;
         let snapshot = s.clone();
         drop(s);
         self.persist(&snapshot);
@@ -84,6 +95,27 @@ impl StatusState {
     pub fn enable_file(&self, path: PathBuf) {
         *self.file.lock() = Some(path);
         let snapshot = self.inner.lock().clone();
+        self.persist(&snapshot);
+    }
+
+    /// Informa mount point e log da sessão (consumidos pela tray/status).
+    pub fn set_runtime_info(&self, mount: &str, log_file: &str) {
+        let mut s = self.inner.lock();
+        s.mount = mount.to_string();
+        s.log_file = log_file.to_string();
+        let snapshot = s.clone();
+        drop(s);
+        self.persist(&snapshot);
+    }
+
+    /// Parada limpa do daemon (pós-unmount + drain final).
+    pub fn record_stopped(&self) {
+        let now = now_unix();
+        let mut s = self.inner.lock();
+        s.updated_at = now;
+        s.stopped_at = Some(now);
+        let snapshot = s.clone();
+        drop(s);
         self.persist(&snapshot);
     }
 
@@ -204,10 +236,14 @@ pub fn format_status(s: &SyncStatus, now: u64, alive: Option<bool>) -> String {
     let mut out = String::new();
     out.push_str(&format!("drive-sync — branch {}\n", s.branch));
     out.push_str(&format!("  repo: {}\n", s.repo));
-    let daemon_line = match alive {
-        Some(true) => format!("rodando (pid {})", s.pid),
-        Some(false) => format!("POSSIVELMENTE PARADO (pid {} não responde)", s.pid),
-        None => "desconhecido".to_string(),
+    let daemon_line = if let Some(stopped) = s.stopped_at {
+        format!("encerrado de forma limpa {}", format_ago(now, stopped))
+    } else {
+        match alive {
+            Some(true) => format!("rodando (pid {})", s.pid),
+            Some(false) => format!("POSSIVELMENTE PARADO (pid {} não responde)", s.pid),
+            None => "desconhecido".to_string(),
+        }
     };
     out.push_str(&format!("  daemon: {}\n", daemon_line));
     out.push_str(&format!(
@@ -280,6 +316,7 @@ mod tests {
                 outcome: "sem novidades".into(),
             }),
             conflicts: vec![],
+            ..Default::default()
         }
     }
 

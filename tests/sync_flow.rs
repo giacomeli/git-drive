@@ -681,3 +681,43 @@ async fn status_file_records_pull_outcome() {
     let pull = status.last_pull.expect("pull deve ter sido registrado");
     assert_eq!(pull.outcome, "sem novidades");
 }
+
+// ---- Fase 2 RF2: drain_now no shutdown ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn drain_now_flushes_pending_ops_without_waiting_debounce() {
+    // Shutdown limpo: ops enfileiradas viram commit imediatamente, sem esperar
+    // o debounce (que aqui é alto de propósito).
+    let test = init_repo();
+    let sync = SyncManager::new_with_identity(
+        test.dir.path().to_str().unwrap(),
+        "main".to_string(),
+        3600, // debounce de 1h — o watcher nunca dispararia no teste
+        Some("Alice".to_string()),
+        Some("a@x.com".to_string()),
+    );
+    sync.queue_write("pendente.txt", b"nao pode se perder".to_vec());
+    sync.queue_mkdir("dir-pendente");
+
+    sync.drain_now();
+
+    assert!(!sync.has_pending_ops(), "fila deve estar vazia após drain_now");
+    assert_eq!(read_file(test.dir.path(), "pendente.txt"), b"nao pode se perder");
+    assert!(file_exists(test.dir.path(), "dir-pendente/.gitkeep"));
+    let head = test.repo.head().unwrap().peel_to_commit().unwrap();
+    assert!(head.message().unwrap().contains("2 changes"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn drain_now_with_empty_queue_is_noop() {
+    let test = init_repo();
+    let head_before = test.repo.head().unwrap().peel_to_commit().unwrap().id();
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    sync.drain_now();
+    let head_after = test.repo.head().unwrap().peel_to_commit().unwrap().id();
+    assert_eq!(head_before, head_after);
+}

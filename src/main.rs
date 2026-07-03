@@ -1,4 +1,4 @@
-use clap::{Arg, Command};
+use clap::{Arg, ArgMatches, Command};
 use drive_sync::config::Config;
 use drive_sync::fs::GitDriveFS;
 use drive_sync::git;
@@ -6,9 +6,10 @@ use drive_sync::log_ts;
 use drive_sync::sync::SyncManager;
 use fuser::MountOption;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// Instala um panic hook que loga o backtrace completo antes do unwind chegar
-/// no boundary do `fuser::mount2` e matar o processo. Sem isso, panics em
+/// no boundary da sessão FUSE e matar o processo. Sem isso, panics em
 /// callbacks FUSE só imprimem `panicked at ...` sem stack — inviabilizando
 /// localizar a origem do `Instant + Duration` overflow que mata o daemon
 /// durante paste de muitos arquivos no Finder.
@@ -31,9 +32,8 @@ fn install_panic_hook() {
     }));
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let matches = Command::new("drive-sync")
+fn cli() -> Command {
+    Command::new("drive-sync")
         .version("0.1.0")
         .about("Sistema de arquivos versionado com Git")
         .subcommand_negates_reqs(true)
@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
                     Arg::new("file")
                         .long("file")
                         .value_name("PATH")
-                        .help("Caminho do status.json (padrão: logs/status.json)"),
+                        .help("Caminho do status.json (padrão: ./logs/status.json, depois o padrão do macOS)"),
                 ),
         )
         .arg(
@@ -67,46 +67,82 @@ async fn main() -> anyhow::Result<()> {
             Arg::new("verbose")
                 .short('v')
                 .long("verbose")
-                .help("Espelha os logs no terminal além de gravar em logs/")
+                .help("Espelha os logs no terminal além de gravar no log dir")
                 .action(clap::ArgAction::SetTrue),
         )
-        .get_matches();
+        .arg(
+            Arg::new("config")
+                .long("config")
+                .value_name("PATH")
+                .help("Caminho do config.json (padrão: ./config.json)"),
+        )
+        .arg(
+            Arg::new("log-dir")
+                .long("log-dir")
+                .value_name("DIR")
+                .help("Diretório dos logs da sessão (padrão: ./logs)"),
+        )
+        .arg(
+            Arg::new("status-file")
+                .long("status-file")
+                .value_name("PATH")
+                .help("Onde gravar o status.json (padrão: <log-dir>/status.json)"),
+        )
+}
 
-    // Subcomando roda ANTES do redirect de I/O — a saída é para o terminal.
+/// main síncrono: subcomandos utilitários rodam sem runtime; o modo mount cria
+/// o runtime tokio explicitamente e conduz o lifecycle (mount, sinais, unmount,
+/// drain final). A tray (subcomando futuro) exige a main thread livre de
+/// runtime — este dispatch garante isso.
+fn main() -> anyhow::Result<()> {
+    let matches = cli().get_matches();
+
     if let Some(sub) = matches.subcommand_matches("status") {
-        let file = sub
-            .get_one::<String>("file")
-            .map(String::as_str)
-            .unwrap_or("logs/status.json");
-        return run_status(std::path::Path::new(file));
+        let file =
+            drive_sync::paths::resolve_status_for_read(sub.get_one::<String>("file").map(String::as_str));
+        return run_status(&file);
     }
 
+    run_mount(&matches)
+}
+
+fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     let repo_path = matches.get_one::<String>("repo").unwrap().clone();
     let mount_path = matches.get_one::<String>("mount").unwrap().clone();
     let verbose = matches.get_flag("verbose");
+    let config_path = matches
+        .get_one::<String>("config")
+        .map(String::as_str)
+        .unwrap_or("config.json")
+        .to_string();
+    let log_dir = matches
+        .get_one::<String>("log-dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("logs"));
+    let status_file = matches
+        .get_one::<String>("status-file")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| log_dir.join("status.json"));
 
     // Depois do parse dos args (pra `--help`/`--version` ainda saírem no
-    // terminal): redirecionar stdout/stderr pra `logs/drive-sync-<ts>.log`.
-    // Isso captura nossos println!/eprintln! E o output do crate `log`
-    // (fuser via env_logger) num único arquivo. Anuncia o path diretamente
-    // em `/dev/tty` pra que o usuário saiba onde olhar.
-    let log_path = drive_sync::redirect_io_to_log_file(verbose).ok();
+    // terminal): redirecionar stdout/stderr pro log da sessão. Isso captura
+    // nossos println!/eprintln! E o output do crate `log` (fuser via
+    // env_logger) num único arquivo. Anuncia o path em `/dev/tty`.
+    let log_path = drive_sync::redirect_io_to_log_file(verbose, &log_dir).ok();
     if let Some(ref path) = log_path {
         if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
             let _ = writeln!(tty, "log em: {}", path.display());
         }
     }
 
-    // Hook precisa rodar DEPOIS do redirect_io_to_log_file pra que o stderr do
-    // hook caia no arquivo de log junto do resto do output.
+    // Hook precisa rodar DEPOIS do redirect pra que o stderr caia no arquivo.
     install_panic_hook();
 
     // env_logger respeita RUST_LOG. Com RUST_LOG=fuser=debug, a gente vê o
-    // opcode cru que macFUSE envia, útil pra diagnosticar discrepâncias entre
-    // o que o kernel manda e o que a gente interpreta.
+    // opcode cru que macFUSE envia.
     env_logger::init();
 
-    let config = Config::load_from("config.json");
+    let config = Config::load_from(&config_path);
     if let Some(ref path) = log_path {
         println!("[{}] boot: log={}", log_ts(), path.display());
     }
@@ -115,7 +151,6 @@ async fn main() -> anyhow::Result<()> {
         log_ts(),
         config.write_debounce_secs
     );
-
     println!("[{}] boot: repo={}", log_ts(), repo_path);
     println!("[{}] boot: mount={}", log_ts(), mount_path);
 
@@ -124,6 +159,12 @@ async fn main() -> anyhow::Result<()> {
         git::current_branch_name(&repo)?
     };
     println!("[{}] boot: branch={}", log_ts(), branch);
+
+    // Runtime explícito: os watchers do SyncManager precisam do contexto tokio.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let _guard = runtime.enter();
 
     let sync = SyncManager::new_full_with_pull(
         &repo_path,
@@ -135,8 +176,18 @@ async fn main() -> anyhow::Result<()> {
         config.remote_token.clone(),
         config.pull_interval_secs,
     );
-    // Status observável em logs/status.json (lido por `drive-sync status`)
-    sync.enable_status_file(std::path::PathBuf::from("logs/status.json"));
+    let sync_handle = sync.clone();
+    // Status observável (lido por `drive-sync status` e pela tray)
+    sync.enable_status_file(status_file);
+    sync.status_state().set_runtime_info(
+        &mount_path,
+        log_path
+            .as_deref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+            .as_str(),
+    );
+
     let fs = GitDriveFS::new_with_cache_budget(
         &repo_path,
         branch,
@@ -163,19 +214,57 @@ async fn main() -> anyhow::Result<()> {
         options.push(MountOption::CUSTOM("noappledouble".to_string()));
         // daemon_timeout default do macFUSE é 60s. Em paste de pasta com muitas
         // sub-pastas/arquivos, o ciclo CREATE+WRITE+FLUSH+RELEASE pode exceder
-        // esse tempo se houver pressão de I/O ou se o debounce/commit/push
-        // estiver bloqueando. O kernel mata o mount quando o timeout estoura,
-        // o que vira "(error code -8062)" no Finder. 300s dá margem.
+        // esse tempo se houver pressão de I/O. 300s dá margem.
         options.push(MountOption::CUSTOM("daemon_timeout=300".to_string()));
     }
 
-    fuser::mount2(fs, &mount_path, &options)?;
+    // Sessão em background: o main vira o dono do lifecycle e conduz o
+    // shutdown ordenado (decisões 6 e 7 da Fase 2).
+    let session = fuser::spawn_mount2(fs, &mount_path, &options)?;
+    println!("[{}] boot: volume montado em {}", log_ts(), mount_path);
+
+    // Espera por SIGTERM/SIGINT (launchd/Ctrl-C) ou pelo fim externo da
+    // sessão (eject no Finder / umount).
+    let ejected = runtime.block_on(async {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate())?;
+        let mut int = signal(SignalKind::interrupt())?;
+        loop {
+            tokio::select! {
+                _ = term.recv() => {
+                    println!("[{}] shutdown: SIGTERM recebido", log_ts());
+                    return Ok::<bool, anyhow::Error>(false);
+                }
+                _ = int.recv() => {
+                    println!("[{}] shutdown: SIGINT recebido", log_ts());
+                    return Ok(false);
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    if session.guard.is_finished() {
+                        println!("[{}] shutdown: volume ejetado externamente", log_ts());
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    })?;
+
+    // Ordem do shutdown (decisão 7): unmount ANTES do drain final — o unmount
+    // força o kernel a entregar FLUSH/RELEASE de fds abertos, e essas ops
+    // entram na fila a tempo de serem drenadas.
+    if !ejected {
+        println!("[{}] shutdown: desmontando {}", log_ts(), mount_path);
+    }
+    session.join();
+    sync_handle.drain_now();
+    sync_handle.status_state().record_stopped();
+    println!("[{}] shutdown: parada limpa concluída", log_ts());
 
     Ok(())
 }
 
 /// `drive-sync status`: lê o status.json gravado pelo daemon e formata.
-fn run_status(file: &std::path::Path) -> anyhow::Result<()> {
+fn run_status(file: &Path) -> anyhow::Result<()> {
     use drive_sync::status;
     match status::read_from(file) {
         Ok(s) => {
@@ -185,7 +274,7 @@ fn run_status(file: &std::path::Path) -> anyhow::Result<()> {
         Err(e) => {
             println!("Sem status disponível ({}).", e);
             println!(
-                "Monte um repositório primeiro: drive-sync -r <repo> -m <mount> — o daemon grava logs/status.json no diretório de onde foi lançado. Use --file para apontar outro caminho."
+                "Monte um repositório primeiro: drive-sync -r <repo> -m <mount> — o daemon grava o status.json no log dir (padrão: logs/ do diretório de onde foi lançado). Use --file para apontar outro caminho."
             );
         }
     }
