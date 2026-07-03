@@ -142,6 +142,13 @@ impl SyncManager {
         self.refresh_flag.swap(false, Ordering::SeqCst)
     }
 
+    /// Sinaliza que os índices do FUSE devem ser reconstruídos no próximo
+    /// lookup/getattr/readdir. Contraparte de `take_refresh_flag`; os watchers
+    /// internos usam o mesmo mecanismo via clone do `Arc`.
+    pub fn raise_refresh_flag(&self) {
+        self.refresh_flag.store(true, Ordering::SeqCst);
+    }
+
     fn spawn_pull_watcher(&self, interval_secs: u64) {
         let inner = self.inner.clone();
         let repo_path = self.repo_path.clone();

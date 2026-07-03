@@ -288,6 +288,67 @@ impl GitDriveFS {
         }
     }
 
+    /// Garante que o inode tem buffer de escrita, inicializando-o com o
+    /// conteúdo corrente do arquivo (blob no HEAD) na primeira mutação.
+    /// Semântica POSIX: `write`/`truncate` operam sobre o conteúdo existente —
+    /// buffer nascendo vazio zerava tudo que não fosse reescrito (corrupção em
+    /// append, páginas sujas de editor e truncate).
+    fn ensure_buffer(&self, ino: u64, path: &str) {
+        if self.write_buffers.lock().contains_key(&ino) {
+            return;
+        }
+        let base = self.content_for_inode_at_path(ino, path).unwrap_or_default();
+        self.write_buffers.lock().entry(ino).or_insert(base);
+    }
+
+    /// Escrita em offset sobre o buffer do inode. Retorna bytes aceitos.
+    pub fn apply_write(&mut self, ino: u64, offset: usize, data: &[u8]) -> Result<u32, i32> {
+        let path = match self.files_by_inode.get(&ino) {
+            Some(f) => f.path.clone(),
+            None => return Err(libc::ENOENT),
+        };
+        self.ensure_buffer(ino, &path);
+        let new_len = {
+            let mut buffers = self.write_buffers.lock();
+            let buf = buffers.get_mut(&ino).expect("buffer garantido acima");
+            if buf.len() < offset + data.len() {
+                buf.resize(offset + data.len(), 0);
+            }
+            buf[offset..offset + data.len()].copy_from_slice(data);
+            buf.len() as u64
+        };
+        if let Some(f) = self.files_by_inode.get_mut(&ino) {
+            f.size = new_len;
+        }
+        Ok(data.len() as u32)
+    }
+
+    /// Truncate (setattr com `size`). Materializa a op imediatamente — um
+    /// `truncate(2)` por path pode não ser seguido de flush.
+    pub fn apply_truncate(&mut self, ino: u64, new_size: u64) -> Result<(), i32> {
+        let path = match self.files_by_inode.get(&ino) {
+            Some(f) => f.path.clone(),
+            None => return Err(libc::ENOENT),
+        };
+        self.ensure_buffer(ino, &path);
+        let data = {
+            let mut buffers = self.write_buffers.lock();
+            let buf = buffers.get_mut(&ino).expect("buffer garantido acima");
+            buf.resize(new_size as usize, 0);
+            buf.clone()
+        };
+        if let Some(f) = self.files_by_inode.get_mut(&ino) {
+            f.size = new_size;
+        }
+        self.sync.queue_write(&path, data);
+        Ok(())
+    }
+
+    /// Conteúdo corrente visível para leitura (buffer ou blob do HEAD).
+    pub fn read_content_for_test(&self, ino: u64) -> Option<Vec<u8>> {
+        self.current_file_content(ino)
+    }
+
     pub fn apply_create(
         &mut self,
         parent: u64,
@@ -460,9 +521,12 @@ impl GitDriveFS {
         dirs_sorted.sort_by_key(|p| p.matches('/').count());
 
         for dir_path in dirs_sorted {
-            let inode = *previous
+            // `unwrap_or_else` (lazy): `unwrap_or(&self.alloc_inode())` avaliava
+            // o alloc SEMPRE, vazando um inode por path existente a cada refresh.
+            let inode = previous
                 .get(&dir_path)
-                .unwrap_or(&self.alloc_inode());
+                .copied()
+                .unwrap_or_else(|| self.alloc_inode());
             let parent_path = Self::resolve_parent_path(&dir_path);
             let parent_inode = *inodes_by_path.get(&parent_path).unwrap_or(&ROOT_INODE);
             let entry = DirEntry {
@@ -481,9 +545,10 @@ impl GitDriveFS {
         }
 
         for (file_path, size) in files {
-            let inode = *previous
+            let inode = previous
                 .get(&file_path)
-                .unwrap_or(&self.alloc_inode());
+                .copied()
+                .unwrap_or_else(|| self.alloc_inode());
             let parent_path = Self::resolve_parent_path(&file_path);
             let parent_inode = *inodes_by_path.get(&parent_path).unwrap_or(&ROOT_INODE);
             let entry = FileEntry {
@@ -901,23 +966,19 @@ impl Filesystem for GitDriveFS {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let mut buffers = self.write_buffers.lock();
-        let buf = buffers.entry(ino).or_insert_with(Vec::new);
-        let offset = offset as usize;
-
-        if buf.len() < offset + data.len() {
-            buf.resize(offset + data.len(), 0);
+        match self.apply_write(ino, offset as usize, data) {
+            Ok(written) => {
+                println!(
+                    "[{}] WRITE inode={} offset={} bytes={}",
+                    log_ts(),
+                    ino,
+                    offset,
+                    data.len()
+                );
+                reply.written(written);
+            }
+            Err(code) => reply.error(code),
         }
-
-        buf[offset..offset + data.len()].copy_from_slice(data);
-        println!(
-            "[{}] WRITE inode={} offset={} bytes={}",
-            log_ts(),
-            ino,
-            offset,
-            data.len()
-        );
-        reply.written(data.len() as u32);
     }
 
     fn flush(
@@ -1000,16 +1061,9 @@ impl Filesystem for GitDriveFS {
         }
 
         if let Some(new_size) = size {
-            if let Some(entry) = self.files_by_inode.get_mut(&ino) {
-                entry.size = new_size;
-                let path = entry.path.clone();
-                let mut buffers = self.write_buffers.lock();
-                let buf = buffers.entry(ino).or_insert_with(Vec::new);
-                buf.resize(new_size as usize, 0);
-                let data = buf.clone();
-                drop(buffers);
-                self.sync.queue_write(&path, data);
-            }
+            // Erros ignorados de propósito: setattr de size em inode desconhecido
+            // mantém o comportamento anterior (segue para o reply abaixo).
+            let _ = self.apply_truncate(ino, new_size);
         }
 
         let resolved = mtime.or(atime).map(|t| match t {

@@ -442,3 +442,121 @@ async fn apply_rename_of_file_queues_write_plus_delete() {
     );
 }
 
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn refresh_preserves_next_inode_when_paths_unchanged() {
+    // Regressão RF7 (Fase 0): `refresh_if_needed` usava
+    // `previous.get(...).unwrap_or(&self.alloc_inode())`, que avalia
+    // `alloc_inode()` SEMPRE (argumento eager) — o contador de inodes saltava
+    // o total de paths a cada refresh, mesmo sem nenhuma mudança.
+    let test = init_repo();
+    commit_file(&test.repo, "foo/bar/baz.txt", b"x", "add baz");
+    commit_file(&test.repo, "a.txt", b"y", "add a");
+
+    let sync = SyncManager::new(test.dir.path().to_str().unwrap(), 5);
+    let sync_handle = sync.clone();
+    let mut fs = GitDriveFS::new(test.dir.path().to_str().unwrap(), "main".to_string(), sync)
+        .expect("GitDriveFS::new");
+
+    let ino_foo = fs.find_inode("foo").unwrap();
+    let ino_baz = fs.find_inode("foo/bar/baz.txt").unwrap();
+    let before = fs.alloc_inode_for_test();
+
+    sync_handle.raise_refresh_flag();
+    fs.refresh_if_needed();
+
+    let after = fs.alloc_inode_for_test();
+    assert_eq!(
+        after,
+        before + 1,
+        "refresh com paths inalterados não deve alocar inodes novos"
+    );
+    // Inodes existentes preservados
+    assert_eq!(fs.find_inode("foo"), Some(ino_foo));
+    assert_eq!(fs.find_inode("foo/bar/baz.txt"), Some(ino_baz));
+}
+
+// ---- Regressão RF1 (Fase 0): buffer de escrita inicializado com conteúdo corrente ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn apply_write_append_preserves_existing_content() {
+    // Antes do fix, o buffer nascia vazio e era zero-preenchido até o offset:
+    // um append (`echo x >> arquivo`) substituía o conteúdo original por zeros.
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"hello", "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("a.txt").unwrap();
+
+    let written = fs.apply_write(ino, 5, b" world").unwrap();
+    assert_eq!(written, 6);
+    assert_eq!(
+        fs.read_content_for_test(ino).as_deref(),
+        Some(b"hello world".as_slice())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn apply_write_partial_overwrite_preserves_tail() {
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"hello world", "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("a.txt").unwrap();
+
+    fs.apply_write(ino, 0, b"J").unwrap();
+    assert_eq!(
+        fs.read_content_for_test(ino).as_deref(),
+        Some(b"Jello world".as_slice())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn apply_write_updates_entry_size() {
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"hi", "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("a.txt").unwrap();
+
+    fs.apply_write(ino, 2, b" there").unwrap();
+    let attr = fs.apply_getattr(ino).unwrap();
+    assert_eq!(attr.size, 8);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn apply_truncate_smaller_preserves_prefix() {
+    // Antes do fix, truncate de arquivo sem buffer criava buffer vazio e
+    // resize(N, 0) — o conteúdo virava N bytes de zeros.
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"hello world", "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("a.txt").unwrap();
+
+    fs.apply_truncate(ino, 4).unwrap();
+    assert_eq!(
+        fs.read_content_for_test(ino).as_deref(),
+        Some(b"hell".as_slice())
+    );
+    // O truncate materializa a op imediatamente (pode não haver flush depois)
+    let ops = fs.sync_snapshot_for_test();
+    assert!(
+        ops.iter().any(|op| matches!(op,
+            drive_sync::sync::SyncOp::Write { path, content }
+                if path == "a.txt" && content.as_slice() == b"hell"
+        )),
+        "esperado Write(a.txt) truncado, obtido {:?}",
+        ops
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn apply_truncate_larger_zero_fills_suffix_only() {
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"hi", "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("a.txt").unwrap();
+
+    fs.apply_truncate(ino, 4).unwrap();
+    assert_eq!(
+        fs.read_content_for_test(ino).as_deref(),
+        Some(b"hi\0\0".as_slice())
+    );
+}
