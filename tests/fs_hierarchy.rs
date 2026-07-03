@@ -626,3 +626,93 @@ async fn rename_after_write_clears_dirty_mark() {
     fs.apply_rename(1, "a.txt", 1, "b.txt").unwrap();
     assert!(fs.apply_flush(ino).is_none());
 }
+
+// ---- Fase 1 RF1: cache de blobs e leitura sem HEAD-miss ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn apply_read_populates_cache_and_hits_on_second_read() {
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"hello", "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("a.txt").unwrap();
+
+    assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"hello");
+    assert!(fs.read_cache_contains_for_test(ino));
+    assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"hello");
+    let (hits, misses) = fs.read_cache_stats_for_test();
+    assert_eq!((hits, misses), (1, 1), "segunda leitura deve ser hit");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn apply_read_respects_offset_and_size() {
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"hello world", "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("a.txt").unwrap();
+
+    assert_eq!(fs.apply_read(ino, 6, 5).unwrap(), b"world");
+    assert_eq!(fs.apply_read(ino, 100, 5).unwrap(), b"");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn read_cache_cleared_on_refresh() {
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"hello", "add");
+    let sync = SyncManager::new(test.dir.path().to_str().unwrap(), 5);
+    let sync_handle = sync.clone();
+    let mut fs = GitDriveFS::new(test.dir.path().to_str().unwrap(), "main".to_string(), sync)
+        .expect("GitDriveFS::new");
+    let ino = fs.find_inode("a.txt").unwrap();
+
+    fs.apply_read(ino, 0, 100).unwrap();
+    assert_eq!(fs.read_cache_len_for_test(), 1);
+
+    sync_handle.raise_refresh_flag();
+    fs.refresh_if_needed();
+    assert_eq!(fs.read_cache_len_for_test(), 0, "refresh deve limpar o cache");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn read_cache_eviction_respects_budget() {
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"aaaa", "add a");
+    commit_file(&test.repo, "b.txt", b"bbbb", "add b");
+    let sync = SyncManager::new(test.dir.path().to_str().unwrap(), 5);
+    let mut fs = GitDriveFS::new_with_cache_budget(
+        test.dir.path().to_str().unwrap(),
+        "main".to_string(),
+        sync,
+        6, // cabe só um blob de 4 bytes por vez
+    )
+    .expect("GitDriveFS::new_with_cache_budget");
+    let ino_a = fs.find_inode("a.txt").unwrap();
+    let ino_b = fs.find_inode("b.txt").unwrap();
+
+    fs.apply_read(ino_a, 0, 100).unwrap();
+    fs.apply_read(ino_b, 0, 100).unwrap();
+    assert_eq!(fs.read_cache_len_for_test(), 1, "orçamento força eviction");
+    assert!(fs.read_cache_contains_for_test(ino_b));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn apply_read_after_create_returns_empty_not_eio() {
+    // Regressão do gap descoberto na Fase 1: o path recém-criado não existe no
+    // HEAD — sem o buffer vazio, read retornava EIO até o primeiro commit.
+    let test = init_repo();
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let (ino, _) = fs.apply_create(1, "novo.txt").unwrap();
+
+    assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn apply_read_after_rename_returns_content_not_eio() {
+    // Mesmo gap para rename: o path NOVO não existe no HEAD até o commit.
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"hello", "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("a.txt").unwrap();
+
+    fs.apply_rename(1, "a.txt", 1, "b.txt").unwrap();
+    assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"hello");
+}

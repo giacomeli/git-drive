@@ -17,6 +17,104 @@ const ROOT_INODE: u64 = 1;
 const FILE_MODE: u16 = 0o644;
 const DIR_MODE: u16 = 0o755;
 
+/// Cache LRU de blobs de leitura, keyed por inode. Orçamento em bytes; blob
+/// maior que o orçamento inteiro não entra (leitura serve direto do repo).
+/// Escala esperada: dezenas de entradas de um mount pessoal — eviction O(n)
+/// é invisível perto do custo de abrir o repo que cada hit evita.
+pub(crate) struct BlobCache {
+    entries: HashMap<u64, BlobCacheEntry>,
+    budget_bytes: u64,
+    total_bytes: u64,
+    tick: u64,
+    hits: u64,
+    misses: u64,
+}
+
+struct BlobCacheEntry {
+    data: Vec<u8>,
+    last_access: u64,
+}
+
+impl BlobCache {
+    pub(crate) fn new(budget_bytes: u64) -> Self {
+        BlobCache {
+            entries: HashMap::new(),
+            budget_bytes,
+            total_bytes: 0,
+            tick: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn get(&mut self, ino: u64) -> Option<&Vec<u8>> {
+        self.tick += 1;
+        let tick = self.tick;
+        match self.entries.get_mut(&ino) {
+            Some(entry) => {
+                entry.last_access = tick;
+                self.hits += 1;
+                Some(&entry.data)
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
+    fn insert(&mut self, ino: u64, data: Vec<u8>) {
+        let len = data.len() as u64;
+        if len > self.budget_bytes {
+            return;
+        }
+        self.remove(ino);
+        while self.total_bytes + len > self.budget_bytes {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.last_access)
+                .map(|(ino, _)| *ino)
+            else {
+                break;
+            };
+            self.remove(oldest);
+        }
+        self.tick += 1;
+        self.total_bytes += len;
+        self.entries.insert(
+            ino,
+            BlobCacheEntry {
+                data,
+                last_access: self.tick,
+            },
+        );
+    }
+
+    fn remove(&mut self, ino: u64) {
+        if let Some(entry) = self.entries.remove(&ino) {
+            self.total_bytes -= entry.data.len() as u64;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.total_bytes = 0;
+    }
+
+    fn contains(&self, ino: u64) -> bool {
+        self.entries.contains_key(&ino)
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn stats(&self) -> (u64, u64) {
+        (self.hits, self.misses)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct FileEntry {
     pub(crate) inode: u64,
@@ -52,6 +150,10 @@ pub struct GitDriveFS {
     /// buffers limpos (não-dirty) são descartados — o conteúdo deles já está
     /// no HEAD e mantê-los esconderia mudanças remotas futuras do `read`.
     last_commit_gen: u64,
+    /// Cache LRU de blobs para leitura. Invalidado por inteiro nos mesmos
+    /// pontos do gc de buffers (HEAD mudou); por inode em unlink/write/
+    /// truncate/rename.
+    read_cache: BlobCache,
     uid: u32,
     gid: u32,
     mode_overrides: Arc<parking_lot::Mutex<HashMap<u64, u16>>>,
@@ -60,8 +162,21 @@ pub struct GitDriveFS {
     xattrs: Arc<parking_lot::Mutex<HashMap<u64, HashMap<OsString, Vec<u8>>>>>,
 }
 
+/// Default do orçamento do cache de leitura quando o caller não especifica
+/// (espelha o default de `read_cache_mb` no config).
+const DEFAULT_READ_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
 impl GitDriveFS {
     pub fn new(repo_path: &str, branch: String, sync: SyncManager) -> anyhow::Result<Self> {
+        Self::new_with_cache_budget(repo_path, branch, sync, DEFAULT_READ_CACHE_BYTES)
+    }
+
+    pub fn new_with_cache_budget(
+        repo_path: &str,
+        branch: String,
+        sync: SyncManager,
+        read_cache_bytes: u64,
+    ) -> anyhow::Result<Self> {
         let repo = git::open_repo(repo_path)?;
         let commit = git::get_commit(&repo, "HEAD")?;
         let dirs = git::list_dirs_at_commit(&repo, &commit)?;
@@ -146,6 +261,7 @@ impl GitDriveFS {
             write_buffers: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             dirty: HashSet::new(),
             last_commit_gen: 0,
+            read_cache: BlobCache::new(read_cache_bytes),
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             mode_overrides: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -332,6 +448,9 @@ impl GitDriveFS {
             f.size = new_len;
         }
         self.dirty.insert(ino);
+        // Buffer passa a ter precedência no read; a entrada do cache só
+        // ocuparia memória (e ficaria stale após o commit).
+        self.read_cache.remove(ino);
         Ok(data.len() as u32)
     }
 
@@ -356,7 +475,36 @@ impl GitDriveFS {
         // Conteúdo do buffer acabou de ser enfileirado — inode volta a "limpo";
         // um flush subsequente sem escrita nova não deve duplicar a op.
         self.dirty.remove(&ino);
+        self.read_cache.remove(ino);
         Ok(())
+    }
+
+    /// Leitura de um intervalo do arquivo. Ordem das fontes: write buffer
+    /// (mutações pendentes), cache de blobs, blob do HEAD (miss popula o
+    /// cache). Erros do git viram EIO.
+    pub fn apply_read(&mut self, ino: u64, offset: usize, size: usize) -> Result<Vec<u8>, i32> {
+        fn slice_of(data: &[u8], offset: usize, size: usize) -> Vec<u8> {
+            let start = offset.min(data.len());
+            let end = (offset + size).min(data.len());
+            data[start..end].to_vec()
+        }
+
+        if let Some(buf) = self.write_buffers.lock().get(&ino) {
+            return Ok(slice_of(buf, offset, size));
+        }
+        let path = match self.files_by_inode.get(&ino) {
+            Some(f) => f.path.clone(),
+            None => return Err(libc::ENOENT),
+        };
+        if let Some(data) = self.read_cache.get(ino) {
+            return Ok(slice_of(data, offset, size));
+        }
+        let repo = git::open_repo(&self.repo_path).map_err(|_| libc::EIO)?;
+        let commit = git::get_commit(&repo, "HEAD").map_err(|_| libc::EIO)?;
+        let content = git::read_file_at_commit(&repo, &commit, &path).map_err(|_| libc::EIO)?;
+        let out = slice_of(&content, offset, size);
+        self.read_cache.insert(ino, content);
+        Ok(out)
     }
 
     /// Flush de um inode: enfileira o buffer no sync APENAS se houve escrita
@@ -374,11 +522,14 @@ impl GitDriveFS {
         Some(path)
     }
 
-    /// Descarta buffers de inodes sem escrita pendente (não-dirty). Buffers
-    /// dirty nunca são tocados — o conteúdo deles ainda não chegou ao sync.
+    /// Descarta buffers de inodes sem escrita pendente (não-dirty) e o cache
+    /// de blobs inteiro — os pontos de chamada significam "o HEAD mudou".
+    /// Buffers dirty nunca são tocados — o conteúdo deles ainda não chegou
+    /// ao sync.
     fn gc_clean_buffers(&mut self) {
         let dirty = &self.dirty;
         self.write_buffers.lock().retain(|ino, _| dirty.contains(ino));
+        self.read_cache.clear();
     }
 
     /// Conteúdo corrente visível para leitura (buffer ou blob do HEAD).
@@ -389,6 +540,19 @@ impl GitDriveFS {
     /// Quantidade de write buffers vivos (introspecção para testes).
     pub fn buffered_count_for_test(&self) -> usize {
         self.write_buffers.lock().len()
+    }
+
+    pub fn read_cache_contains_for_test(&self, ino: u64) -> bool {
+        self.read_cache.contains(ino)
+    }
+
+    pub fn read_cache_len_for_test(&self) -> usize {
+        self.read_cache.len()
+    }
+
+    /// (hits, misses) acumulados do cache de leitura.
+    pub fn read_cache_stats_for_test(&self) -> (u64, u64) {
+        self.read_cache.stats()
     }
 
     pub fn apply_create(
@@ -430,6 +594,9 @@ impl GitDriveFS {
 
         // Enfileirar write vazio para materializar no disco (flush posterior pode sobrescrever)
         self.sync.queue_write(&full_path, Vec::new());
+        // Buffer vazio (não-dirty) para que reads antes do commit retornem
+        // vazio em vez de EIO — o path novo ainda não existe no HEAD.
+        self.write_buffers.lock().insert(inode, Vec::new());
 
         Ok((inode, self.file_attr_for(inode, 0)))
     }
@@ -467,6 +634,7 @@ impl GitDriveFS {
             .remove(&ino);
         self.write_buffers.lock().remove(&ino);
         self.dirty.remove(&ino);
+        self.read_cache.remove(ino);
         self.sync.queue_delete(&entry.path);
         Ok(())
     }
@@ -884,6 +1052,12 @@ impl GitDriveFS {
             let content = self
                 .content_for_inode_at_path(src, &old_path)
                 .unwrap_or_default();
+            // Buffer (não-dirty) mantém o conteúdo legível até o commit: o
+            // path NOVO não existe no HEAD ainda — sem isso, read pós-rename
+            // caía no blob inexistente e retornava EIO. O gc descarta após
+            // o commit. A entrada de cache do path antigo fica stale — fora.
+            self.write_buffers.lock().insert(src, content.clone());
+            self.read_cache.remove(src);
             self.sync.queue_write(&new_path, content);
             self.sync.queue_delete(&old_path);
             // Conteúdo corrente (incluindo escritas pendentes) foi enfileirado
@@ -1704,41 +1878,9 @@ impl Filesystem for GitDriveFS {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        // Preferir write_buffer (escritas não drenadas, inclui conteúdo posicionado
-        // por exchange). Fallback no blob do HEAD.
-        if let Some(buf) = self.write_buffers.lock().get(&ino).cloned() {
-            let end = std::cmp::min(offset as usize + size as usize, buf.len());
-            let start = (offset as usize).min(buf.len());
-            reply.data(&buf[start..end]);
-            return;
-        }
-        if let Some(entry) = self.files_by_inode.get(&ino) {
-            let repo = match git::open_repo(&self.repo_path) {
-                Ok(r) => r,
-                Err(_) => {
-                    reply.error(libc::EIO);
-                    return;
-                }
-            };
-            let commit = match git::get_commit(&repo, "HEAD") {
-                Ok(c) => c,
-                Err(_) => {
-                    reply.error(libc::EIO);
-                    return;
-                }
-            };
-            let content = match git::read_file_at_commit(&repo, &commit, &entry.path) {
-                Ok(v) => v,
-                Err(_) => {
-                    reply.error(libc::EIO);
-                    return;
-                }
-            };
-            let end = std::cmp::min(offset as usize + size as usize, content.len());
-            let start = (offset as usize).min(content.len());
-            reply.data(&content[start..end]);
-        } else {
-            reply.error(libc::ENOENT);
+        match self.apply_read(ino, offset as usize, size as usize) {
+            Ok(data) => reply.data(&data),
+            Err(code) => reply.error(code),
         }
     }
 }
@@ -1806,5 +1948,66 @@ fn leaf_name(path: &str) -> &str {
     match path.rfind('/') {
         Some(i) => &path[i + 1..],
         None => path,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlobCache;
+
+    #[test]
+    fn blob_cache_counts_hits_and_misses() {
+        let mut c = BlobCache::new(100);
+        assert!(c.get(1).is_none());
+        c.insert(1, b"abc".to_vec());
+        assert_eq!(c.get(1).map(|d| d.as_slice()), Some(b"abc".as_slice()));
+        assert_eq!(c.stats(), (1, 1));
+    }
+
+    #[test]
+    fn blob_cache_evicts_lru_when_over_budget() {
+        let mut c = BlobCache::new(10);
+        c.insert(1, vec![0; 6]);
+        c.insert(2, vec![0; 4]);
+        // Acessa 1 para que 2 vire o LRU
+        assert!(c.get(1).is_some());
+        c.insert(3, vec![0; 4]);
+        assert!(c.contains(1));
+        assert!(!c.contains(2), "entrada LRU deve ter sido despejada");
+        assert!(c.contains(3));
+        assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn blob_cache_skips_blob_larger_than_budget() {
+        let mut c = BlobCache::new(4);
+        c.insert(1, vec![0; 5]);
+        assert!(!c.contains(1));
+        assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn blob_cache_clear_resets_entries() {
+        let mut c = BlobCache::new(100);
+        c.insert(1, vec![0; 10]);
+        c.insert(2, vec![0; 10]);
+        c.clear();
+        assert_eq!(c.len(), 0);
+        // Espaço liberado: reinsere sem eviction
+        c.insert(3, vec![0; 90]);
+        assert!(c.contains(3));
+    }
+
+    #[test]
+    fn blob_cache_insert_same_inode_replaces_without_double_count() {
+        let mut c = BlobCache::new(10);
+        c.insert(1, vec![0; 6]);
+        c.insert(1, vec![0; 8]);
+        assert!(c.contains(1));
+        assert_eq!(c.len(), 1);
+        // Se o total tivesse contado 6+8, este insert despejaria o inode 1
+        c.insert(2, vec![0; 2]);
+        assert!(c.contains(1));
+        assert!(c.contains(2));
     }
 }

@@ -12,12 +12,19 @@ fn default_pull_interval_secs() -> u64 {
     60
 }
 
+fn default_read_cache_mb() -> u64 {
+    64
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default = "default_write_debounce_secs")]
     pub write_debounce_secs: u64,
     #[serde(default = "default_pull_interval_secs")]
     pub pull_interval_secs: u64,
+    /// Orçamento do cache LRU de blobs de leitura, em MiB. `0` desativa.
+    #[serde(default = "default_read_cache_mb")]
+    pub read_cache_mb: u64,
     #[serde(default)]
     pub user_name: Option<String>,
     #[serde(default)]
@@ -31,6 +38,7 @@ impl Default for Config {
         Config {
             write_debounce_secs: default_write_debounce_secs(),
             pull_interval_secs: default_pull_interval_secs(),
+            read_cache_mb: default_read_cache_mb(),
             user_name: None,
             user_email: None,
             remote_token: None,
@@ -99,9 +107,17 @@ mod tests {
         let cfg = Config::load_from(&path);
         assert_eq!(cfg.write_debounce_secs, 5);
         assert_eq!(cfg.pull_interval_secs, 60);
+        assert_eq!(cfg.read_cache_mb, 64);
         assert!(cfg.user_name.is_none());
         assert!(cfg.user_email.is_none());
         assert!(cfg.remote_token.is_none());
+    }
+
+    #[test]
+    fn load_from_read_cache_mb_zero_disables() {
+        let (_dir, path) = write_config(r#"{"read_cache_mb": 0}"#);
+        let cfg = Config::load_from(&path);
+        assert_eq!(cfg.read_cache_mb, 0);
     }
 
     #[test]

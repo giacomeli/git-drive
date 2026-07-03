@@ -115,7 +115,12 @@ async fn main() -> anyhow::Result<()> {
         config.remote_token.clone(),
         config.pull_interval_secs,
     );
-    let fs = GitDriveFS::new(&repo_path, branch, sync)?;
+    let fs = GitDriveFS::new_with_cache_budget(
+        &repo_path,
+        branch,
+        sync,
+        config.read_cache_mb * 1024 * 1024,
+    )?;
 
     // Opções macFUSE-específicas:
     // - `local`: trata o volume como disco local em vez de network share. Sem
