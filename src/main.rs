@@ -47,6 +47,27 @@ fn cli() -> Command {
                         .help("Caminho do status.json (padrão: ./logs/status.json, depois o padrão do macOS)"),
                 ),
         )
+        .subcommand(
+            Command::new("install")
+                .about("Instala o LaunchAgent: monta o drive automaticamente no login")
+                .arg(
+                    Arg::new("repo")
+                        .short('r')
+                        .long("repo")
+                        .value_name("REPO_PATH")
+                        .required(true)
+                        .help("Repositório Git de armazenamento"),
+                )
+                .arg(
+                    Arg::new("mount")
+                        .short('m')
+                        .long("mount")
+                        .value_name("MOUNT_PATH")
+                        .required(true)
+                        .help("Ponto de montagem do drive"),
+                ),
+        )
+        .subcommand(Command::new("uninstall").about("Para o daemon e remove o LaunchAgent"))
         .arg(
             Arg::new("repo")
                 .short('r')
@@ -101,6 +122,15 @@ fn main() -> anyhow::Result<()> {
         let file =
             drive_sync::paths::resolve_status_for_read(sub.get_one::<String>("file").map(String::as_str));
         return run_status(&file);
+    }
+    if let Some(sub) = matches.subcommand_matches("install") {
+        return drive_sync::launchd::install(
+            sub.get_one::<String>("repo").unwrap(),
+            sub.get_one::<String>("mount").unwrap(),
+        );
+    }
+    if matches.subcommand_matches("uninstall").is_some() {
+        return drive_sync::launchd::uninstall();
     }
 
     run_mount(&matches)
@@ -218,6 +248,12 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
         options.push(MountOption::CUSTOM("daemon_timeout=300".to_string()));
     }
 
+    // Recuperação pós-crash: kill -9 (ou panic) não roda o AutoUnmount e
+    // deixa um mount FUSE zumbi que bloqueia o remount — o KeepAlive do
+    // launchd ficaria religando um daemon que falha para sempre. Detecta e
+    // força o unmount antes de montar.
+    prepare_mountpoint(&mount_path)?;
+
     // Sessão em background: o main vira o dono do lifecycle e conduz o
     // shutdown ordenado (decisões 6 e 7 da Fase 2).
     let session = fuser::spawn_mount2(fs, &mount_path, &options)?;
@@ -261,6 +297,55 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     println!("[{}] shutdown: parada limpa concluída", log_ts());
 
     Ok(())
+}
+
+/// Garante que o mountpoint existe e está livre. Se a tabela de mounts já
+/// lista o path: sonda com `read_dir` — mount zumbi (crash anterior) falha e
+/// leva `umount -f`; mount saudável significa outra instância viva e o boot
+/// aborta com erro claro em vez de brigar pelo mountpoint.
+fn prepare_mountpoint(mount: &str) -> anyhow::Result<()> {
+    std::fs::create_dir_all(mount)?;
+    let canonical = std::fs::canonicalize(mount)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| mount.to_string());
+
+    let table = std::process::Command::new("mount").output()?;
+    let needle = format!(" on {} (", canonical);
+    let listed = String::from_utf8_lossy(&table.stdout)
+        .lines()
+        .any(|l| l.contains(&needle));
+    if !listed {
+        return Ok(());
+    }
+
+    match std::fs::read_dir(&canonical) {
+        Ok(_) => anyhow::bail!(
+            "já existe um volume saudável montado em {} — pare o outro daemon ou desmonte antes",
+            canonical
+        ),
+        Err(e) => {
+            println!(
+                "[{}] boot: mount zumbi detectado em {} ({}) — forçando unmount",
+                log_ts(),
+                canonical,
+                e
+            );
+            let status = std::process::Command::new("umount")
+                .arg("-f")
+                .arg(&canonical)
+                .status()?;
+            if !status.success() {
+                anyhow::bail!(
+                    "não foi possível desmontar o mount zumbi em {} — rode `umount -f {}` manualmente",
+                    canonical,
+                    canonical
+                );
+            }
+            // Dar um instante para o kernel liberar o mountpoint.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Ok(())
+        }
+    }
 }
 
 /// `drive-sync status`: lê o status.json gravado pelo daemon e formata.

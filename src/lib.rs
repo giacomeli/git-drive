@@ -1,6 +1,7 @@
 pub mod config;
 pub mod fs;
 pub mod git;
+pub mod launchd;
 pub mod paths;
 pub mod status;
 pub mod sync;
