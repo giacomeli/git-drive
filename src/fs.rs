@@ -14,6 +14,9 @@ use crate::sync::SyncManager;
 
 const TTL: Duration = Duration::from_secs(1);
 const ROOT_INODE: u64 = 1;
+
+/// Entradas (inode, path) de uma travessia de subárvore.
+type SubtreeEntries = Vec<(u64, String)>;
 const FILE_MODE: u16 = 0o644;
 const DIR_MODE: u16 = 0o755;
 
@@ -1128,7 +1131,7 @@ impl GitDriveFS {
 
     /// Coleta a subárvore de `root_ino` (inclusive): dirs e arquivos com os
     /// paths correntes do índice. Travessia local, sem I/O.
-    fn collect_subtree(&self, root_ino: u64) -> (Vec<(u64, String)>, Vec<(u64, String)>) {
+    fn collect_subtree(&self, root_ino: u64) -> (SubtreeEntries, SubtreeEntries) {
         let mut dirs = Vec::new();
         let mut files = Vec::new();
         let mut stack = vec![root_ino];

@@ -162,8 +162,7 @@ pub fn write_atomic(path: &Path, status: &SyncStatus) -> std::io::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
     }
-    let json = serde_json::to_vec_pretty(status)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let json = serde_json::to_vec_pretty(status).map_err(std::io::Error::other)?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, path)?;
@@ -321,15 +320,17 @@ mod tests {
     fn write_atomic_and_read_roundtrip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("status.json");
-        let mut status = SyncStatus::default();
-        status.pid = 42;
-        status.branch = "main".into();
-        status.last_drain = Some(DrainInfo {
-            at: 100,
-            ops: 3,
-            commit: Some("abc123".into()),
-            pushed: Some(true),
-        });
+        let status = SyncStatus {
+            pid: 42,
+            branch: "main".into(),
+            last_drain: Some(DrainInfo {
+                at: 100,
+                ops: 3,
+                commit: Some("abc123".into()),
+                pushed: Some(true),
+            }),
+            ..Default::default()
+        };
         write_atomic(&path, &status).unwrap();
         let loaded = read_from(&path).unwrap();
         assert_eq!(loaded.pid, 42);
