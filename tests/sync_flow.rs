@@ -816,3 +816,39 @@ async fn ignored_file_stays_visible_and_out_of_commits() {
     let ino2 = fs2.find_inode("app.log").expect("visível após remount");
     assert_eq!(fs2.apply_read(ino2, 0, 100).unwrap(), b"segredo local".to_vec());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn spooled_write_drains_and_commits_correct_content() {
+    use drive_sync::fs::GitDriveFS;
+
+    let test = init_repo();
+    commit_file(&test.repo, "seed.txt", b"x", "seed");
+    let repo_path = test.dir.path().to_str().unwrap();
+    let sync = mgr(repo_path, "main", Some(("Alice", "a@x.com")));
+    let mut fs = GitDriveFS::new_with_options(
+        repo_path,
+        "main".to_string(),
+        sync,
+        64 * 1024 * 1024,
+        8, // limiar minúsculo: força o regime spooled
+    )
+    .expect("fs");
+
+    let (ino, _) = fs.apply_create(1, "video.bin").unwrap();
+    let payload: Vec<u8> = (0..1000u32).flat_map(|i| i.to_le_bytes()).collect();
+    fs.apply_write(ino, 0, &payload).unwrap();
+    fs.apply_flush(ino);
+    wait_flush().await;
+
+    assert_eq!(
+        read_file(test.dir.path(), "video.bin"),
+        payload,
+        "conteúdo spooled deve chegar íntegro ao working tree"
+    );
+    let head = test.repo.head().unwrap().peel_to_commit().unwrap();
+    let tree = head.tree().unwrap();
+    assert!(
+        tree.get_path(std::path::Path::new("video.bin")).is_ok(),
+        "arquivo spooled deve ser commitado normalmente"
+    );
+}

@@ -12,9 +12,41 @@ use crate::log_ts;
 use crate::notify::{self, Notifier, NotifyEvent};
 use crate::status::StatusState;
 
+/// Conteúdo de um `SyncOp::Write`. `Mem` compartilha o mesmo `Arc` do write
+/// buffer do inode (pico de RAM ~1x o tamanho do arquivo, não uma cópia por
+/// estágio da pipeline).
+#[derive(Debug, Clone)]
+pub enum WriteContent {
+    Mem(Arc<Vec<u8>>),
+    /// Snapshot em arquivo de spool (dentro de `.git/`, mesmo volume do
+    /// working tree): o drain aplica com `rename`, sem materializar em RAM.
+    Spooled(PathBuf),
+}
+
+impl WriteContent {
+    /// Materializa o conteúdo (cópia). Uso: testes e caminhos frios.
+    pub fn to_vec(&self) -> Vec<u8> {
+        match self {
+            WriteContent::Mem(a) => a.as_ref().clone(),
+            WriteContent::Spooled(p) => std::fs::read(p).unwrap_or_default(),
+        }
+    }
+
+    pub fn len(&self) -> u64 {
+        match self {
+            WriteContent::Mem(a) => a.len() as u64,
+            WriteContent::Spooled(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum SyncOp {
-    Write { path: String, content: Vec<u8> },
+    Write { path: String, content: WriteContent },
     Delete { path: String },
     Mkdir { path: String },
     Rmdir { path: String },
@@ -366,6 +398,12 @@ impl SyncManager {
     }
 
     pub fn queue_write(&self, path: &str, content: Vec<u8>) {
+        self.queue_write_content(path, WriteContent::Mem(Arc::new(content)));
+    }
+
+    /// Enfileira um write com conteúdo já empacotado (ex.: `Arc` compartilhado
+    /// com o write buffer do FUSE — nenhuma cópia no caminho quente).
+    pub fn queue_write_content(&self, path: &str, content: WriteContent) {
         self.enqueue(SyncOp::Write {
             path: path.to_string(),
             content,
@@ -542,7 +580,17 @@ fn apply_op_to_disk(repo_path: &Path, op: &SyncOp) {
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            match std::fs::write(&full, content) {
+            let result = match content {
+                WriteContent::Mem(data) => std::fs::write(&full, data.as_slice()),
+                // rename move o snapshot sem passar pela RAM; fallback para
+                // copy+remove se o spool estiver em outro volume.
+                WriteContent::Spooled(src) => std::fs::rename(src, &full).or_else(|_| {
+                    std::fs::copy(src, &full).map(|_| ())?;
+                    let _ = std::fs::remove_file(src);
+                    Ok(())
+                }),
+            };
+            match result {
                 Ok(_) => println!("[{}] disk: write {}", log_ts(), path),
                 Err(e) => eprintln!("[{}] disk: erro ao salvar {}: {}", log_ts(), path, e),
             }
@@ -906,6 +954,11 @@ pub(crate) fn push_coalescing(queue: &mut Vec<SyncOp>, op: SyncOp) {
         for existing in queue.iter_mut().rev() {
             if let SyncOp::Write { path: p, content: c } = existing {
                 if *p == path {
+                    // Snapshot spooled substituído nunca chegará ao drain —
+                    // remover o arquivo aqui evita acúmulo no diretório de spool.
+                    if let WriteContent::Spooled(old) = &*c {
+                        let _ = std::fs::remove_file(old);
+                    }
                     *c = content;
                     return;
                 }
@@ -932,6 +985,11 @@ mod tests {
         SyncManager::new("/tmp/ignored", 60)
     }
 
+    /// Empacota bytes em WriteContent::Mem para os testes de fila.
+    fn wc(bytes: &[u8]) -> WriteContent {
+        WriteContent::Mem(Arc::new(bytes.to_vec()))
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn queue_write_appends_to_buffer() {
         let m = mgr();
@@ -941,7 +999,7 @@ mod tests {
         match &snap[0] {
             SyncOp::Write { path, content } => {
                 assert_eq!(path, "a.txt");
-                assert_eq!(content.as_slice(), b"hello");
+                assert_eq!(content.to_vec(), b"hello");
             }
             other => panic!("esperado Write, obtido {:?}", other),
         }
@@ -955,7 +1013,7 @@ mod tests {
         let snap = m.buffer_snapshot();
         assert_eq!(snap.len(), 1);
         match &snap[0] {
-            SyncOp::Write { content, .. } => assert_eq!(content.as_slice(), b"second"),
+            SyncOp::Write { content, .. } => assert_eq!(content.to_vec(), b"second"),
             other => panic!("esperado Write, obtido {:?}", other),
         }
     }
@@ -1055,12 +1113,12 @@ mod tests {
     #[test]
     fn push_coalescing_write_over_write_same_path_replaces_in_place() {
         let mut q = Vec::new();
-        push_coalescing(&mut q, SyncOp::Write { path: "a.txt".into(), content: b"v1".to_vec() });
-        push_coalescing(&mut q, SyncOp::Write { path: "b.txt".into(), content: b"other".to_vec() });
-        push_coalescing(&mut q, SyncOp::Write { path: "a.txt".into(), content: b"v2".to_vec() });
+        push_coalescing(&mut q, SyncOp::Write { path: "a.txt".into(), content: wc(b"v1") });
+        push_coalescing(&mut q, SyncOp::Write { path: "b.txt".into(), content: wc(b"other") });
+        push_coalescing(&mut q, SyncOp::Write { path: "a.txt".into(), content: wc(b"v2") });
         assert_eq!(q.len(), 2);
         assert!(matches!(&q[0], SyncOp::Write { path, content }
-            if path == "a.txt" && content.as_slice() == b"v2"));
+            if path == "a.txt" && content.to_vec() == b"v2"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1079,16 +1137,36 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn queue_write_content_shares_arc_without_copy() {
+        // Requisito 16 da Fase 2.5: buffer e SyncOp::Write compartilham o
+        // MESMO conteúdo (Arc) — pico de RAM ~1x, não ~3x o tamanho.
+        let m = mgr();
+        let content = std::sync::Arc::new(b"conteudo grande".to_vec());
+        m.queue_write_content("a.txt", WriteContent::Mem(content.clone()));
+        let snap = m.buffer_snapshot();
+        assert_eq!(snap.len(), 1);
+        match &snap[0] {
+            SyncOp::Write { content: WriteContent::Mem(arc), .. } => {
+                assert!(
+                    std::sync::Arc::ptr_eq(arc, &content),
+                    "conteúdo deve ser compartilhado por Arc, não clonado"
+                );
+            }
+            other => panic!("esperado Write compartilhado, obtido {:?}", other),
+        }
+    }
+
     #[test]
     fn push_coalescing_symlink_is_barrier_for_write() {
         // Write pós-symlink não pode coalescer com Write pré-symlink no mesmo
         // path: `rm f && ln -s alvo f && echo x > f` são três estados causais.
         let mut q = Vec::new();
-        push_coalescing(&mut q, SyncOp::Write { path: "f.txt".into(), content: b"pre".to_vec() });
+        push_coalescing(&mut q, SyncOp::Write { path: "f.txt".into(), content: wc(b"pre") });
         push_coalescing(&mut q, SyncOp::Symlink { path: "f.txt".into(), target: "alvo".into() });
-        push_coalescing(&mut q, SyncOp::Write { path: "f.txt".into(), content: b"post".to_vec() });
+        push_coalescing(&mut q, SyncOp::Write { path: "f.txt".into(), content: wc(b"post") });
         assert_eq!(q.len(), 3, "Symlink deve ser barreira: {:?}", q);
-        assert!(matches!(&q[2], SyncOp::Write { content, .. } if content.as_slice() == b"post"));
+        assert!(matches!(&q[2], SyncOp::Write { content, .. } if content.to_vec() == b"post"));
     }
 
     #[test]
@@ -1096,20 +1174,20 @@ mod tests {
         // Write(b) não pode atravessar Rename{a->b}: o conteúdo pré e pós
         // rename são estados diferentes do path.
         let mut q = Vec::new();
-        push_coalescing(&mut q, SyncOp::Write { path: "b.txt".into(), content: b"pre".to_vec() });
+        push_coalescing(&mut q, SyncOp::Write { path: "b.txt".into(), content: wc(b"pre") });
         push_coalescing(&mut q, SyncOp::Rename { from: "a.txt".into(), to: "b.txt".into() });
-        push_coalescing(&mut q, SyncOp::Write { path: "b.txt".into(), content: b"post".to_vec() });
+        push_coalescing(&mut q, SyncOp::Write { path: "b.txt".into(), content: wc(b"post") });
         assert_eq!(q.len(), 3);
-        assert!(matches!(&q[2], SyncOp::Write { content, .. } if content.as_slice() == b"post"));
+        assert!(matches!(&q[2], SyncOp::Write { content, .. } if content.to_vec() == b"post"));
     }
 
     #[test]
     fn push_coalescing_dir_rename_is_barrier_for_nested_write() {
         // Rename de diretório é barreira para writes DENTRO dele (prefixo).
         let mut q = Vec::new();
-        push_coalescing(&mut q, SyncOp::Write { path: "d/f.txt".into(), content: b"v1".to_vec() });
+        push_coalescing(&mut q, SyncOp::Write { path: "d/f.txt".into(), content: wc(b"v1") });
         push_coalescing(&mut q, SyncOp::Rename { from: "c".into(), to: "d".into() });
-        push_coalescing(&mut q, SyncOp::Write { path: "d/f.txt".into(), content: b"v2".to_vec() });
+        push_coalescing(&mut q, SyncOp::Write { path: "d/f.txt".into(), content: wc(b"v2") });
         assert_eq!(q.len(), 3, "write pós-rename não pode coalescer com o pré-rename");
     }
 
@@ -1126,9 +1204,9 @@ mod tests {
     #[test]
     fn build_commit_message_three_paths() {
         let ops_owned = [
-            SyncOp::Write { path: "a.txt".into(), content: vec![] },
-            SyncOp::Write { path: "b.txt".into(), content: vec![] },
-            SyncOp::Write { path: "c.txt".into(), content: vec![] },
+            SyncOp::Write { path: "a.txt".into(), content: wc(b"") },
+            SyncOp::Write { path: "b.txt".into(), content: wc(b"") },
+            SyncOp::Write { path: "c.txt".into(), content: wc(b"") },
         ];
         let ops: Vec<&SyncOp> = ops_owned.iter().collect();
         let m = build_commit_message(&ops);
@@ -1141,7 +1219,7 @@ mod tests {
         let ops_owned: Vec<SyncOp> = (0..5)
             .map(|i| SyncOp::Write {
                 path: format!("f{}.txt", i),
-                content: vec![],
+                content: wc(b""),
             })
             .collect();
         let ops: Vec<&SyncOp> = ops_owned.iter().collect();

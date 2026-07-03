@@ -16,6 +16,10 @@ fn default_read_cache_mb() -> u64 {
     64
 }
 
+fn default_large_file_threshold_mb() -> u64 {
+    64
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default = "default_write_debounce_secs")]
@@ -25,6 +29,10 @@ pub struct Config {
     /// Orçamento do cache LRU de blobs de leitura, em MiB. `0` desativa.
     #[serde(default = "default_read_cache_mb")]
     pub read_cache_mb: u64,
+    /// Limiar em MiB acima do qual write buffers são mantidos em arquivo de
+    /// spool em disco (pico de RAM limitado). `0` desativa o spool.
+    #[serde(default = "default_large_file_threshold_mb")]
+    pub large_file_threshold_mb: u64,
     #[serde(default)]
     pub user_name: Option<String>,
     #[serde(default)]
@@ -39,6 +47,7 @@ impl Default for Config {
             write_debounce_secs: default_write_debounce_secs(),
             pull_interval_secs: default_pull_interval_secs(),
             read_cache_mb: default_read_cache_mb(),
+            large_file_threshold_mb: default_large_file_threshold_mb(),
             user_name: None,
             user_email: None,
             remote_token: None,
@@ -111,6 +120,20 @@ mod tests {
         assert!(cfg.user_name.is_none());
         assert!(cfg.user_email.is_none());
         assert!(cfg.remote_token.is_none());
+    }
+
+    #[test]
+    fn load_from_default_large_file_threshold_is_64() {
+        let (_dir, path) = write_config("{}");
+        let cfg = Config::load_from(&path);
+        assert_eq!(cfg.large_file_threshold_mb, 64);
+    }
+
+    #[test]
+    fn load_from_large_file_threshold_override() {
+        let (_dir, path) = write_config(r#"{"large_file_threshold_mb": 256}"#);
+        let cfg = Config::load_from(&path);
+        assert_eq!(cfg.large_file_threshold_mb, 256);
     }
 
     #[test]

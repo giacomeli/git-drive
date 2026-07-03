@@ -428,7 +428,7 @@ async fn apply_rename_of_file_queues_write_plus_delete() {
     assert!(
         ops.iter().any(|op| matches!(op,
             drive_sync::sync::SyncOp::Write { path, content }
-                if path == "b.txt" && content.as_slice() == b"hello"
+                if path == "b.txt" && content.to_vec() == b"hello"
         )),
         "esperado Write(b.txt) com conteúdo do original, obtido {:?}",
         ops
@@ -540,7 +540,7 @@ async fn apply_truncate_smaller_preserves_prefix() {
     assert!(
         ops.iter().any(|op| matches!(op,
             drive_sync::sync::SyncOp::Write { path, content }
-                if path == "a.txt" && content.as_slice() == b"hell"
+                if path == "a.txt" && content.to_vec() == b"hell"
         )),
         "esperado Write(a.txt) truncado, obtido {:?}",
         ops
@@ -590,7 +590,7 @@ async fn flush_after_write_enqueues_once() {
     assert!(
         ops.iter().any(|op| matches!(op,
             drive_sync::sync::SyncOp::Write { path, content }
-                if path == "a.txt" && content.as_slice() == b"hello world"
+                if path == "a.txt" && content.to_vec() == b"hello world"
         )),
         "esperado Write(a.txt) com conteúdo completo, obtido {:?}",
         ops
@@ -791,7 +791,7 @@ async fn dir_rename_from_ephemeral_materializes_content() {
     use drive_sync::sync::SyncOp;
     let pos_mkdir = ops.iter().position(|op| matches!(op, SyncOp::Mkdir { path } if path == "visible"));
     let pos_write = ops.iter().position(|op| matches!(op,
-        SyncOp::Write { path, content } if path == "visible/f.txt" && content.as_slice() == b"segredo"));
+        SyncOp::Write { path, content } if path == "visible/f.txt" && content.to_vec() == b"segredo"));
     assert!(pos_mkdir.is_some(), "mkdir esperado, obtido {:?}", ops);
     assert!(pos_write.is_some(), "write com conteúdo esperado, obtido {:?}", ops);
     assert!(pos_mkdir < pos_write, "mkdir deve preceder o write");
@@ -830,7 +830,7 @@ async fn file_rename_from_ephemeral_materializes_write() {
     use drive_sync::sync::SyncOp;
     assert_eq!(ops.len(), 1, "esperado só o Write, obtido {:?}", ops);
     assert!(matches!(&ops[0], SyncOp::Write { path, content }
-        if path == "real.txt" && content.as_slice() == b"data"));
+        if path == "real.txt" && content.to_vec() == b"data"));
 }
 
 // ---- Correção do parse de RENAME do macFUSE: exchange com nomes reais ----
@@ -853,9 +853,9 @@ async fn apply_exchange_swaps_contents_by_name() {
     let ops = fs.sync_snapshot_for_test();
     use drive_sync::sync::SyncOp;
     assert!(ops.iter().any(|op| matches!(op, SyncOp::Write { path, content }
-        if path == "a.txt" && content.as_slice() == b"conteudo-b")));
+        if path == "a.txt" && content.to_vec() == b"conteudo-b")));
     assert!(ops.iter().any(|op| matches!(op, SyncOp::Write { path, content }
-        if path == "b.txt" && content.as_slice() == b"conteudo-a")));
+        if path == "b.txt" && content.to_vec() == b"conteudo-a")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1161,5 +1161,154 @@ async fn mtime_derived_updates_after_refresh() {
         fs.apply_getattr(ino).unwrap().mtime,
         epoch_time(1_700_000_000),
         "path tocado pelo commit novo atualiza o mtime derivado no refresh"
+    );
+}
+
+// ---- Fase 2.5, Bloco E: conteúdo compartilhado entre buffer e fila ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn flush_shares_buffer_arc_with_queued_op() {
+    let test = init_repo();
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let (ino, _) = fs.apply_create(1, "a.txt").unwrap();
+    fs.apply_write(ino, 0, b"dados").unwrap();
+    fs.apply_flush(ino);
+
+    let buf = fs.buffer_arc_for_test(ino).expect("buffer vivo após flush");
+    let snap = fs.sync_snapshot_for_test();
+    let shared = snap.iter().any(|op| matches!(op,
+        drive_sync::sync::SyncOp::Write { content: drive_sync::sync::WriteContent::Mem(arc), .. }
+            if std::sync::Arc::ptr_eq(arc, &buf)));
+    assert!(shared, "op enfileirada deve compartilhar o Arc do buffer: {:?}", snap);
+}
+
+// ---- Fase 2.5, Bloco E: spool de write buffers grandes em disco ----
+
+fn new_fs_with_spool(repo_path: &str, threshold_bytes: u64) -> GitDriveFS {
+    let sync = SyncManager::new(repo_path, 5);
+    GitDriveFS::new_with_options(
+        repo_path,
+        "main".to_string(),
+        sync,
+        64 * 1024 * 1024,
+        threshold_bytes,
+    )
+    .expect("GitDriveFS::new_with_options")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn write_buffer_spills_to_disk_above_threshold() {
+    let test = init_repo();
+    let mut fs = new_fs_with_spool(test.dir.path().to_str().unwrap(), 8);
+
+    let (ino, _) = fs.apply_create(1, "grande.bin").unwrap();
+    fs.apply_write(ino, 0, b"0123456789ABCDEF").unwrap();
+    assert!(
+        fs.buffer_is_spooled_for_test(ino),
+        "buffer acima do limiar deve estar em disco, não em RAM"
+    );
+    assert_eq!(
+        fs.apply_read(ino, 0, 100).unwrap(),
+        b"0123456789ABCDEF".to_vec(),
+        "leitura do buffer spooled deve ser idêntica"
+    );
+    assert_eq!(fs.apply_read(ino, 4, 4).unwrap(), b"4567".to_vec());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn buffer_crossing_threshold_migrates_without_loss() {
+    let test = init_repo();
+    let mut fs = new_fs_with_spool(test.dir.path().to_str().unwrap(), 8);
+
+    let (ino, _) = fs.apply_create(1, "cresce.bin").unwrap();
+    fs.apply_write(ino, 0, b"abcd").unwrap();
+    assert!(!fs.buffer_is_spooled_for_test(ino), "abaixo do limiar fica em RAM");
+    fs.apply_write(ino, 4, b"efghijkl").unwrap();
+    assert!(fs.buffer_is_spooled_for_test(ino), "cruzou o limiar: migra para spool");
+    assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"abcdefghijkl".to_vec());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn ensure_buffer_of_large_existing_file_spools_head_copy() {
+    // Invariante da Fase 0 preservado no regime spooled: buffer de arquivo
+    // existente NUNCA nasce vazio — cópia do HEAD, agora em disco.
+    let test = init_repo();
+    commit_file(&test.repo, "big.txt", b"conteudo-original-grande", "add big");
+    let mut fs = new_fs_with_spool(test.dir.path().to_str().unwrap(), 8);
+
+    let ino = fs.find_inode("big.txt").unwrap();
+    // Escrita parcial no meio: o resto do arquivo tem que sobreviver
+    fs.apply_write(ino, 9, b"MUDADO--").unwrap();
+    assert!(fs.buffer_is_spooled_for_test(ino));
+    assert_eq!(
+        fs.apply_read(ino, 0, 100).unwrap(),
+        b"conteudo-MUDADO---grande".to_vec()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn truncate_on_spooled_buffer_sets_length() {
+    let test = init_repo();
+    let mut fs = new_fs_with_spool(test.dir.path().to_str().unwrap(), 8);
+    let (ino, _) = fs.apply_create(1, "t.bin").unwrap();
+    fs.apply_write(ino, 0, b"0123456789ABCDEF").unwrap();
+    fs.apply_truncate(ino, 4).unwrap();
+    assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"0123".to_vec());
+    assert_eq!(fs.apply_getattr(ino).unwrap().size, 4);
+}
+
+// ---- Fase 2.5, Bloco E: handle de repo persistente no caminho de leitura ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn read_miss_reuses_persistent_repo_handle() {
+    let test = init_repo();
+    commit_file(&test.repo, "big.txt", b"0123456789", "add big");
+    let sync = SyncManager::new(test.dir.path().to_str().unwrap(), 5);
+    // Cache de leitura DESATIVADO (orçamento 0): todo read é miss e cai no repo
+    let mut fs = GitDriveFS::new_with_options(
+        test.dir.path().to_str().unwrap(),
+        "main".to_string(),
+        sync,
+        0,
+        64 * 1024 * 1024,
+    )
+    .expect("fs");
+
+    let ino = fs.find_inode("big.txt").unwrap();
+    assert_eq!(fs.apply_read(ino, 0, 4).unwrap(), b"0123".to_vec());
+    assert_eq!(fs.apply_read(ino, 4, 4).unwrap(), b"4567".to_vec());
+    assert_eq!(fs.apply_read(ino, 8, 2).unwrap(), b"89".to_vec());
+    assert_eq!(
+        fs.read_repo_opens_for_test(),
+        1,
+        "o repo deve ser aberto UMA vez para N syscalls de read, não uma por syscall"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn persistent_read_handle_sees_new_head_after_refresh() {
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"versao-1", "v1");
+    let sync = SyncManager::new(test.dir.path().to_str().unwrap(), 5);
+    let sync_handle = sync.clone();
+    let mut fs = GitDriveFS::new_with_options(
+        test.dir.path().to_str().unwrap(),
+        "main".to_string(),
+        sync,
+        0,
+        64 * 1024 * 1024,
+    )
+    .expect("fs");
+
+    let ino = fs.find_inode("a.txt").unwrap();
+    assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"versao-1".to_vec());
+
+    commit_file(&test.repo, "a.txt", b"versao-2", "v2");
+    sync_handle.raise_refresh_flag();
+    fs.refresh_if_needed();
+    assert_eq!(
+        fs.apply_read(ino, 0, 100).unwrap(),
+        b"versao-2".to_vec(),
+        "handle persistente não pode servir HEAD antigo após refresh"
     );
 }

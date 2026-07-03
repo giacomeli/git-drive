@@ -126,6 +126,93 @@ impl BlobCache {
     }
 }
 
+/// Buffer de escrita por inode. Abaixo do limiar de spool vive em RAM com
+/// mutação copy-on-write (`Arc` compartilhado com a fila de sync); acima, em
+/// arquivo de spool dentro de `.git/` — pico de RAM limitado ao limiar.
+pub(crate) enum WriteBuffer {
+    Mem(Arc<Vec<u8>>),
+    Spooled(SpooledBuffer),
+}
+
+/// Arquivo de spool com acesso randômico. Removido do disco no drop (gc de
+/// buffers, unlink, shutdown).
+pub(crate) struct SpooledBuffer {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+    len: u64,
+}
+
+impl Drop for SpooledBuffer {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+impl WriteBuffer {
+    fn len(&self) -> u64 {
+        match self {
+            WriteBuffer::Mem(a) => a.len() as u64,
+            WriteBuffer::Spooled(s) => s.len,
+        }
+    }
+
+    fn read_range(&self, offset: usize, size: usize) -> Vec<u8> {
+        match self {
+            WriteBuffer::Mem(a) => {
+                let data = a.as_slice();
+                let start = offset.min(data.len());
+                let end = offset.saturating_add(size).min(data.len());
+                data[start..end].to_vec()
+            }
+            WriteBuffer::Spooled(s) => {
+                use std::os::unix::fs::FileExt;
+                let start = (offset as u64).min(s.len);
+                let end = (offset as u64).saturating_add(size as u64).min(s.len);
+                let mut out = vec![0u8; (end - start) as usize];
+                if s.file.read_exact_at(&mut out, start).is_err() {
+                    out.clear();
+                }
+                out
+            }
+        }
+    }
+
+    fn full_vec(&self) -> Vec<u8> {
+        self.read_range(0, self.len() as usize)
+    }
+
+    fn write_at(&mut self, offset: usize, data: &[u8]) {
+        match self {
+            WriteBuffer::Mem(a) => {
+                // Copy-on-write: se uma op enfileirada ainda segura este Arc,
+                // o make_mut clona antes de mutar — a op preserva o snapshot.
+                let buf = Arc::make_mut(a);
+                if buf.len() < offset + data.len() {
+                    buf.resize(offset + data.len(), 0);
+                }
+                buf[offset..offset + data.len()].copy_from_slice(data);
+            }
+            WriteBuffer::Spooled(s) => {
+                use std::os::unix::fs::FileExt;
+                // Escrita além do EOF estende com zeros (hole), a mesma
+                // semântica do resize do caminho em RAM.
+                let _ = s.file.write_all_at(data, offset as u64);
+                s.len = s.len.max((offset + data.len()) as u64);
+            }
+        }
+    }
+
+    fn set_len(&mut self, n: u64) {
+        match self {
+            WriteBuffer::Mem(a) => Arc::make_mut(a).resize(n as usize, 0),
+            WriteBuffer::Spooled(s) => {
+                let _ = s.file.set_len(n);
+                s.len = n;
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct FileEntry {
     pub(crate) inode: u64,
@@ -157,7 +244,15 @@ pub struct GitDriveFS {
     inodes_by_path: HashMap<String, u64>,
     next_inode: Arc<AtomicU64>,
     sync: SyncManager,
-    write_buffers: Arc<parking_lot::Mutex<HashMap<u64, Vec<u8>>>>,
+    /// Conteúdo corrente por inode: RAM copy-on-write (compartilhado com a
+    /// fila via `Arc`) abaixo do limiar de spool, arquivo em disco acima.
+    write_buffers: Arc<parking_lot::Mutex<HashMap<u64, WriteBuffer>>>,
+    /// Limiar em bytes para spool de buffers (0 = spool desligado).
+    spool_threshold_bytes: u64,
+    /// Diretório dos arquivos de spool (dentro de `.git/` — mesmo volume do
+    /// working tree e invisível para o commit). Limpo no boot.
+    spool_dir: std::path::PathBuf,
+    spool_counter: AtomicU64,
     /// Inodes com escrita ainda não enfileirada no sync ("dirty"). O flush só
     /// gera `SyncOp::Write` para inodes marcados — flush roda em todo close(2),
     /// inclusive de fds de leitura, e sem a marca re-enfileiraria conteúdo
@@ -171,6 +266,13 @@ pub struct GitDriveFS {
     /// pontos do gc de buffers (HEAD mudou); por inode em unlink/write/
     /// truncate/rename.
     read_cache: BlobCache,
+    /// Handle de repo reutilizado no caminho quente de leitura (miss do
+    /// cache). Sem ele, arquivo maior que o orçamento reabria o repo a CADA
+    /// syscall de read. HEAD é re-resolvido a cada uso (refs vêm do disco),
+    /// então o handle nunca serve commit velho.
+    read_repo: Option<git2::Repository>,
+    /// Contador de aberturas reais do handle (introspecção para testes).
+    read_repo_opens: u64,
     uid: u32,
     gid: u32,
     mode_overrides: Arc<parking_lot::Mutex<HashMap<u64, u16>>>,
@@ -187,6 +289,10 @@ pub struct GitDriveFS {
 /// (espelha o default de `read_cache_mb` no config).
 const DEFAULT_READ_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Default do limiar de spool de write buffers (espelha o default de
+/// `large_file_threshold_mb` no config).
+const DEFAULT_SPOOL_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+
 impl GitDriveFS {
     pub fn new(repo_path: &str, branch: String, sync: SyncManager) -> anyhow::Result<Self> {
         Self::new_with_cache_budget(repo_path, branch, sync, DEFAULT_READ_CACHE_BYTES)
@@ -197,6 +303,22 @@ impl GitDriveFS {
         branch: String,
         sync: SyncManager,
         read_cache_bytes: u64,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_options(
+            repo_path,
+            branch,
+            sync,
+            read_cache_bytes,
+            DEFAULT_SPOOL_THRESHOLD_BYTES,
+        )
+    }
+
+    pub fn new_with_options(
+        repo_path: &str,
+        branch: String,
+        sync: SyncManager,
+        read_cache_bytes: u64,
+        spool_threshold_bytes: u64,
     ) -> anyhow::Result<Self> {
         let repo = git::open_repo(repo_path)?;
         let commit = git::get_commit(&repo, "HEAD")?;
@@ -280,6 +402,11 @@ impl GitDriveFS {
                 .insert(inode);
         }
 
+        // Spool de buffers grandes: resíduos de um crash anterior são lixo.
+        let spool_dir = std::path::Path::new(repo_path).join(".git/drive-sync-spool");
+        let _ = std::fs::remove_dir_all(&spool_dir);
+        let _ = std::fs::create_dir_all(&spool_dir);
+
         let mut fs = GitDriveFS {
             repo_path: repo_path.to_string(),
             branch,
@@ -289,9 +416,14 @@ impl GitDriveFS {
             next_inode,
             sync,
             write_buffers: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            spool_threshold_bytes,
+            spool_dir,
+            spool_counter: AtomicU64::new(0),
             dirty: HashSet::new(),
             last_commit_gen: 0,
             read_cache: BlobCache::new(read_cache_bytes),
+            read_repo: None,
+            read_repo_opens: 0,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             mode_overrides: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -425,7 +557,7 @@ impl GitDriveFS {
     /// já mexeu no path em memória mas ainda precisa do conteúdo antigo.
     fn content_for_inode_at_path(&self, ino: u64, path: &str) -> Option<Vec<u8>> {
         if let Some(buf) = self.write_buffers.lock().get(&ino) {
-            return Some(buf.clone());
+            return Some(buf.full_vec());
         }
         if let Some(f) = self.files_by_inode.get(&ino) {
             if f.local_only {
@@ -465,6 +597,67 @@ impl GitDriveFS {
         }
     }
 
+    /// Cria um arquivo de spool novo com o conteúdo dado. `None` em erro de
+    /// I/O — o caller degrada para RAM.
+    fn spool_from_slice(&self, data: &[u8]) -> Option<SpooledBuffer> {
+        let n = self.spool_counter.fetch_add(1, Ordering::SeqCst);
+        let path = self.spool_dir.join(format!("buf-{}", n));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .ok()?;
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(data, 0).ok()?;
+        Some(SpooledBuffer {
+            file,
+            path,
+            len: data.len() as u64,
+        })
+    }
+
+    /// Monta um buffer novo: spooled se o conteúdo já nasce acima do limiar.
+    fn make_buffer_from_vec(&self, base: Vec<u8>) -> WriteBuffer {
+        if self.spool_threshold_bytes > 0 && base.len() as u64 >= self.spool_threshold_bytes {
+            if let Some(sb) = self.spool_from_slice(&base) {
+                return WriteBuffer::Spooled(sb);
+            }
+        }
+        WriteBuffer::Mem(Arc::new(base))
+    }
+
+    /// Migra um buffer em RAM para spool quando cruza o limiar.
+    fn maybe_spill(&self, buf: &mut WriteBuffer) {
+        if self.spool_threshold_bytes == 0 {
+            return;
+        }
+        if let WriteBuffer::Mem(a) = buf {
+            if a.len() as u64 >= self.spool_threshold_bytes {
+                if let Some(sb) = self.spool_from_slice(a) {
+                    *buf = WriteBuffer::Spooled(sb);
+                }
+            }
+        }
+    }
+
+    /// Snapshot imutável do buffer para a fila de sync. RAM: `Arc` clonado
+    /// (zero cópia). Spooled: cópia disco-a-disco para um arquivo de fila —
+    /// escritas posteriores no buffer não podem mutar o snapshot causal.
+    fn snapshot_buffer_content(&self, buf: &WriteBuffer) -> crate::sync::WriteContent {
+        match buf {
+            WriteBuffer::Mem(a) => crate::sync::WriteContent::Mem(a.clone()),
+            WriteBuffer::Spooled(s) => {
+                let n = self.spool_counter.fetch_add(1, Ordering::SeqCst);
+                let qpath = self.spool_dir.join(format!("q-{}", n));
+                match std::fs::copy(&s.path, &qpath) {
+                    Ok(_) => crate::sync::WriteContent::Spooled(qpath),
+                    Err(_) => crate::sync::WriteContent::Mem(Arc::new(buf.full_vec())),
+                }
+            }
+        }
+    }
+
     /// Garante que o inode tem buffer de escrita, inicializando-o com o
     /// conteúdo corrente do arquivo (blob no HEAD) na primeira mutação.
     /// Semântica POSIX: `write`/`truncate` operam sobre o conteúdo existente —
@@ -475,7 +668,8 @@ impl GitDriveFS {
             return;
         }
         let base = self.content_for_inode_at_path(ino, path).unwrap_or_default();
-        self.write_buffers.lock().entry(ino).or_insert(base);
+        let buffer = self.make_buffer_from_vec(base);
+        self.write_buffers.lock().entry(ino).or_insert(buffer);
     }
 
     /// Escrita em offset sobre o buffer do inode. Retorna bytes aceitos.
@@ -488,11 +682,9 @@ impl GitDriveFS {
         let new_len = {
             let mut buffers = self.write_buffers.lock();
             let buf = buffers.get_mut(&ino).expect("buffer garantido acima");
-            if buf.len() < offset + data.len() {
-                buf.resize(offset + data.len(), 0);
-            }
-            buf[offset..offset + data.len()].copy_from_slice(data);
-            buf.len() as u64
+            buf.write_at(offset, data);
+            self.maybe_spill(buf);
+            buf.len()
         };
         if let Some(f) = self.files_by_inode.get_mut(&ino) {
             f.size = new_len;
@@ -512,16 +704,17 @@ impl GitDriveFS {
             None => return Err(libc::ENOENT),
         };
         self.ensure_buffer(ino, &path);
-        let data = {
+        let content = {
             let mut buffers = self.write_buffers.lock();
             let buf = buffers.get_mut(&ino).expect("buffer garantido acima");
-            buf.resize(new_size as usize, 0);
-            buf.clone()
+            buf.set_len(new_size);
+            self.maybe_spill(buf);
+            self.snapshot_buffer_content(buf)
         };
         if let Some(f) = self.files_by_inode.get_mut(&ino) {
             f.size = new_size;
         }
-        self.sync.queue_write(&path, data);
+        self.sync.queue_write_content(&path, content);
         // Conteúdo do buffer acabou de ser enfileirado — inode volta a "limpo";
         // um flush subsequente sem escrita nova não deve duplicar a op.
         self.dirty.remove(&ino);
@@ -540,7 +733,7 @@ impl GitDriveFS {
         }
 
         if let Some(buf) = self.write_buffers.lock().get(&ino) {
-            return Ok(slice_of(buf, offset, size));
+            return Ok(buf.read_range(offset, size));
         }
         let (path, local_only, kind) = match self.files_by_inode.get(&ino) {
             Some(f) => (f.path.clone(), f.local_only, f.kind),
@@ -552,9 +745,7 @@ impl GitDriveFS {
         let content = if local_only {
             self.read_local_only_content(kind, &path).ok_or(libc::EIO)?
         } else {
-            let repo = git::open_repo(&self.repo_path).map_err(|_| libc::EIO)?;
-            let commit = git::get_commit(&repo, "HEAD").map_err(|_| libc::EIO)?;
-            git::read_file_at_commit(&repo, &commit, &path).map_err(|_| libc::EIO)?
+            self.head_blob_via_persistent_handle(&path)?
         };
         let out = slice_of(&content, offset, size);
         self.read_cache.insert(ino, content);
@@ -572,6 +763,37 @@ impl GitDriveFS {
         self.apply_read(ino, 0, usize::MAX)
     }
 
+    /// Blob do HEAD via handle persistente — abre o repo uma vez e reutiliza
+    /// nas leituras seguintes. Erro derruba o handle (reabre na próxima
+    /// chamada) e vira EIO.
+    fn head_blob_via_persistent_handle(&mut self, path: &str) -> Result<Vec<u8>, i32> {
+        if self.read_repo.is_none() {
+            self.read_repo = git::open_repo(&self.repo_path).ok();
+            if self.read_repo.is_some() {
+                self.read_repo_opens += 1;
+            }
+        }
+        let Some(repo) = self.read_repo.as_ref() else {
+            return Err(libc::EIO);
+        };
+        let result = git::get_commit(repo, "HEAD")
+            .and_then(|commit| git::read_file_at_commit(repo, &commit, path));
+        match result {
+            Ok(content) => Ok(content),
+            Err(_) => {
+                // Handle pode ter ficado inválido (repo movido, gc externo):
+                // descarta para reabrir na próxima leitura.
+                self.read_repo = None;
+                Err(libc::EIO)
+            }
+        }
+    }
+
+    /// Aberturas reais do handle persistente de leitura (introspecção).
+    pub fn read_repo_opens_for_test(&self) -> u64 {
+        self.read_repo_opens
+    }
+
     /// Flush de um inode: enfileira o buffer no sync APENAS se houve escrita
     /// desde o último flush (dirty). Retorna o path enfileirado, ou `None` se
     /// não havia nada a fazer (ex.: close de fd aberto só para leitura).
@@ -580,8 +802,12 @@ impl GitDriveFS {
             return None;
         }
         let path = self.files_by_inode.get(&ino)?.path.clone();
-        let data = self.write_buffers.lock().get(&ino).cloned()?;
-        self.sync.queue_write(&path, data);
+        let content = {
+            let buffers = self.write_buffers.lock();
+            let buf = buffers.get(&ino)?;
+            self.snapshot_buffer_content(buf)
+        };
+        self.sync.queue_write_content(&path, content);
         self.dirty.remove(&ino);
         self.touch(ino);
         Some(path)
@@ -605,6 +831,23 @@ impl GitDriveFS {
     /// Quantidade de write buffers vivos (introspecção para testes).
     pub fn buffered_count_for_test(&self) -> usize {
         self.write_buffers.lock().len()
+    }
+
+    /// `Arc` do buffer de um inode (introspecção para testes de
+    /// compartilhamento de conteúdo com a fila).
+    pub fn buffer_arc_for_test(&self, ino: u64) -> Option<Arc<Vec<u8>>> {
+        match self.write_buffers.lock().get(&ino) {
+            Some(WriteBuffer::Mem(a)) => Some(a.clone()),
+            _ => None,
+        }
+    }
+
+    /// `true` se o buffer do inode está em arquivo de spool (introspecção).
+    pub fn buffer_is_spooled_for_test(&self, ino: u64) -> bool {
+        matches!(
+            self.write_buffers.lock().get(&ino),
+            Some(WriteBuffer::Spooled(_))
+        )
     }
 
     pub fn read_cache_contains_for_test(&self, ino: u64) -> bool {
@@ -663,7 +906,9 @@ impl GitDriveFS {
         self.sync.queue_write(&full_path, Vec::new());
         // Buffer vazio (não-dirty) para que reads antes do commit retornem
         // vazio em vez de EIO — o path novo ainda não existe no HEAD.
-        self.write_buffers.lock().insert(inode, Vec::new());
+        self.write_buffers
+            .lock()
+            .insert(inode, WriteBuffer::Mem(Arc::new(Vec::new())));
 
         Ok((inode, self.file_attr_for(inode, 0)))
     }
@@ -714,7 +959,7 @@ impl GitDriveFS {
         // commit — o path ainda não existe no HEAD.
         self.write_buffers
             .lock()
-            .insert(inode, target.as_bytes().to_vec());
+            .insert(inode, WriteBuffer::Mem(Arc::new(target.as_bytes().to_vec())));
         self.sync.queue_symlink(&full_path, target);
         self.touch(inode);
 
@@ -1060,14 +1305,18 @@ impl GitDriveFS {
             f.size = tgt_new_size;
         }
 
+        let tgt_shared = Arc::new(tgt_content);
+        let src_shared = Arc::new(src_content);
         {
             let mut buffers = self.write_buffers.lock();
-            buffers.insert(src_ino, tgt_content.clone());
-            buffers.insert(tgt_ino, src_content.clone());
+            buffers.insert(src_ino, WriteBuffer::Mem(tgt_shared.clone()));
+            buffers.insert(tgt_ino, WriteBuffer::Mem(src_shared.clone()));
         }
 
-        self.sync.queue_write(&src_path, tgt_content);
-        self.sync.queue_write(&tgt_path, src_content);
+        self.sync
+            .queue_write_content(&src_path, crate::sync::WriteContent::Mem(tgt_shared));
+        self.sync
+            .queue_write_content(&tgt_path, crate::sync::WriteContent::Mem(src_shared));
         self.dirty.remove(&src_ino);
         self.dirty.remove(&tgt_ino);
         self.touch(src_ino);
@@ -1117,14 +1366,18 @@ impl GitDriveFS {
         }
 
         // Buffers refletem o conteúdo trocado para reads antes do commit
+        let shared_b = Arc::new(content_b);
+        let shared_a = Arc::new(content_a);
         {
             let mut buffers = self.write_buffers.lock();
-            buffers.insert(ino_a, content_b.clone());
-            buffers.insert(ino_b, content_a.clone());
+            buffers.insert(ino_a, WriteBuffer::Mem(shared_b.clone()));
+            buffers.insert(ino_b, WriteBuffer::Mem(shared_a.clone()));
         }
 
-        self.sync.queue_write(&path_a, content_b);
-        self.sync.queue_write(&path_b, content_a);
+        self.sync
+            .queue_write_content(&path_a, crate::sync::WriteContent::Mem(shared_b));
+        self.sync
+            .queue_write_content(&path_b, crate::sync::WriteContent::Mem(shared_a));
         self.dirty.remove(&ino_a);
         self.dirty.remove(&ino_b);
         self.read_cache.remove(ino_a);
@@ -1263,7 +1516,9 @@ impl GitDriveFS {
                     let content = self
                         .content_for_inode_at_path(*ino, &old)
                         .unwrap_or_default();
-                    self.write_buffers.lock().insert(*ino, content);
+                    self.write_buffers
+                        .lock()
+                        .insert(*ino, WriteBuffer::Mem(Arc::new(content)));
                     self.read_cache.remove(*ino);
                     self.dirty.remove(ino);
                     self.sync.queue_delete(&old);
@@ -1308,9 +1563,13 @@ impl GitDriveFS {
             // path NOVO não existe no HEAD ainda — sem isso, read pós-rename
             // caía no blob inexistente e retornava EIO. O gc descarta após
             // o commit. A entrada de cache do path antigo fica stale — fora.
-            self.write_buffers.lock().insert(src, content.clone());
+            let shared = Arc::new(content);
+            self.write_buffers
+                .lock()
+                .insert(src, WriteBuffer::Mem(shared.clone()));
             self.read_cache.remove(src);
-            self.sync.queue_write(&new_path, content);
+            self.sync
+                .queue_write_content(&new_path, crate::sync::WriteContent::Mem(shared));
             self.sync.queue_delete(&old_path);
             // Conteúdo corrente (incluindo escritas pendentes) foi enfileirado
             // no destino — inode volta a "limpo".
@@ -1792,8 +2051,12 @@ impl Filesystem for GitDriveFS {
             .insert(new_inode);
 
         // Popular write_buffer pra que leituras imediatas vejam o conteúdo
-        self.write_buffers.lock().insert(new_inode, content.clone());
-        self.sync.queue_write(&full_path, content);
+        let shared = Arc::new(content);
+        self.write_buffers
+            .lock()
+            .insert(new_inode, WriteBuffer::Mem(shared.clone()));
+        self.sync
+            .queue_write_content(&full_path, crate::sync::WriteContent::Mem(shared));
         self.touch(new_inode);
 
         let attr = self.file_attr_for(new_inode, size);

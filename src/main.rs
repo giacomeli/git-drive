@@ -242,11 +242,12 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
             .as_str(),
     );
 
-    let fs = GitDriveFS::new_with_cache_budget(
+    let fs = GitDriveFS::new_with_options(
         &repo_path,
         branch,
         sync,
         config.read_cache_mb * 1024 * 1024,
+        config.large_file_threshold_mb * 1024 * 1024,
     )?;
 
     // Opções macFUSE-específicas:
