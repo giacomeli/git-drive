@@ -9,6 +9,7 @@ use tokio::task;
 
 use crate::git;
 use crate::log_ts;
+use crate::status::StatusState;
 
 #[derive(Debug, Clone)]
 pub enum SyncOp {
@@ -53,6 +54,8 @@ pub struct SyncManager {
     /// chamada git individual — um commit entrando entre o fetch e o checkout
     /// do pull era a janela de corrida (RF4 da Fase 0).
     repo_lock: Arc<Mutex<()>>,
+    /// Estado observável (status.json + subcomando `status`).
+    status: Arc<StatusState>,
 }
 
 struct Inner {
@@ -126,6 +129,8 @@ impl SyncManager {
         remote_token: Option<String>,
         pull_interval_secs: u64,
     ) -> Self {
+        let status = Arc::new(StatusState::new());
+        status.record_boot(repo_path, &branch);
         let manager = SyncManager {
             inner: Arc::new(Mutex::new(Inner {
                 buffer: Vec::new(),
@@ -142,6 +147,7 @@ impl SyncManager {
             refresh_flag: Arc::new(AtomicBool::new(false)),
             commit_generation: Arc::new(AtomicU64::new(0)),
             repo_lock: Arc::new(Mutex::new(())),
+            status,
         };
 
         manager.spawn_watcher();
@@ -169,6 +175,16 @@ impl SyncManager {
         self.commit_generation.load(Ordering::SeqCst)
     }
 
+    /// Liga a persistência do status em arquivo (grava o estado corrente).
+    pub fn enable_status_file(&self, path: std::path::PathBuf) {
+        self.status.enable_file(path);
+    }
+
+    /// Acesso ao estado observável (snapshot para testes/CLI embutido).
+    pub fn status_state(&self) -> Arc<StatusState> {
+        self.status.clone()
+    }
+
     fn spawn_pull_watcher(&self, interval_secs: u64) {
         let inner = self.inner.clone();
         let repo_path = self.repo_path.clone();
@@ -179,6 +195,7 @@ impl SyncManager {
         let user_email = self.user_email.clone();
         let refresh_flag = self.refresh_flag.clone();
         let repo_lock = self.repo_lock.clone();
+        let status = self.status.clone();
 
         task::spawn(async move {
             loop {
@@ -187,6 +204,7 @@ impl SyncManager {
                 // Não roda pull enquanto há lote pendente (evita corrida com commit local)
                 let pending = { !inner.lock().buffer.is_empty() };
                 if pending {
+                    status.record_pull("pulado: fila de sync pendente");
                     continue;
                 }
                 let Some(ref remote) = remote_name else {
@@ -215,10 +233,12 @@ impl SyncManager {
                             "[{}] pull: working tree com mudanças não commitadas — pulando",
                             log_ts()
                         );
+                        status.record_pull("pulado: working tree sujo");
                         continue;
                     }
                     Err(e) => {
                         eprintln!("[{}] pull: erro ao checar working tree: {}", log_ts(), e);
+                        status.record_pull("erro ao checar working tree");
                         continue;
                     }
                 }
@@ -227,6 +247,7 @@ impl SyncManager {
                     git::fetch_remote(&repo, &branch, remote, remote_token.as_deref())
                 {
                     eprintln!("[{}] pull: erro no fetch: {}", log_ts(), e);
+                    status.record_pull("erro no fetch");
                     continue;
                 }
 
@@ -248,13 +269,17 @@ impl SyncManager {
                     };
 
                 match outcome {
-                    Ok(git::MergeOutcome::NoOp) => {}
+                    Ok(git::MergeOutcome::NoOp) => {
+                        status.record_pull("sem novidades");
+                    }
                     Ok(git::MergeOutcome::FastForwarded) => {
                         println!("[{}] pull: fast-forward aplicado", log_ts());
+                        status.record_pull("fast-forward");
                         refresh_flag.store(true, Ordering::SeqCst);
                     }
                     Ok(git::MergeOutcome::Merged) => {
                         println!("[{}] pull: merge 3-way sem conflitos", log_ts());
+                        status.record_pull("merge 3-way");
                         refresh_flag.store(true, Ordering::SeqCst);
                     }
                     Ok(git::MergeOutcome::Conflicted { resolved, suffix }) => {
@@ -265,10 +290,18 @@ impl SyncManager {
                             suffix,
                             resolved
                         );
+                        status.record_pull(&format!("merge com {} conflito(s)", resolved.len()));
+                        status.add_conflicts(
+                            resolved
+                                .iter()
+                                .map(|p| format!("{}.{}", p, suffix))
+                                .collect(),
+                        );
                         refresh_flag.store(true, Ordering::SeqCst);
                     }
                     Err(e) => {
                         eprintln!("[{}] pull: erro no merge: {}", log_ts(), e);
+                        status.record_pull("erro no merge");
                     }
                 }
             }
@@ -342,6 +375,7 @@ impl SyncManager {
         let refresh_flag = self.refresh_flag.clone();
         let commit_generation = self.commit_generation.clone();
         let repo_lock = self.repo_lock.clone();
+        let status = self.status.clone();
 
         task::spawn(async move {
             loop {
@@ -375,18 +409,21 @@ impl SyncManager {
                         for op in &ops {
                             apply_op_to_disk(&repo_path, op);
                         }
-                        let committed = commit_batch(
+                        let commit_oid = commit_batch(
                             &repo_path,
                             &branch,
                             &user_name,
                             &user_email,
                             &ops,
                         );
-                        if committed {
+                        let mut pushed: Option<bool> = None;
+                        if let Some(_oid) = commit_oid {
                             commit_generation.fetch_add(1, Ordering::SeqCst);
                             if let Some(ref remote) = remote_name {
                                 let ok = push_batch(&repo_path, &branch, remote, &remote_token);
-                                if !ok {
+                                if ok {
+                                    pushed = Some(true);
+                                } else {
                                     let recovered = reconcile_and_retry_push(
                                         &repo_path,
                                         &branch,
@@ -394,13 +431,22 @@ impl SyncManager {
                                         &remote_token,
                                         &user_name,
                                         &user_email,
+                                        &status,
                                     );
+                                    pushed = Some(recovered);
                                     if recovered {
                                         refresh_flag.store(true, Ordering::SeqCst);
                                     }
                                 }
                             }
                         }
+                        let pending = inner.lock().buffer.len();
+                        status.record_drain(
+                            ops.len(),
+                            commit_oid.map(|o| o.to_string()),
+                            pushed,
+                            pending,
+                        );
                         break;
                     }
                 }
@@ -491,42 +537,42 @@ fn apply_op_to_disk(repo_path: &Path, op: &SyncOp) {
     }
 }
 
-/// Retorna `true` se um commit foi criado (para sinalizar se vale a pena
-/// tentar push em seguida).
+/// Retorna o oid do commit criado, ou `None` (sem identidade, tree limpa ou
+/// erro — o motivo vai para o log).
 fn commit_batch(
     repo_path: &Path,
     branch: &str,
     user_name: &Option<String>,
     user_email: &Option<String>,
     ops: &[&SyncOp],
-) -> bool {
+) -> Option<git2::Oid> {
     let (Some(name), Some(email)) = (user_name.as_deref(), user_email.as_deref()) else {
         println!(
             "[{}] commit: user_name/user_email ausentes — commit ignorado",
             log_ts()
         );
-        return false;
+        return None;
     };
     let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[{}] commit: erro ao abrir repo: {}", log_ts(), e);
-            return false;
+            return None;
         }
     };
     let message = build_commit_message(ops);
     match git::commit_working_tree(&repo, branch, name, email, &message) {
         Ok(Some(oid)) => {
             println!("[{}] commit: criado {}", log_ts(), oid);
-            true
+            Some(oid)
         }
         Ok(None) => {
             println!("[{}] commit: tree limpa, nada a commitar", log_ts());
-            false
+            None
         }
         Err(e) => {
             eprintln!("[{}] commit: erro: {}", log_ts(), e);
-            false
+            None
         }
     }
 }
@@ -561,6 +607,7 @@ fn reconcile_and_retry_push(
     token: &Option<String>,
     user_name: &Option<String>,
     user_email: &Option<String>,
+    status: &StatusState,
 ) -> bool {
     let (Some(name), Some(email)) = (user_name.as_deref(), user_email.as_deref()) else {
         eprintln!(
@@ -598,6 +645,12 @@ fn reconcile_and_retry_push(
                 resolved.len(),
                 suffix,
                 resolved
+            );
+            status.add_conflicts(
+                resolved
+                    .iter()
+                    .map(|p| format!("{}.{}", p, suffix))
+                    .collect(),
             );
         }
         Ok(o) => {

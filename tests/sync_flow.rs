@@ -622,3 +622,62 @@ async fn pull_watcher_skips_when_working_tree_dirty() {
         "pull não deve ter aplicado nada com working tree sujo"
     );
 }
+
+// ---- Fase 1 RF4: status.json do daemon ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn status_file_updated_after_drain() {
+    let test = init_repo();
+    let status_dir = tempfile::tempdir().unwrap();
+    let status_path = status_dir.path().join("status.json");
+
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    sync.enable_status_file(status_path.clone());
+    assert!(status_path.exists(), "enable deve gravar o estado inicial");
+
+    sync.queue_write("a.txt", b"hello".to_vec());
+    wait_flush().await;
+
+    let status = drive_sync::status::read_from(&status_path).unwrap();
+    assert_eq!(status.branch, "main");
+    assert_eq!(status.pending_ops, 0);
+    let drain = status.last_drain.expect("drain deve ter sido registrado");
+    assert_eq!(drain.ops, 1);
+    assert!(drain.commit.is_some(), "commit deve ter oid");
+    assert!(drain.pushed.is_none(), "sem remote configurado, pushed é None");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn status_file_records_pull_outcome() {
+    let test = init_repo();
+    let bare = init_bare_remote();
+    let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+    test.repo.remote("origin", &bare_url).unwrap();
+    drive_sync::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
+
+    let status_dir = tempfile::tempdir().unwrap();
+    let status_path = status_dir.path().join("status.json");
+
+    let sync = SyncManager::new_full_with_pull(
+        test.dir.path().to_str().unwrap(),
+        "main".to_string(),
+        60,
+        Some("Alice".to_string()),
+        Some("a@x.com".to_string()),
+        Some("origin".to_string()),
+        None,
+        1,
+    );
+    sync.enable_status_file(status_path.clone());
+
+    // esperar ao menos um ciclo de pull (sem novidades no remote)
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    let status = drive_sync::status::read_from(&status_path).unwrap();
+    let pull = status.last_pull.expect("pull deve ter sido registrado");
+    assert_eq!(pull.outcome, "sem novidades");
+}

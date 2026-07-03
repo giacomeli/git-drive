@@ -36,6 +36,17 @@ async fn main() -> anyhow::Result<()> {
     let matches = Command::new("drive-sync")
         .version("0.1.0")
         .about("Sistema de arquivos versionado com Git")
+        .subcommand_negates_reqs(true)
+        .subcommand(
+            Command::new("status")
+                .about("Mostra o estado do daemon de sincronização")
+                .arg(
+                    Arg::new("file")
+                        .long("file")
+                        .value_name("PATH")
+                        .help("Caminho do status.json (padrão: logs/status.json)"),
+                ),
+        )
         .arg(
             Arg::new("repo")
                 .short('r')
@@ -60,6 +71,15 @@ async fn main() -> anyhow::Result<()> {
                 .action(clap::ArgAction::SetTrue),
         )
         .get_matches();
+
+    // Subcomando roda ANTES do redirect de I/O — a saída é para o terminal.
+    if let Some(sub) = matches.subcommand_matches("status") {
+        let file = sub
+            .get_one::<String>("file")
+            .map(String::as_str)
+            .unwrap_or("logs/status.json");
+        return run_status(std::path::Path::new(file));
+    }
 
     let repo_path = matches.get_one::<String>("repo").unwrap().clone();
     let mount_path = matches.get_one::<String>("mount").unwrap().clone();
@@ -115,6 +135,8 @@ async fn main() -> anyhow::Result<()> {
         config.remote_token.clone(),
         config.pull_interval_secs,
     );
+    // Status observável em logs/status.json (lido por `drive-sync status`)
+    sync.enable_status_file(std::path::PathBuf::from("logs/status.json"));
     let fs = GitDriveFS::new_with_cache_budget(
         &repo_path,
         branch,
@@ -149,5 +171,23 @@ async fn main() -> anyhow::Result<()> {
 
     fuser::mount2(fs, &mount_path, &options)?;
 
+    Ok(())
+}
+
+/// `drive-sync status`: lê o status.json gravado pelo daemon e formata.
+fn run_status(file: &std::path::Path) -> anyhow::Result<()> {
+    use drive_sync::status;
+    match status::read_from(file) {
+        Ok(s) => {
+            let alive = status::pid_alive(s.pid);
+            print!("{}", status::format_status(&s, status::now_unix(), alive));
+        }
+        Err(e) => {
+            println!("Sem status disponível ({}).", e);
+            println!(
+                "Monte um repositório primeiro: drive-sync -r <repo> -m <mount> — o daemon grava logs/status.json no diretório de onde foi lançado. Use --file para apontar outro caminho."
+            );
+        }
+    }
     Ok(())
 }

@@ -1,6 +1,7 @@
 pub mod config;
 pub mod fs;
 pub mod git;
+pub mod status;
 pub mod sync;
 
 use std::time::{SystemTime, UNIX_EPOCH};
