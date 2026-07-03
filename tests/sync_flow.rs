@@ -773,3 +773,46 @@ async fn symlink_roundtrip_created_in_fs_read_back_by_new_mount() {
     assert_eq!(fs2.apply_getattr(ino2).unwrap().kind, FileType::Symlink);
     assert_eq!(fs2.apply_readlink(ino2).unwrap(), b"real.txt".to_vec());
 }
+
+// ---- Fase 2.5, Bloco A: ignorados local-only através do drain/commit ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn ignored_file_stays_visible_and_out_of_commits() {
+    use drive_sync::fs::GitDriveFS;
+
+    let test = init_repo();
+    commit_file(&test.repo, ".gitignore", b"*.log\n", "add gitignore");
+    let repo_path = test.dir.path().to_str().unwrap();
+    let sync = mgr(repo_path, "main", Some(("Alice", "a@x.com")));
+    let mut fs = GitDriveFS::new(repo_path, "main".to_string(), sync).expect("fs");
+
+    let (lino, _) = fs.apply_create(1, "app.log").unwrap();
+    fs.apply_write(lino, 0, b"segredo local").unwrap();
+    fs.apply_flush(lino);
+    let (rino, _) = fs.apply_create(1, "real.txt").unwrap();
+    fs.apply_write(rino, 0, b"publico").unwrap();
+    fs.apply_flush(rino);
+    wait_flush().await;
+
+    // Commit aconteceu (real.txt) e NÃO contém o ignorado
+    let head = test.repo.head().unwrap().peel_to_commit().unwrap();
+    let tree = head.tree().unwrap();
+    assert!(tree.get_path(std::path::Path::new("real.txt")).is_ok());
+    assert!(
+        tree.get_path(std::path::Path::new("app.log")).is_err(),
+        "app.log é ignorado e não pode aparecer em commit"
+    );
+    // Working tree persiste o local-only
+    assert_eq!(read_file(test.dir.path(), "app.log"), b"segredo local");
+
+    // Pós-gc (commit_generation avançou), continua visível e legível
+    fs.refresh_if_needed();
+    let ino = fs.find_inode("app.log").expect("visível após commit de outros arquivos");
+    assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"segredo local".to_vec());
+
+    // Remount reincorpora do working tree
+    let sync2 = mgr(repo_path, "main", Some(("Alice", "a@x.com")));
+    let mut fs2 = GitDriveFS::new(repo_path, "main".to_string(), sync2).expect("fs2");
+    let ino2 = fs2.find_inode("app.log").expect("visível após remount");
+    assert_eq!(fs2.apply_read(ino2, 0, 100).unwrap(), b"segredo local".to_vec());
+}

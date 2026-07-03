@@ -135,6 +135,9 @@ pub(crate) struct FileEntry {
     /// Regular ou Symlink (filemode 120000 no Git). Para symlink, o conteúdo
     /// do blob é o texto do alvo e o attr expõe `FileType::Symlink`.
     pub(crate) kind: git::FileKind,
+    /// Arquivo que casa com regras de ignore do repo montado: vive no working
+    /// tree, nunca entra em commit. Leituras vêm do disco, não do HEAD.
+    pub(crate) local_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +265,7 @@ impl GitDriveFS {
                 parent: parent_inode,
                 size,
                 kind,
+                local_only: false,
             };
             files_by_inode.insert(inode, entry);
             inodes_by_path.insert(file_path, inode);
@@ -272,7 +276,7 @@ impl GitDriveFS {
                 .insert(inode);
         }
 
-        Ok(GitDriveFS {
+        let mut fs = GitDriveFS {
             repo_path: repo_path.to_string(),
             branch,
             files_by_inode,
@@ -290,7 +294,11 @@ impl GitDriveFS {
             times: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             boot_time: SystemTime::now(),
             xattrs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-        })
+        };
+        // Arquivos ignorados presentes no working tree entram como local-only
+        // visíveis (Fase 2.5): aparecem no mount, nunca em commit.
+        fs.incorporate_local_only(&HashMap::new());
+        Ok(fs)
     }
 
     fn perm_for(&self, ino: u64, default: u16) -> u16 {
@@ -409,6 +417,11 @@ impl GitDriveFS {
         if let Some(buf) = self.write_buffers.lock().get(&ino) {
             return Some(buf.clone());
         }
+        if let Some(f) = self.files_by_inode.get(&ino) {
+            if f.local_only {
+                return self.read_local_only_content(f.kind, path);
+            }
+        }
         let repo = git::open_repo(&self.repo_path).ok()?;
         let commit = git::get_commit(&repo, "HEAD").ok()?;
         git::read_file_at_commit(&repo, &commit, path).ok()
@@ -519,16 +532,20 @@ impl GitDriveFS {
         if let Some(buf) = self.write_buffers.lock().get(&ino) {
             return Ok(slice_of(buf, offset, size));
         }
-        let path = match self.files_by_inode.get(&ino) {
-            Some(f) => f.path.clone(),
+        let (path, local_only, kind) = match self.files_by_inode.get(&ino) {
+            Some(f) => (f.path.clone(), f.local_only, f.kind),
             None => return Err(libc::ENOENT),
         };
         if let Some(data) = self.read_cache.get(ino) {
             return Ok(slice_of(data, offset, size));
         }
-        let repo = git::open_repo(&self.repo_path).map_err(|_| libc::EIO)?;
-        let commit = git::get_commit(&repo, "HEAD").map_err(|_| libc::EIO)?;
-        let content = git::read_file_at_commit(&repo, &commit, &path).map_err(|_| libc::EIO)?;
+        let content = if local_only {
+            self.read_local_only_content(kind, &path).ok_or(libc::EIO)?
+        } else {
+            let repo = git::open_repo(&self.repo_path).map_err(|_| libc::EIO)?;
+            let commit = git::get_commit(&repo, "HEAD").map_err(|_| libc::EIO)?;
+            git::read_file_at_commit(&repo, &commit, &path).map_err(|_| libc::EIO)?
+        };
         let out = slice_of(&content, offset, size);
         self.read_cache.insert(ino, content);
         Ok(out)
@@ -622,6 +639,7 @@ impl GitDriveFS {
             parent,
             size: 0,
             kind: git::FileKind::Regular,
+            local_only: false,
         };
         self.files_by_inode.insert(inode, entry);
         self.inodes_by_path.insert(full_path.clone(), inode);
@@ -672,6 +690,7 @@ impl GitDriveFS {
             parent,
             size: target.len() as u64,
             kind: git::FileKind::Symlink,
+            local_only: false,
         };
         self.files_by_inode.insert(inode, entry);
         self.inodes_by_path.insert(full_path.clone(), inode);
@@ -781,6 +800,10 @@ impl GitDriveFS {
         if gen != self.last_commit_gen {
             self.last_commit_gen = gen;
             self.gc_clean_buffers();
+            // Arquivos ignorados que participaram do lote ficaram fora do
+            // commit — marcá-los local-only redireciona os reads para o
+            // working tree (o buffer que os servia acabou de ser coletado).
+            self.incorporate_local_only(&HashMap::new());
         }
         if !self.sync.take_refresh_flag() {
             return;
@@ -876,6 +899,7 @@ impl GitDriveFS {
                 parent: parent_inode,
                 size,
                 kind,
+                local_only: false,
             };
             files_by_inode.insert(inode, entry);
             inodes_by_path.insert(file_path, inode);
@@ -889,6 +913,9 @@ impl GitDriveFS {
         self.files_by_inode = files_by_inode;
         self.dirs_by_inode = dirs_by_inode;
         self.inodes_by_path = inodes_by_path;
+        // Local-only não vive no HEAD: reincorpora do working tree, reusando
+        // inodes do índice anterior para não invalidar handles do kernel.
+        self.incorporate_local_only(&previous);
     }
 
     pub fn apply_mkdir(&mut self, parent: u64, name: &str) -> Result<(u64, FileAttr), i32> {
@@ -1280,6 +1307,107 @@ impl GitDriveFS {
         Ok(())
     }
 
+    /// Incorpora ao índice os arquivos ignorados do working tree (local-only
+    /// visíveis). Paths já presentes são marcados/atualizados; ausentes ganham
+    /// entrada nova (reusando inode de `previous` quando o path existia antes
+    /// de um rebuild). Diretórios intermediários fora do HEAD são criados.
+    fn incorporate_local_only(&mut self, previous: &HashMap<String, u64>) {
+        let repo = match git::open_repo(&self.repo_path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[{}] local-only: erro ao abrir repo: {}", log_ts(), e);
+                return;
+            }
+        };
+        let ignored = match git::list_ignored_files(&repo) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[{}] local-only: erro ao listar ignorados: {}", log_ts(), e);
+                return;
+            }
+        };
+        for git::ListedFile { path, size, kind } in ignored {
+            if leaf_name(&path) == ".gitkeep" || crate::sync::is_fully_ephemeral_path(&path) {
+                continue;
+            }
+            if let Some(&ino) = self.inodes_by_path.get(&path) {
+                if let Some(f) = self.files_by_inode.get_mut(&ino) {
+                    f.local_only = true;
+                    f.kind = kind;
+                    // Buffer pendente tem precedência sobre o tamanho do disco.
+                    if !self.write_buffers.lock().contains_key(&ino) {
+                        f.size = size;
+                    }
+                }
+                continue;
+            }
+            let parent_path = Self::resolve_parent_path(&path);
+            let parent_ino = self.ensure_dir_chain(&parent_path, previous);
+            let ino = previous
+                .get(&path)
+                .copied()
+                .unwrap_or_else(|| self.alloc_inode());
+            let entry = FileEntry {
+                inode: ino,
+                path: path.clone(),
+                parent: parent_ino,
+                size,
+                kind,
+                local_only: true,
+            };
+            self.files_by_inode.insert(ino, entry);
+            self.inodes_by_path.insert(path, ino);
+            self.dirs_by_inode
+                .get_mut(&parent_ino)
+                .unwrap()
+                .children
+                .insert(ino);
+        }
+    }
+
+    /// Garante que a cadeia de diretórios de `dir_path` existe no índice,
+    /// criando entradas em memória para dirs fora do HEAD (ex.: dir inteiro
+    /// ignorado). Retorna o inode do dir final.
+    fn ensure_dir_chain(&mut self, dir_path: &str, previous: &HashMap<String, u64>) -> u64 {
+        if dir_path.is_empty() {
+            return ROOT_INODE;
+        }
+        if let Some(&ino) = self.inodes_by_path.get(dir_path) {
+            return ino;
+        }
+        let parent = self.ensure_dir_chain(&Self::resolve_parent_path(dir_path), previous);
+        let ino = previous
+            .get(dir_path)
+            .copied()
+            .unwrap_or_else(|| self.alloc_inode());
+        let entry = DirEntry {
+            inode: ino,
+            path: dir_path.to_string(),
+            parent,
+            children: HashSet::new(),
+        };
+        self.dirs_by_inode.insert(ino, entry);
+        self.inodes_by_path.insert(dir_path.to_string(), ino);
+        self.dirs_by_inode
+            .get_mut(&parent)
+            .unwrap()
+            .children
+            .insert(ino);
+        ino
+    }
+
+    /// Conteúdo de um arquivo local-only, lido do working tree. Para symlink,
+    /// o "conteúdo" é o texto do alvo (paridade com o blob 120000 do Git).
+    fn read_local_only_content(&self, kind: git::FileKind, path: &str) -> Option<Vec<u8>> {
+        let full = std::path::Path::new(&self.repo_path).join(path);
+        match kind {
+            git::FileKind::Symlink => std::fs::read_link(&full)
+                .ok()
+                .map(|t| t.as_os_str().as_encoded_bytes().to_vec()),
+            git::FileKind::Regular => std::fs::read(&full).ok(),
+        }
+    }
+
     /// Coleta a subárvore de `root_ino` (inclusive): dirs e arquivos com os
     /// paths correntes do índice. Travessia local, sem I/O.
     fn collect_subtree(&self, root_ino: u64) -> (SubtreeEntries, SubtreeEntries) {
@@ -1612,6 +1740,7 @@ impl Filesystem for GitDriveFS {
             parent: newparent,
             size,
             kind: src_kind,
+            local_only: false,
         };
         self.files_by_inode.insert(new_inode, entry);
         self.inodes_by_path.insert(full_path.clone(), new_inode);

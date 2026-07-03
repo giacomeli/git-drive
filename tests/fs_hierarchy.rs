@@ -1018,3 +1018,84 @@ async fn apply_unlink_of_symlink_queues_delete() {
         snap
     );
 }
+
+// ---- Fase 2.5, Bloco A: arquivos ignorados local-only visíveis ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn ignored_file_in_worktree_visible_after_boot() {
+    let test = init_repo();
+    commit_file(&test.repo, ".gitignore", b"*.log\n", "add gitignore");
+    std::fs::write(test.dir.path().join("app.log"), b"local data").unwrap();
+
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("app.log").expect("ignorado deve ser visível no boot");
+    assert_eq!(fs.apply_getattr(ino).unwrap().size, 10);
+    assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"local data".to_vec());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn ignored_file_inside_ignored_dir_creates_parent_chain() {
+    let test = init_repo();
+    commit_file(&test.repo, ".gitignore", b"build/\n", "add gitignore");
+    std::fs::create_dir_all(test.dir.path().join("build")).unwrap();
+    std::fs::write(test.dir.path().join("build/out.bin"), b"bin").unwrap();
+
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let dir_ino = fs.find_inode("build").expect("dir do ignorado deve existir no índice");
+    let ino = fs.find_inode("build/out.bin").expect("arquivo em dir ignorado visível");
+    let entries = fs.apply_readdir(dir_ino).unwrap();
+    assert!(entries.iter().any(|(_, _, n)| n == "out.bin"));
+    assert_eq!(fs.apply_read(ino, 0, 10).unwrap(), b"bin".to_vec());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn ignored_file_survives_refresh_with_same_inode() {
+    let test = init_repo();
+    commit_file(&test.repo, ".gitignore", b"*.log\n", "add gitignore");
+    std::fs::write(test.dir.path().join("app.log"), b"conteudo").unwrap();
+
+    let sync = SyncManager::new(test.dir.path().to_str().unwrap(), 5);
+    let sync_handle = sync.clone();
+    let mut fs = GitDriveFS::new(test.dir.path().to_str().unwrap(), "main".to_string(), sync)
+        .expect("GitDriveFS::new");
+    let ino = fs.find_inode("app.log").expect("visível no boot");
+
+    sync_handle.raise_refresh_flag();
+    fs.refresh_if_needed();
+    assert_eq!(
+        fs.find_inode("app.log"),
+        Some(ino),
+        "local-only sobrevive ao refresh preservando inode"
+    );
+    assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"conteudo".to_vec());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn ignored_file_delete_removes_and_queues() {
+    let test = init_repo();
+    commit_file(&test.repo, ".gitignore", b"*.log\n", "add gitignore");
+    std::fs::write(test.dir.path().join("app.log"), b"x").unwrap();
+
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    assert!(fs.find_inode("app.log").is_some());
+    assert_eq!(fs.apply_unlink(1, "app.log"), Ok(()));
+    assert_eq!(fs.find_inode("app.log"), None);
+    let snap = fs.sync_snapshot_for_test();
+    assert!(
+        matches!(&snap[..], [drive_sync::sync::SyncOp::Delete { path }] if path == "app.log"),
+        "delete de local-only vai pela fila normal: {:?}",
+        snap
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn ignored_symlink_in_worktree_visible_with_kind() {
+    let test = init_repo();
+    commit_file(&test.repo, ".gitignore", b"*.lnk\n", "add gitignore");
+    std::os::unix::fs::symlink("alvo.txt", test.dir.path().join("a.lnk")).unwrap();
+
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("a.lnk").expect("symlink ignorado visível");
+    assert_eq!(fs.apply_getattr(ino).unwrap().kind, FileType::Symlink);
+    assert_eq!(fs.apply_readlink(ino).unwrap(), b"alvo.txt".to_vec());
+}

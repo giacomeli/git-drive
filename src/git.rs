@@ -396,6 +396,54 @@ pub fn pull_and_merge(
     }
 }
 
+/// Lista arquivos do working tree que casam com regras de ignore
+/// (`.gitignore`, `info/exclude`, `core.excludesfile`) e NÃO estão no índice.
+/// São os candidatos a "local-only visível": existem no disco, nunca entram
+/// em commit. Symlinks vêm com `FileKind::Symlink` e size = len do alvo.
+pub fn list_ignored_files(repo: &Repository) -> Result<Vec<ListedFile>, Error> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| Error::from_str("repo sem workdir (bare?)"))?
+        .to_path_buf();
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(true)
+        .recurse_ignored_dirs(true);
+    let statuses = repo.statuses(Some(&mut opts))?;
+
+    let mut out = Vec::new();
+    for entry in statuses.iter() {
+        if !entry.status().contains(git2::Status::IGNORED) {
+            continue;
+        }
+        let Some(path) = entry.path() else { continue };
+        let full = workdir.join(path);
+        let Ok(meta) = std::fs::symlink_metadata(&full) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            let size = std::fs::read_link(&full)
+                .map(|t| t.as_os_str().len() as u64)
+                .unwrap_or(0);
+            out.push(ListedFile {
+                path: path.to_string(),
+                size,
+                kind: FileKind::Symlink,
+            });
+        } else if meta.is_file() {
+            out.push(ListedFile {
+                path: path.to_string(),
+                size: meta.len(),
+                kind: FileKind::Regular,
+            });
+        }
+        // Diretórios ignorados não entram: os arquivos internos já vêm
+        // individualmente via recurse_ignored_dirs.
+    }
+    Ok(out)
+}
+
 /// `true` se o working tree não tem NENHUMA mudança pendente (staged,
 /// unstaged ou untracked; ignorados ficam de fora). Guarda do pull watcher:
 /// merge/checkout force só podem rodar com tree limpa — senão mudanças locais
@@ -882,6 +930,75 @@ mod tests {
         let (dir, repo) = init_repo_with_commit();
         std::fs::write(dir.path().join("novo.txt"), b"untracked").unwrap();
         assert!(!is_working_tree_clean(&repo).unwrap());
+    }
+
+    // ---- Fase 2.5, Bloco A: política de commit e ignorados ----
+
+    #[test]
+    fn is_working_tree_clean_true_with_only_ignored_files() {
+        // Pin do comportamento: ignorados não bloqueiam a guarda do pull.
+        let (dir, repo) = init_repo_with_commit();
+        commit_file(&repo, ".gitignore", b"*.log\n");
+        std::fs::write(dir.path().join("app.log"), b"ignorado").unwrap();
+        assert!(
+            is_working_tree_clean(&repo).unwrap(),
+            "arquivo ignorado não pode sujar a working tree para a guarda do pull"
+        );
+    }
+
+    #[test]
+    fn commit_working_tree_skips_ignored_file() {
+        // Pin do comportamento: IndexAddOption::DEFAULT respeita as regras de
+        // ignore — antes era efeito colateral, agora é especificado.
+        let (dir, repo) = init_repo_with_commit();
+        commit_file(&repo, ".gitignore", b"*.log\n");
+        std::fs::write(dir.path().join("app.log"), b"ignorado").unwrap();
+        std::fs::write(dir.path().join("real.txt"), b"real").unwrap();
+
+        let branch = current_branch_name(&repo).unwrap();
+        let oid = commit_working_tree(&repo, &branch, "A", "a@x.com", "batch")
+            .unwrap()
+            .expect("real.txt deve gerar commit");
+        let commit = repo.find_commit(oid).unwrap();
+        let tree = commit.tree().unwrap();
+        assert!(tree.get_path(Path::new("real.txt")).is_ok());
+        assert!(
+            tree.get_path(Path::new("app.log")).is_err(),
+            "app.log é ignorado e não pode entrar no commit"
+        );
+    }
+
+    #[test]
+    fn list_ignored_files_reports_untracked_ignored_with_sizes() {
+        let (dir, repo) = init_repo_with_commit();
+        commit_file(&repo, ".gitignore", b"*.log\nbuild/\n");
+        std::fs::write(dir.path().join("app.log"), b"12345").unwrap();
+        std::fs::create_dir_all(dir.path().join("build")).unwrap();
+        std::fs::write(dir.path().join("build/out.bin"), b"123").unwrap();
+        // Untracked NÃO-ignorado fica de fora
+        std::fs::write(dir.path().join("real.txt"), b"x").unwrap();
+
+        let mut files = list_ignored_files(&repo).unwrap();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let paths: Vec<(&str, u64)> = files.iter().map(|f| (f.path.as_str(), f.size)).collect();
+        assert_eq!(
+            paths,
+            vec![("app.log", 5), ("build/out.bin", 3)],
+            "só ignorados untracked, com tamanhos do disco"
+        );
+        assert!(files.iter().all(|f| f.kind == FileKind::Regular));
+    }
+
+    #[test]
+    fn list_ignored_files_reports_symlink_kind() {
+        let (dir, repo) = init_repo_with_commit();
+        commit_file(&repo, ".gitignore", b"*.lnk\n");
+        std::os::unix::fs::symlink("alvo.txt", dir.path().join("a.lnk")).unwrap();
+        let files = list_ignored_files(&repo).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "a.lnk");
+        assert_eq!(files[0].kind, FileKind::Symlink);
+        assert_eq!(files[0].size, "alvo.txt".len() as u64);
     }
 
     #[test]
