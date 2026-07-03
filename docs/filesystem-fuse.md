@@ -127,7 +127,7 @@ Regras que sustentam o modelo:
 | `readdir` | `readdir` | `apply_readdir(ino)` | Lista `.`, `..` e children ordenados por nome. Refresh só na primeira página (`offset == 0`). |
 | `readdirplus` | `readdirplus` | `apply_readdir(ino)` | Variante com atributos inline — Finder usa `getattrlistbulk`. |
 | `open` | `open` | — | Sempre aceita, fh = ino. |
-| `read` | `read` | — | Buffer do inode primeiro; fallback reabre repo e lê blob do HEAD. Erros viram `EIO`. |
+| `read` | `read` | `apply_read(ino, offset, size)` | Buffer do inode, cache de blobs, blob do HEAD (miss popula o cache). Erros viram `EIO`. |
 | `write` | `write` | `apply_write(ino, offset, data)` | Buffer inicializado do HEAD; escrita em offset; atualiza `entry.size`; marca dirty. |
 | `flush` | `flush` | `apply_flush(ino)` | Enfileira `queue_write` só se dirty; limpa a marca; `touch`. |
 | `release` | `release` | — | Apenas loga. |
@@ -135,7 +135,7 @@ Regras que sustentam o modelo:
 | `unlink` | `unlink` | `apply_unlink(parent, name)` | Remove de índices, buffer e dirty; enfileira `queue_delete`. `EISDIR` se for diretório. |
 | `mkdir` | `mkdir` | `apply_mkdir(parent, name)` | Aloca inode, insere `DirEntry`, enfileira `queue_mkdir`. Rejeita `.Trashes` na raiz (EPERM) para forçar delete via UNLINK no Finder. |
 | `rmdir` | `rmdir` | `apply_rmdir(parent, name)` | Remove inode + path, enfileira `queue_rmdir`. `ENOTEMPTY` se há children. |
-| `rename` | `rename` | `apply_rename(parent, name, new_parent, new_name)` | Move inode entre parents, atualiza paths de descendentes, reindexa. Dir usa `queue_rename`; arquivo vira `queue_write(dest) + queue_delete(src)` e limpa dirty. Nomes vazios acionam o swap implícito (encoding do exchangedata no macFUSE). |
+| `rename` | `rename` | `apply_rename(parent, name, new_parent, new_name)` | Move inode entre parents, atualiza paths de descendentes, reindexa. Dir usa `queue_rename` — exceto endpoints efêmeros: destino efêmero expande em Delete/Rmdir recursivo (bottom-up) e origem efêmera materializa via Mkdir/Write. Arquivo vira `queue_write(dest) + queue_delete(src)`, popula buffer não-dirty e limpa dirty. Nomes vazios acionam o swap implícito (encoding do exchangedata no macFUSE). |
 | `exchange` | `exchange` (macOS) | — | Troca conteúdo de dois arquivos (safe save do TextEdit/iWork). Atualiza buffers, enfileira os dois writes, limpa dirty. |
 | `link` | `link` | — | Simulado via cópia com inode novo (modelo 1 inode = 1 path). Cobre o backup transiente do safe save. |
 | `statfs` | `statfs` | — | Volume advertido com ~1 TiB livre — sinal para o userland, não quota. |
@@ -175,22 +175,29 @@ Não implementadas (default `ENOSYS`): `symlink`, `readlink`, `mknod`, `fsync`, 
 
 ## Leitura de Arquivos
 
-`fuser::read` em `src/fs.rs`:
+`apply_read` em `src/fs.rs` (callback `read` delega). Ordem das fontes:
 
-1. Se o inode tem write buffer (escrita ainda não commitada ou aguardando gc), serve dele.
-2. Fallback: reabre repo, resolve `HEAD`, lê o blob do path. Três operações Git por syscall, sem cache — gargalo conhecido para arquivos grandes.
+1. **Write buffer** do inode (mutações pendentes, conteúdo pós-create/rename ainda não commitado).
+2. **Cache de blobs** (`BlobCache`): LRU keyed por inode com orçamento em bytes (`read_cache_mb` no
+   `config.json`, default 64 MiB; `0` desativa). Blob maior que o orçamento não entra.
+3. **Blob do HEAD**: reabre o repo e lê; o miss popula o cache.
+
+Invalidação do cache: limpeza total nos pontos de gc de buffers (avanço de `commit_generation` e
+refresh pós-pull — o HEAD mudou); remoção por inode em `unlink`, `write`, `truncate` e rename de
+arquivo. `create` e rename de arquivo populam um buffer não-dirty com o conteúdo corrente — sem isso,
+ler o path novo antes do commit caía num blob inexistente no HEAD e retornava `EIO`.
 
 ---
 
 ## Limitações
 
-1. **Sem cache de blobs** em `read`.
-2. **TTL de 1s** no kernel mascara mudanças vindas do pull por até 1 segundo.
-3. **Sem symlinks / FIFOs / hardlinks reais** (`link` é cópia).
-4. **Permissões e xattrs em memória** — `chmod` aceito mas não persiste entre montagens; `chown` ignorado.
-5. **Timestamps em memória** — começam no boot do mount, avançam em escrita real, não persistem.
-6. **Escritas não-commitadas são perdidas em crash** antes do debounce drenar.
-7. **Swap implícito assume um único arquivo-filho** no diretório de origem — com vários, o primeiro da iteração é escolhido (validação prevista para a Fase 1).
+1. **TTL de 1s** no kernel mascara mudanças vindas do pull por até 1 segundo.
+2. **Sem symlinks / FIFOs / hardlinks reais** (`link` é cópia).
+3. **Permissões e xattrs em memória** — `chmod` aceito mas não persiste entre montagens; `chown` ignorado.
+4. **Timestamps em memória** — começam no boot do mount, avançam em escrita real, não persistem.
+5. **Escritas não-commitadas são perdidas em crash** antes do debounce drenar.
+6. **Swap implícito exige exatamente um arquivo-filho** no diretório de origem — ambiguidade retorna `EXDEV` e o app degrada para o fluxo de cópia.
+7. **Cache de blobs não cobre arquivos maiores que o orçamento** (`read_cache_mb`) — leituras deles reabrem o repo a cada syscall.
 
 ---
 

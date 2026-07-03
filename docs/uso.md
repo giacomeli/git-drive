@@ -158,7 +158,7 @@ Se o repo é local-only (`git init` sem `git remote add`), ignore esta etapa int
 
 ## 6. Ajustar `config.json`
 
-`config.json` fica na **raiz do projeto drive-sync** (não do repo montado). Ausente → defaults silenciosos; inválido → defaults com log `⚠️`.
+`config.json` fica na **raiz do projeto drive-sync** (não do repo montado). Ausente → defaults silenciosos; inválido → defaults com log de aviso.
 
 ### 6.1. Template completo comentado
 
@@ -166,6 +166,7 @@ Se o repo é local-only (`git init` sem `git remote add`), ignore esta etapa int
 {
   "write_debounce_secs": 5,
   "pull_interval_secs": 60,
+  "read_cache_mb": 64,
   "user_name": "Juliano",
   "user_email": "juliano@example.com",
   "remote_token": null
@@ -176,6 +177,7 @@ Se o repo é local-only (`git init` sem `git remote add`), ignore esta etapa int
 | --- | --- |
 | `write_debounce_secs` | Diminua (`1`–`2`) para ver commits mais rápido em dev; aumente (`30`) se fizer muitas escritas em rajada para agrupar em menos commits. |
 | `pull_interval_secs` | `0` desliga o pull watcher (útil em repos locais-only). Aumente se o remote muda pouco para reduzir chamadas de rede. |
+| `read_cache_mb` | Orçamento do cache de leitura em MiB (default `64`). Aumente para repos com arquivos grandes lidos com frequência; `0` desativa (cada leitura reabre o repo). |
 | `user_name` / `user_email` | Se qualquer um for `null`, drive-sync **aplica as mudanças no working tree mas não commita**. Deixe ambos preenchidos para ter histórico. |
 | `remote_token` | PAT para HTTPS. `null` cai para ssh-agent / credential helper. |
 
@@ -332,21 +334,44 @@ rmdir /tmp/gitmount/notas/2026   # precisa estar vazio
 
 ### 9.1. Logs do processo
 
-No terminal onde `cargo run` está ativo, cada ciclo imprime:
+Os logs da sessão ficam em `logs/drive-sync-<timestamp>.log` (o path é anunciado no boot; use `-v` para espelhar no terminal). Cada ciclo de drain imprime:
 
 ```text
-🔄 aplicando 3 operações
-✅ commit ab12cd3 — 3 changes (hello.txt, notas/.gitkeep, notas)
-🚀 push origin main (ok)
+[14:32:07.101] drain: sincronizando alterações
+[14:32:07.104] disk: write hello.txt
+[14:32:07.130] commit: criado ab12cd3...
+[14:32:07.512] push: origin ok
 ```
 
 Quando o pull watcher roda:
 
 ```text
-⬇️ fetch origin
-✅ fast-forward main → de12ef3
-♻️ refresh agendado
+[14:33:05.220] pull: fast-forward aplicado
 ```
+
+### 9.1.1. `drive-sync status`
+
+Resumo do estado sem ler log cru — rode do mesmo diretório de onde o daemon foi lançado (ou aponte com `--file`):
+
+```bash
+drive-sync status
+drive-sync status --file /outro/caminho/status.json
+```
+
+Saída típica:
+
+```text
+drive-sync — branch main
+  repo: /Users/voce/Projects/meu-drive
+  daemon: rodando (pid 4242)
+  iniciado há 2 h 10 min | atualizado há 12 s
+  ops pendentes: 0
+  último drain: há 1 min — 3 op(s), commit ab12cd3f, push ok
+  último pull: há 12 s — sem novidades
+  conflitos na sessão: nenhum
+```
+
+O daemon grava `logs/status.json` (escrita atômica) a cada evento de boot, drain e pull. Se `updated_at` estiver velho e o pid não responder, o subcomando sinaliza "POSSIVELMENTE PARADO". Um pull com "pulado: working tree sujo" recorrente no modo sem identidade indica escritas locais nunca commitadas bloqueando o pull (ver limitações).
 
 ### 9.2. Verificar no repo real
 

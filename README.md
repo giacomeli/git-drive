@@ -6,7 +6,7 @@ Status: estágio inicial (v0.1.0). Operações básicas implementadas: `create`,
 
 ## Requisitos
 
-- Rust 1.70+ (edition 2021)
+- Rust 1.77+ (edition 2021)
 - macOS com [macFUSE](https://osxfuse.github.io/) instalado: `brew install macfuse`
 - Um repositório Git local (com um branch checked-out) para montar
 - Opcional: `origin` configurado para sincronização com remote
@@ -17,6 +17,7 @@ Status: estágio inicial (v0.1.0). Operações básicas implementadas: `create`,
 cargo build
 cargo test                    # todos os testes
 cargo run -- -r <caminho_do_repo> -m <ponto_de_montagem>
+cargo run -- status           # estado do daemon (logs/status.json)
 ```
 
 Exemplo:
@@ -38,6 +39,7 @@ Opcional. Crie `config.json` na raiz do projeto:
 {
   "write_debounce_secs": 5,
   "pull_interval_secs": 60,
+  "read_cache_mb": 64,
   "user_name": "Seu Nome",
   "user_email": "voce@example.com",
   "remote_token": null
@@ -48,6 +50,7 @@ Opcional. Crie `config.json` na raiz do projeto:
 | --- | --- | --- |
 | `write_debounce_secs` | `5` | Segundos de ociosidade antes de aplicar escritas, commit e push. |
 | `pull_interval_secs` | `60` | Intervalo de pull periódico do remote `origin`. `0` desliga. |
+| `read_cache_mb` | `64` | Orçamento do cache LRU de blobs de leitura (MiB). `0` desativa. |
 | `user_name` | `null` | Identidade dos commits. Se ausente, commits são pulados. |
 | `user_email` | `null` | Idem. |
 | `remote_token` | `null` | Token HTTPS (ex: GitHub PAT). Se ausente, usa ssh-agent / credential helper. **Texto plano — já em `.gitignore`.** |

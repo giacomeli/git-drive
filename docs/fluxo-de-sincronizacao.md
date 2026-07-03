@@ -90,6 +90,7 @@ pub struct SyncManager {
     refresh_flag: Arc<AtomicBool>,
     commit_generation: Arc<AtomicU64>,
     repo_lock: Arc<Mutex<()>>,
+    status: Arc<StatusState>,
 }
 ```
 
@@ -99,6 +100,7 @@ pub struct SyncManager {
 - `refresh_flag` — `AtomicBool` setado quando o HEAD avança por pull ou reconcile; consumido por `GitDriveFS::refresh_if_needed`.
 - `commit_generation` — `AtomicU64` incrementado a cada commit criado pelo drain; o `GitDriveFS` compara com o último valor visto para descartar write buffers cujo conteúdo já está no HEAD.
 - `repo_lock` — serializa os ciclos completos do drain e do pull. A unidade atômica é o ciclo, não a chamada git individual: um commit entrando entre o fetch e o checkout do pull era a janela de corrida.
+- `status` — estado observável (`src/status.rs`): eventos de boot/drain/pull e conflicted copies da sessão, persistidos atomicamente em `logs/status.json` quando `enable_status_file` é chamado (o main liga no boot). Lido pelo subcomando `drive-sync status`.
 
 ### `SyncOp` e a fila causal
 
@@ -137,6 +139,7 @@ Fluxo, ver `src/sync.rs::spawn_watcher`:
 5. Itera o lote **na ordem da fila** chamando `apply_op_to_disk` para cada `SyncOp`.
 6. Se `user_name`/`user_email` estão presentes, `commit_batch` gera a mensagem `drive-sync: <N> changes (...)` e chama `git::commit_working_tree`. Commit criado incrementa `commit_generation`.
 7. Se houve commit e `remote_name` está configurado, `push_batch` chama `git::push_to_remote`. Push rejeitado (tipicamente non-FF) dispara `reconcile_and_retry_push`: fetch + `pull_and_merge` + um retry de push. Recuperação seta `refresh_flag`. O commit local nunca é revertido.
+8. Ao final do ciclo, `status.record_drain` registra ops aplicadas, oid do commit, resultado do push e ops ainda pendentes na fila — e persiste o `status.json`.
 
 ### Tradução `SyncOp` -> working tree
 
@@ -163,6 +166,7 @@ Erros são logados e o lote segue — arquivos restantes são tentados. **Sem at
 5. `git::fetch_remote` (`git fetch origin <branch>`).
 6. Com identidade: `git::pull_and_merge` — FF se possível; senão merge 3-way; conflito gera conflicted copy (`<path>.conflict-<host>-<ts>`) com a versão remota como canônica. Sem identidade: degrada para `git::merge_ff_only` (trava em divergência).
 7. Qualquer outcome que toque a tree (`FastForwarded`/`Merged`/`Conflicted`) seta `refresh_flag = true`.
+8. Toda iteração registra o outcome em `status.record_pull` — inclusive os pulos ("fila de sync pendente", "working tree sujo") e erros de fetch/merge. Conflicted copies entram na lista `conflicts` do status.
 
 ---
 
@@ -212,6 +216,13 @@ Buffers **dirty** (escrita ainda não enfileirada) nunca são descartados.
 - **Filtro total** (`is_fully_ephemeral_path`, todas as ops): componentes `._*`, `.DS_Store`, `.Spotlight-V100`, `.Trashes`, `.TemporaryItems`, `.fseventsd`, `.DocumentRevisions-V100`, `.apdisk`, `.VolumeIcon.icns`.
 - **Filtro de criação** (`is_textedit_scratch_path`, só Write/Mkdir e destino de Rename): componentes contendo `.sb-` (temp dirs do safe-save do TextEdit/NSDocument). Delete/Rmdir passam para permitir limpar resíduos já commitados.
 
+Renames de DIRETÓRIO com endpoint efêmero não chegam ao filtro como `Rename` (que seria descartado
+inteiro, divergindo disco e índice): `apply_rename` expande a operação antes de enfileirar —
+destino efêmero (ex.: mover pasta para o Trash) vira Delete/Rmdir recursivo dos paths reais
+(bottom-up), com buffers preservando leitura e restore; origem efêmera virando real materializa via
+Mkdir/Write top-down com o conteúdo corrente. Renames de ARQUIVO já se resolvem pela tradução
+Write+Delete (o lado efêmero é filtrado individualmente).
+
 ---
 
 ## Limitações do Fluxo Atual
@@ -257,7 +268,8 @@ A única coalescência hoje é Write-sobre-Write (`push_coalescing` em `src/sync
 | `src/sync.rs` | `SyncManager`, `SyncOp`, fila causal (`push_coalescing`), watchers, `commit_batch`, `push_batch`, `reconcile_and_retry_push` |
 | `src/fs.rs` | `write_buffers` + dirty flags, `refresh_if_needed` (gc de buffers + rebuild), chamadas a `sync.queue_*` nos `apply_*` |
 | `src/git.rs` | `commit_working_tree`, `push_to_remote`, `fetch_remote`, `merge_ff_only`, `pull_and_merge`, `is_working_tree_clean` |
-| `src/config.rs` | Origem de `write_debounce_secs`, `pull_interval_secs`, identidade e token |
+| `src/status.rs` | `SyncStatus`/`StatusState`, escrita atômica do `status.json`, formatação do subcomando |
+| `src/config.rs` | Origem de `write_debounce_secs`, `pull_interval_secs`, `read_cache_mb`, identidade e token |
 
 Docs relacionadas:
 
