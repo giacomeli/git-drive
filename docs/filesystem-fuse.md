@@ -133,7 +133,7 @@ Regras que sustentam o modelo:
 | `release` | `release` | — | Apenas loga. |
 | `create` | `create` | `apply_create(parent, name)` | Aloca inode, insere `FileEntry`, enfileira `queue_write(path, [])` para materializar em disco. |
 | `unlink` | `unlink` | `apply_unlink(parent, name)` | Remove de índices, buffer e dirty; enfileira `queue_delete`. `EISDIR` se for diretório. |
-| `mkdir` | `mkdir` | `apply_mkdir(parent, name)` | Aloca inode, insere `DirEntry`, enfileira `queue_mkdir`. Rejeita `.Trashes` na raiz (EPERM) para forçar delete via UNLINK no Finder. |
+| `mkdir` | `mkdir` | `apply_mkdir(parent, name)` | Aloca inode, insere `DirEntry`, enfileira `queue_mkdir` (paths efêmeros como `.Trashes` ficam só em memória — Lixeira nativa do Finder). |
 | `rmdir` | `rmdir` | `apply_rmdir(parent, name)` | Remove inode + path, enfileira `queue_rmdir`. `ENOTEMPTY` se há children. |
 | `rename` | `rename` | `apply_rename(parent, name, new_parent, new_name)` | Move inode entre parents, atualiza paths de descendentes, reindexa. Flags do `renameatx_np` (patch no vendor/fuser): `RENAME_SWAP` roteia para `apply_exchange`, `RENAME_EXCL` retorna `EEXIST` se o destino existe. Dir usa `queue_rename` — exceto endpoints efêmeros: destino efêmero expande em Delete/Rmdir recursivo (bottom-up) e origem efêmera materializa via Mkdir/Write. Arquivo vira `queue_write(dest) + queue_delete(src)`, popula buffer não-dirty e limpa dirty. Nomes vazios (fallback defensivo do parse antigo) acionam o swap implícito. |
 | `exchange` | `exchange` (macOS) | `apply_exchange(parent, name, newparent, newname)` | Troca conteúdo de dois arquivos (safe save do TextEdit/iWork). Atualiza buffers, enfileira os dois writes, limpa dirty. Mesma lógica atende `rename` com `RENAME_SWAP`. |
@@ -153,7 +153,6 @@ Regras que sustentam o modelo:
 | `EINVAL` | Nome não-UTF8 |
 | `EIO` | Erro do `git2` em `read` |
 | `EXDEV` | Swap implícito sem par no destino (defesa contra encodings ambíguos do exchangedata) |
-| `EPERM` | `mkdir .Trashes` na raiz |
 
 Não implementadas (default `ENOSYS`): `symlink`, `readlink`, `mknod`, `fsync`, `fallocate`, `copy_file_range`.
 

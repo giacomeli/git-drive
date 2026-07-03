@@ -61,7 +61,9 @@ drive-sync/
 | CLI / Orquestração | `src/main.rs` | Parse de argumentos com `clap`, carga de config, detecção de branch, instanciação de `SyncManager` e `GitDriveFS`, chamada bloqueante a `fuser::mount2`. |
 | Filesystem | `src/fs.rs` | Implementa `fuser::Filesystem`. Modelo hierárquico (`FileEntry` + `DirEntry`), alocador atômico de inodes, buffers de escrita em memória, `apply_*` puras para teste. |
 | Git | `src/git.rs` | Abre repo, resolve revisões, lê blobs, lista arquivos/dirs. Cria commits com identidade, empurra refspec para remote, faz fetch + merge-ff-only. |
-| Sincronização | `src/sync.rs` | `SyncManager` com enum `SyncOp` e dois watchers: (a) debounce-commit-push e (b) pull periódico com sinal de refresh via `AtomicBool`. |
+| Sincronização | `src/sync.rs` | `SyncManager` com enum `SyncOp` e dois watchers: (a) debounce-commit-push e (b) pull periódico com sinal de refresh via `AtomicBool`. `DrainCtx` compartilha o ciclo com o `drain_now` do shutdown. |
+| Observabilidade | `src/status.rs`, `src/notify.rs`, `src/tray.rs` | `status.json` atômico (eventos de boot/drain/pull/parada), notificações macOS via osascript e tray na barra de menus com polling do status. |
+| Instalação | `src/launchd.rs`, `src/paths.rs` | LaunchAgents (daemon + tray opcional) gerados por template, paths padrão do macOS resolvidos por flags. |
 | Configuração | `src/config.rs` | Loader de `config.json` com `#[serde(default)]` por campo. Defaults sensatos para os 5 campos. |
 
 ### CLI / Orquestração

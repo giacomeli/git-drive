@@ -17,8 +17,20 @@ Status: estágio inicial (v0.1.0). Operações básicas implementadas: `create`,
 cargo build
 cargo test                    # todos os testes
 cargo run -- -r <caminho_do_repo> -m <ponto_de_montagem>
-cargo run -- status           # estado do daemon (logs/status.json)
+cargo run -- status           # estado do daemon
+cargo run -- tray             # ícone de status na barra de menus
 ```
+
+Para montar automaticamente no login (LaunchAgent com KeepAlive):
+
+```bash
+cargo run -- install -r <caminho_do_repo> -m <ponto_de_montagem> --with-tray
+cargo run -- uninstall        # para o daemon e remove os agentes
+```
+
+SIGTERM/eject fazem parada limpa: a fila pendente é commitada e enviada antes de sair. Conflitos de
+merge, push falho e pull bloqueado geram notificação do macOS. A Lixeira do Finder funciona
+nativamente (itens recuperáveis até esvaziar ou remontar).
 
 Exemplo:
 

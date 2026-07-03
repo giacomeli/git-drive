@@ -141,6 +141,11 @@ Fluxo, ver `src/sync.rs::spawn_watcher`:
 7. Se houve commit e `remote_name` está configurado, `push_batch` chama `git::push_to_remote`. Push rejeitado (tipicamente non-FF) dispara `reconcile_and_retry_push`: fetch + `pull_and_merge` + um retry de push. Recuperação seta `refresh_flag`. O commit local nunca é revertido.
 8. Ao final do ciclo, `status.record_drain` registra ops aplicadas, oid do commit, resultado do push e ops ainda pendentes na fila — e persiste o `status.json`.
 
+O corpo do ciclo vive em `DrainCtx::run`, compartilhado entre o watcher e o `drain_now` do shutdown
+limpo: SIGTERM/SIGINT/eject disparam unmount (o kernel entrega os flushes de fds abertos), depois
+`drain_now` drena a fila final de forma síncrona — nada enfileirado se perde na parada. Push falho
+pós-reconcile e conflicted copies também disparam notificações macOS (`notify.rs`).
+
 ### Tradução `SyncOp` -> working tree
 
 | Op | Efeito em disco |
@@ -269,6 +274,7 @@ A única coalescência hoje é Write-sobre-Write (`push_coalescing` em `src/sync
 | `src/fs.rs` | `write_buffers` + dirty flags, `refresh_if_needed` (gc de buffers + rebuild), chamadas a `sync.queue_*` nos `apply_*` |
 | `src/git.rs` | `commit_working_tree`, `push_to_remote`, `fetch_remote`, `merge_ff_only`, `pull_and_merge`, `is_working_tree_clean` |
 | `src/status.rs` | `SyncStatus`/`StatusState`, escrita atômica do `status.json`, formatação do subcomando |
+| `src/notify.rs` | Notificações macOS (osascript) com rate limit para eventos persistentes |
 | `src/config.rs` | Origem de `write_debounce_secs`, `pull_interval_secs`, `read_cache_mb`, identidade e token |
 
 Docs relacionadas:

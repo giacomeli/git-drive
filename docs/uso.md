@@ -13,9 +13,11 @@ Este guia mostra, na ordem em que você deve executar, como preparar o ambiente,
 - [7. Montar o drive](#7-montar-o-drive)
 - [8. Usar o filesystem no dia a dia](#8-usar-o-filesystem-no-dia-a-dia)
 - [9. Observar o ciclo de sincronização](#9-observar-o-ciclo-de-sincronização)
-- [10. Desmontar](#10-desmontar)
-- [11. Cenários completos](#11-cenários-completos)
-- [12. Troubleshooting](#12-troubleshooting)
+- [10. Montar automaticamente no login (launchd)](#10-montar-automaticamente-no-login-launchd)
+- [11. Lixeira do Finder](#11-lixeira-do-finder)
+- [12. Desmontar](#12-desmontar)
+- [13. Cenários completos](#13-cenários-completos)
+- [14. Troubleshooting](#14-troubleshooting)
 - [Como estender este guia](#como-estender-este-guia)
 
 ---
@@ -371,7 +373,48 @@ drive-sync — branch main
   conflitos na sessão: nenhum
 ```
 
-O daemon grava `logs/status.json` (escrita atômica) a cada evento de boot, drain e pull. Se `updated_at` estiver velho e o pid não responder, o subcomando sinaliza "POSSIVELMENTE PARADO". Um pull com "pulado: working tree sujo" recorrente no modo sem identidade indica escritas locais nunca commitadas bloqueando o pull (ver limitações).
+O daemon grava o `status.json` (escrita atômica) a cada evento de boot, drain, pull e parada. Se `updated_at` estiver velho e o pid não responder, o subcomando sinaliza "POSSIVELMENTE PARADO". Um pull com "pulado: working tree sujo" recorrente no modo sem identidade indica escritas locais nunca commitadas bloqueando o pull (ver limitações).
+
+### 9.1.2. Tray na barra de menus
+
+```bash
+drive-sync tray
+```
+
+Ícone circular com o estado do drive: verde (sincronizado), laranja (ops pendentes), vermelho
+(conflito ou push falho), cinza (daemon parado ou status stale). O menu traz o resumo do status,
+"Abrir drive no Finder", "Ver log em tempo real" (Terminal com `tail -f`), "Status detalhado" e
+"Sair da tray". Instale junto do daemon com `drive-sync install ... --with-tray` para subir no login.
+
+### 9.1.3. Notificações
+
+O daemon notifica via Central de Notificações (atribuídas ao "Script Editor"): conflito de merge
+(com os nomes das conflicted copies), push falho persistente, drive montado/desmontado e pull
+bloqueado por working tree sujo (no máximo uma por hora enquanto persistir).
+
+## 10. Montar automaticamente no login (launchd)
+
+```bash
+drive-sync install -r ~/Projects/meu-drive -m ~/GitDrive --with-tray
+```
+
+O install grava `~/Library/LaunchAgents/dev.giacomeli.drive-sync.plist` (RunAtLoad + KeepAlive),
+copia o `config.json` do diretório atual para `~/Library/Application Support/drive-sync/` (se ainda
+não existir) e passa os paths padrão por flags — logs em `~/Library/Logs/drive-sync/`, status em
+`~/Library/Application Support/drive-sync/status.json` (o `drive-sync status` acha sozinho de
+qualquer diretório).
+
+- **Parada limpa:** SIGTERM (launchctl, logout) ou eject no Finder drenam a fila pendente (commit +
+  push) antes de sair — nada se perde. Parada limpa não é ressuscitada pelo KeepAlive.
+- **Crash:** o launchd religa o daemon, que detecta e recupera mount zumbi deixado pelo processo
+  morto.
+- **Remover:** `drive-sync uninstall` (para o daemon, desmonta e remove os agentes, inclusive a tray).
+
+## 11. Lixeira do Finder
+
+Mover itens do drive para o Lixo remove do repositório (vira commit) mas os mantém visíveis e
+recuperáveis na Lixeira do Finder enquanto o mount viver — restaurar rematerializa no repo.
+Esvaziar a Lixeira (ou desmontar/remontar) libera a memória e torna a remoção definitiva no volume.
 
 ### 9.2. Verificar no repo real
 
@@ -393,31 +436,40 @@ git log origin/main --oneline -5
 
 ---
 
-## 10. Desmontar
+## 12. Desmontar
 
-Duas formas, nesta ordem de preferência:
+Qualquer uma das formas abaixo faz **parada limpa**: o volume desmonta, a fila pendente é drenada
+(commit + push mesmo do que estava no meio do debounce) e o status registra o encerramento.
 
-### 10.1. Ctrl-C no terminal do mount
-
-Mais limpo. `fuser::mount2` captura o sinal e libera o ponto de montagem. Qualquer lote pendente **não é drenado** — fique de olho no último log para confirmar que o debounce já rodou antes de sair.
-
-### 10.2. `umount` externo
+### 12.1. Ctrl-C (ou SIGTERM) no processo do mount
 
 ```bash
-umount /tmp/gitmount           # ou: diskutil unmount /tmp/gitmount
+# no terminal do mount: Ctrl-C
+# ou de fora:
+pkill -TERM -f 'drive-sync -r'
 ```
 
-Útil se o terminal original foi perdido. Em caso de "device busy", feche processos que ainda têm file descriptors no mount (`lsof /tmp/gitmount`).
+### 12.2. Eject no Finder / `umount` externo
 
-### 10.3. Boas práticas antes de desmontar
+```bash
+umount ~/GitDrive              # ou: diskutil unmount ~/GitDrive
+```
 
-1. Aguardar pelo menos `write_debounce_secs` segundos após a última escrita.
-2. Confirmar no log que o último lote fez commit + push.
-3. Conferir `git log` no repo real.
+O daemon detecta o fim da sessão, drena a fila e sai. Em caso de "device busy", feche processos com
+file descriptors abertos no mount (`lsof ~/GitDrive`).
+
+### 12.3. Via launchd
+
+```bash
+drive-sync uninstall           # para de vez (remove os agentes)
+launchctl kill TERM gui/$UID/dev.giacomeli.drive-sync   # para só a instância (KeepAlive NÃO religa exit 0)
+```
+
+Confirme com `drive-sync status` — deve mostrar "encerrado de forma limpa".
 
 ---
 
-## 11. Cenários completos
+## 13. Cenários completos
 
 ### 11.1. Cenário A — drive local com commits, sem remote
 
@@ -509,7 +561,7 @@ cargo run -- -r ~/drives/compartilhado -m /tmp/compartilhado
 
 ---
 
-## 12. Troubleshooting
+## 14. Troubleshooting
 
 | Sintoma | Causa provável | Ação |
 | --- | --- | --- |
