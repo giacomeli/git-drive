@@ -396,6 +396,71 @@ pub fn pull_and_merge(
     }
 }
 
+/// Converte o timestamp de committer de um commit em `SystemTime` (UTC).
+fn commit_system_time(commit: &git2::Commit) -> std::time::SystemTime {
+    let secs = commit.time().seconds();
+    if secs >= 0 {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64)
+    } else {
+        std::time::UNIX_EPOCH
+    }
+}
+
+/// Timestamp do último commit que tocou cada path do HEAD, calculado num
+/// ÚNICO revwalk (não um walk por arquivo). Percorre do HEAD para trás,
+/// diffando cada commit contra o primeiro pai; o primeiro commit (mais
+/// recente) que toca um path define o timestamp dele. Para com teto de
+/// profundidade `depth_cap` ou quando todos os paths foram resolvidos; o
+/// resíduo recebe o timestamp do HEAD (fallback barato e determinístico).
+/// Merge commits são diffados só contra o primeiro pai — arquivos trazidos
+/// pelo merge recebem o timestamp do merge (aproximação documentada).
+pub fn commit_times_by_path(
+    repo: &Repository,
+    depth_cap: usize,
+) -> Result<std::collections::HashMap<String, std::time::SystemTime>, Error> {
+    use std::collections::{HashMap, HashSet};
+
+    let head = repo.head()?.peel_to_commit()?;
+    let head_time = commit_system_time(&head);
+    let mut pending: HashSet<String> = list_files_at_commit(repo, &head)?
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    let mut out: HashMap<String, std::time::SystemTime> = HashMap::new();
+
+    let mut revwalk = repo.revwalk()?;
+    revwalk.push_head()?;
+    revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+
+    let mut depth = 0usize;
+    for oid in revwalk {
+        if pending.is_empty() || depth >= depth_cap {
+            break;
+        }
+        depth += 1;
+        let commit = repo.find_commit(oid?)?;
+        let time = commit_system_time(&commit);
+        let tree = commit.tree()?;
+        let parent_tree = match commit.parent(0) {
+            Ok(parent) => Some(parent.tree()?),
+            Err(_) => None, // commit raiz: diff contra tree vazia
+        };
+        let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+        for delta in diff.deltas() {
+            if let Some(path) = delta.new_file().path().and_then(|p| p.to_str()) {
+                if pending.remove(path) {
+                    out.insert(path.to_string(), time);
+                }
+            }
+        }
+    }
+
+    for path in pending {
+        out.insert(path, head_time);
+    }
+    Ok(out)
+}
+
 /// Lista arquivos do working tree que casam com regras de ignore
 /// (`.gitignore`, `info/exclude`, `core.excludesfile`) e NÃO estão no índice.
 /// São os candidatos a "local-only visível": existem no disco, nunca entram
@@ -999,6 +1064,71 @@ mod tests {
         assert_eq!(files[0].path, "a.lnk");
         assert_eq!(files[0].kind, FileKind::Symlink);
         assert_eq!(files[0].size, "alvo.txt".len() as u64);
+    }
+
+    // ---- Fase 2.5, Bloco C: mtime derivado do histórico ----
+
+    /// Commita um arquivo com timestamp de committer explícito (epoch segundos).
+    fn commit_file_at(repo: &Repository, relpath: &str, content: &[u8], epoch_secs: i64) {
+        let workdir = repo.workdir().unwrap();
+        let full = workdir.join(relpath);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full, content).unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new(relpath)).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+
+        let time = git2::Time::new(epoch_secs, 0);
+        let sig = Signature::new("Test", "test@example.com", &time).unwrap();
+        let parent_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "add", &tree, &[&parent_commit])
+            .unwrap();
+    }
+
+    fn epoch(secs: u64) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn commit_times_by_path_assigns_last_touch_per_path() {
+        let (_dir, repo) = init_repo_with_commit();
+        commit_file_at(&repo, "a.txt", b"v1", 1_600_000_000);
+        commit_file_at(&repo, "b.txt", b"y", 1_650_000_000);
+        commit_file_at(&repo, "a.txt", b"v2", 1_700_000_000);
+
+        let times = commit_times_by_path(&repo, 100).unwrap();
+        assert_eq!(times.get("a.txt"), Some(&epoch(1_700_000_000)));
+        assert_eq!(times.get("b.txt"), Some(&epoch(1_650_000_000)));
+    }
+
+    #[test]
+    fn commit_times_by_path_depth_cap_falls_back_to_head_time() {
+        let (_dir, repo) = init_repo_with_commit();
+        commit_file_at(&repo, "antigo.txt", b"x", 1_600_000_000);
+        commit_file_at(&repo, "novo.txt", b"y", 1_700_000_000);
+
+        // Cap 1: só o commit do HEAD é diffado; antigo.txt cai no fallback
+        // (timestamp do HEAD), nunca em boot_time/erro.
+        let times = commit_times_by_path(&repo, 1).unwrap();
+        assert_eq!(times.get("novo.txt"), Some(&epoch(1_700_000_000)));
+        assert_eq!(
+            times.get("antigo.txt"),
+            Some(&epoch(1_700_000_000)),
+            "path fora do teto recebe o timestamp do HEAD"
+        );
+    }
+
+    #[test]
+    fn commit_times_by_path_covers_nested_paths() {
+        let (_dir, repo) = init_repo_with_commit();
+        commit_file_at(&repo, "docs/a.md", b"x", 1_620_000_000);
+        let times = commit_times_by_path(&repo, 100).unwrap();
+        assert_eq!(times.get("docs/a.md"), Some(&epoch(1_620_000_000)));
     }
 
     #[test]

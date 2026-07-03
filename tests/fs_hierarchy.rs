@@ -1099,3 +1099,67 @@ async fn ignored_symlink_in_worktree_visible_with_kind() {
     assert_eq!(fs.apply_getattr(ino).unwrap().kind, FileType::Symlink);
     assert_eq!(fs.apply_readlink(ino).unwrap(), b"alvo.txt".to_vec());
 }
+
+// ---- Fase 2.5, Bloco C: mtime derivado do último commit por path ----
+
+fn epoch_time(secs: u64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn mtime_after_boot_derives_from_last_commit_per_path() {
+    let test = init_repo();
+    common::commit_file_at(&test.repo, "antigo.txt", b"v1", 1_600_000_000, "add antigo");
+    common::commit_file_at(&test.repo, "novo.txt", b"x", 1_700_000_000, "add novo");
+
+    let fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let antigo = fs.find_inode("antigo.txt").unwrap();
+    let novo = fs.find_inode("novo.txt").unwrap();
+    assert_eq!(
+        fs.apply_getattr(antigo).unwrap().mtime,
+        epoch_time(1_600_000_000),
+        "mtime deve vir do último commit que tocou o path, não do boot"
+    );
+    assert_eq!(fs.apply_getattr(novo).unwrap().mtime, epoch_time(1_700_000_000));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn mtime_touched_in_session_has_precedence_over_derived() {
+    let test = init_repo();
+    common::commit_file_at(&test.repo, "a.txt", b"v1", 1_600_000_000, "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("a.txt").unwrap();
+
+    let before = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
+    fs.apply_write(ino, 0, b"v2").unwrap();
+    fs.apply_flush(ino);
+    let mtime = fs.apply_getattr(ino).unwrap().mtime;
+    assert!(
+        mtime > before,
+        "arquivo tocado na sessão usa o relógio corrente, não o derivado"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn mtime_derived_updates_after_refresh() {
+    let test = init_repo();
+    common::commit_file_at(&test.repo, "a.txt", b"v1", 1_600_000_000, "add");
+
+    let sync = SyncManager::new(test.dir.path().to_str().unwrap(), 5);
+    let sync_handle = sync.clone();
+    let mut fs = GitDriveFS::new(test.dir.path().to_str().unwrap(), "main".to_string(), sync)
+        .expect("GitDriveFS::new");
+    let ino = fs.find_inode("a.txt").unwrap();
+    assert_eq!(fs.apply_getattr(ino).unwrap().mtime, epoch_time(1_600_000_000));
+
+    // Simula mudança remota chegando via pull: commit novo + refresh flag
+    common::commit_file_at(&test.repo, "a.txt", b"v2", 1_700_000_000, "update");
+    sync_handle.raise_refresh_flag();
+    fs.refresh_if_needed();
+
+    assert_eq!(
+        fs.apply_getattr(ino).unwrap().mtime,
+        epoch_time(1_700_000_000),
+        "path tocado pelo commit novo atualiza o mtime derivado no refresh"
+    );
+}

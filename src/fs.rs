@@ -175,6 +175,10 @@ pub struct GitDriveFS {
     gid: u32,
     mode_overrides: Arc<parking_lot::Mutex<HashMap<u64, u16>>>,
     times: Arc<parking_lot::Mutex<HashMap<u64, SystemTime>>>,
+    /// mtime derivado do último commit que tocou cada path (revwalk único no
+    /// boot/refresh). Consultado depois de `times` (sessão) e antes de
+    /// `boot_time` (resíduo: local-only e diretórios).
+    derived_times: HashMap<u64, SystemTime>,
     boot_time: SystemTime,
     xattrs: Arc<parking_lot::Mutex<HashMap<u64, HashMap<OsString, Vec<u8>>>>>,
 }
@@ -292,12 +296,16 @@ impl GitDriveFS {
             gid: unsafe { libc::getgid() },
             mode_overrides: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             times: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            derived_times: HashMap::new(),
             boot_time: SystemTime::now(),
             xattrs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         };
         // Arquivos ignorados presentes no working tree entram como local-only
         // visíveis (Fase 2.5): aparecem no mount, nunca em commit.
         fs.incorporate_local_only(&HashMap::new());
+        // mtime derivado do histórico: sem isso, todo remount "renovaria" o
+        // mtime de todos os arquivos para o instante do boot.
+        fs.refresh_derived_times();
         Ok(fs)
     }
 
@@ -310,8 +318,10 @@ impl GitDriveFS {
     }
 
     fn time_for(&self, ino: u64) -> SystemTime {
-        self.times
-            .lock()
+        if let Some(t) = self.times.lock().get(&ino) {
+            return *t;
+        }
+        self.derived_times
             .get(&ino)
             .copied()
             .unwrap_or(self.boot_time)
@@ -916,6 +926,8 @@ impl GitDriveFS {
         // Local-only não vive no HEAD: reincorpora do working tree, reusando
         // inodes do índice anterior para não invalidar handles do kernel.
         self.incorporate_local_only(&previous);
+        // HEAD avançou: paths tocados pelo pull ganham o mtime do commit novo.
+        self.refresh_derived_times();
     }
 
     pub fn apply_mkdir(&mut self, parent: u64, name: &str) -> Result<(u64, FileAttr), i32> {
@@ -1394,6 +1406,35 @@ impl GitDriveFS {
             .children
             .insert(ino);
         ino
+    }
+
+    /// Teto de commits percorridos pelo revwalk de mtime. Histórias mais
+    /// longas caem no fallback (timestamp do HEAD) para não onerar o boot.
+    const MTIME_WALK_DEPTH_CAP: usize = 4096;
+
+    /// Recalcula o mapa de mtimes derivados (inode -> timestamp do último
+    /// commit que tocou o path). Chamado no boot e no refresh pós-pull.
+    fn refresh_derived_times(&mut self) {
+        let repo = match git::open_repo(&self.repo_path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[{}] mtime: erro ao abrir repo: {}", log_ts(), e);
+                return;
+            }
+        };
+        let by_path = match git::commit_times_by_path(&repo, Self::MTIME_WALK_DEPTH_CAP) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[{}] mtime: revwalk falhou: {}", log_ts(), e);
+                return;
+            }
+        };
+        self.derived_times.clear();
+        for (path, time) in by_path {
+            if let Some(&ino) = self.inodes_by_path.get(&path) {
+                self.derived_times.insert(ino, time);
+            }
+        }
     }
 
     /// Conteúdo de um arquivo local-only, lido do working tree. Para symlink,
