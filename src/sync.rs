@@ -48,6 +48,12 @@ pub struct SyncManager {
     /// com o último valor visto para descartar write buffers "limpos" (conteúdo
     /// já commitado no HEAD) — ver `refresh_if_needed`.
     commit_generation: Arc<AtomicU64>,
+    /// Serializa os ciclos completos dos dois watchers sobre o mesmo repo:
+    /// drain (apply + commit + push + reconcile) e pull (fetch + merge +
+    /// checkout) nunca rodam concorrentes. A unidade atômica é o CICLO, não a
+    /// chamada git individual — um commit entrando entre o fetch e o checkout
+    /// do pull era a janela de corrida (RF4 da Fase 0).
+    repo_lock: Arc<Mutex<()>>,
 }
 
 struct Inner {
@@ -136,6 +142,7 @@ impl SyncManager {
             remote_token,
             refresh_flag: Arc::new(AtomicBool::new(false)),
             commit_generation: Arc::new(AtomicU64::new(0)),
+            repo_lock: Arc::new(Mutex::new(())),
         };
 
         manager.spawn_watcher();
@@ -172,6 +179,7 @@ impl SyncManager {
         let user_name = self.user_name.clone();
         let user_email = self.user_email.clone();
         let refresh_flag = self.refresh_flag.clone();
+        let repo_lock = self.repo_lock.clone();
 
         task::spawn(async move {
             loop {
@@ -186,6 +194,10 @@ impl SyncManager {
                     break;
                 };
 
+                // Serializa com o ciclo do drain (RF4). Sem .await enquanto o
+                // guard vive — o lock cobre só chamadas bloqueantes de git.
+                let _repo_guard = repo_lock.lock();
+
                 let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
                     Ok(r) => r,
                     Err(e) => {
@@ -193,6 +205,24 @@ impl SyncManager {
                         continue;
                     }
                 };
+
+                // Guarda RF6: merge/checkout force só com working tree limpo.
+                // Tree suja = mudanças locais ainda não commitadas (típico do
+                // modo sem identidade) — um fast-forward as destruiria.
+                match git::is_working_tree_clean(&repo) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        println!(
+                            "[{}] pull: working tree com mudanças não commitadas — pulando",
+                            log_ts()
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("[{}] pull: erro ao checar working tree: {}", log_ts(), e);
+                        continue;
+                    }
+                }
 
                 if let Err(e) =
                     git::fetch_remote(&repo, &branch, remote, remote_token.as_deref())
@@ -312,6 +342,7 @@ impl SyncManager {
         let remote_token = self.remote_token.clone();
         let refresh_flag = self.refresh_flag.clone();
         let commit_generation = self.commit_generation.clone();
+        let repo_lock = self.repo_lock.clone();
 
         task::spawn(async move {
             loop {
@@ -336,6 +367,10 @@ impl SyncManager {
 
                     if let Some(changes) = drained {
                         println!("[{}] drain: sincronizando alterações", log_ts());
+                        // Serializa o ciclo inteiro (apply + commit + push +
+                        // reconcile) com o pull watcher (RF4). Sem .await no
+                        // escopo do guard.
+                        let _repo_guard = repo_lock.lock();
                         // Aplicação na ordem de chegada — a fila já é causal.
                         let ops: Vec<&SyncOp> = changes.iter().collect();
                         for op in &ops {

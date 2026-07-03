@@ -558,3 +558,67 @@ async fn batch_create_write_delete_leaves_no_residue() {
         "working tree líquido inalterado não deve gerar commit"
     );
 }
+
+// ---- Regressão RF6 (Fase 0): pull só com working tree limpo ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn pull_watcher_skips_when_working_tree_dirty() {
+    // Cenário de perda de dados: no modo sem identidade, escritas locais vivem
+    // só no working tree (commits são pulados). Antes do fix, o fast-forward
+    // do pull rodava checkout force e DESTRUÍA essas mudanças.
+    let test = init_repo();
+    let bare = init_bare_remote();
+    let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+    test.repo.remote("origin", &bare_url).unwrap();
+    commit_file(&test.repo, "hi.txt", b"v1", "add hi");
+    drive_sync::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
+
+    // Mudança local NÃO commitada (working tree sujo)
+    std::fs::write(test.dir.path().join("hi.txt"), b"local-edit").unwrap();
+
+    // Pull watcher sem identidade (modo degradado, FF-only), intervalo 1s
+    let sync = SyncManager::new_full_with_pull(
+        test.dir.path().to_str().unwrap(),
+        "main".to_string(),
+        60,
+        None,
+        None,
+        Some("origin".to_string()),
+        None,
+        1,
+    );
+
+    // B publica v2 no remote
+    let dir_b = tempfile::tempdir().unwrap();
+    let repo_b = git2::Repository::clone(&bare_url, dir_b.path()).unwrap();
+    {
+        let mut cfg = repo_b.config().unwrap();
+        cfg.set_str("user.name", "Bob").unwrap();
+        cfg.set_str("user.email", "b@x.com").unwrap();
+    }
+    std::fs::write(dir_b.path().join("hi.txt"), b"v2").unwrap();
+    let mut index = repo_b.index().unwrap();
+    index.add_path(std::path::Path::new("hi.txt")).unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo_b.find_tree(tree_id).unwrap();
+    let sig = git2::Signature::now("Bob", "b@x.com").unwrap();
+    let parent = repo_b.head().unwrap().peel_to_commit().unwrap();
+    repo_b
+        .commit(Some("HEAD"), &sig, &sig, "v2 from B", &tree, &[&parent])
+        .unwrap();
+    drive_sync::git::push_to_remote(&repo_b, "main", "origin", None).unwrap();
+
+    // esperar mais de um ciclo de pull
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+
+    assert_eq!(
+        read_file(test.dir.path(), "hi.txt"),
+        b"local-edit",
+        "mudança local não commitada não pode ser destruída pelo pull"
+    );
+    assert!(
+        !sync.take_refresh_flag(),
+        "pull não deve ter aplicado nada com working tree sujo"
+    );
+}

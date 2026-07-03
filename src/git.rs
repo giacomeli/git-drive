@@ -367,6 +367,19 @@ pub fn pull_and_merge(
     }
 }
 
+/// `true` se o working tree não tem NENHUMA mudança pendente (staged,
+/// unstaged ou untracked; ignorados ficam de fora). Guarda do pull watcher:
+/// merge/checkout force só podem rodar com tree limpa — senão mudanças locais
+/// não commitadas seriam destruídas (RF6 da Fase 0).
+pub fn is_working_tree_clean(repo: &Repository) -> Result<bool, Error> {
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false);
+    let statuses = repo.statuses(Some(&mut opts))?;
+    Ok(statuses.is_empty())
+}
+
 pub fn current_branch_name(repo: &Repository) -> Result<String, Error> {
     let head = repo.head()?;
     if !head.is_branch() {
@@ -762,6 +775,28 @@ mod tests {
         assert_eq!(head.parent_count(), 2, "merge commit de conflito deve ter 2 pais");
         // Estado de merge deve estar limpo (sem MERGE_HEAD pendurado)
         assert!(repo_a.state() == git2::RepositoryState::Clean);
+    }
+
+    #[test]
+    fn is_working_tree_clean_true_on_fresh_commit() {
+        let (_dir, repo) = init_repo_with_commit();
+        commit_file(&repo, "a.txt", b"x");
+        assert!(is_working_tree_clean(&repo).unwrap());
+    }
+
+    #[test]
+    fn is_working_tree_clean_false_on_modified_tracked_file() {
+        let (dir, repo) = init_repo_with_commit();
+        commit_file(&repo, "a.txt", b"x");
+        std::fs::write(dir.path().join("a.txt"), b"editado").unwrap();
+        assert!(!is_working_tree_clean(&repo).unwrap());
+    }
+
+    #[test]
+    fn is_working_tree_clean_false_on_untracked_file() {
+        let (dir, repo) = init_repo_with_commit();
+        std::fs::write(dir.path().join("novo.txt"), b"untracked").unwrap();
+        assert!(!is_working_tree_clean(&repo).unwrap());
     }
 
     #[test]
