@@ -12,18 +12,55 @@ use crate::log_ts;
 use crate::paths;
 
 pub const LABEL: &str = "dev.giacomeli.drive-sync";
+pub const TRAY_LABEL: &str = "dev.giacomeli.drive-sync.tray";
 
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-/// Path do plist do agente: `~/Library/LaunchAgents/<label>.plist`.
-pub fn agent_plist_path() -> PathBuf {
+fn launch_agents_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("Library/LaunchAgents")
-        .join(format!("{}.plist", LABEL))
+}
+
+/// Path do plist do agente: `~/Library/LaunchAgents/<label>.plist`.
+pub fn agent_plist_path() -> PathBuf {
+    launch_agents_dir().join(format!("{}.plist", LABEL))
+}
+
+pub fn tray_plist_path() -> PathBuf {
+    launch_agents_dir().join(format!("{}.plist", TRAY_LABEL))
+}
+
+/// Plist do agente da tray (sobe no login; sem KeepAlive — fechar pela opção
+/// "Sair da tray" não deve ressuscitar).
+pub fn render_tray_plist(binary: &Path, status_file: &Path) -> String {
+    let e = |p: &Path| xml_escape(&p.to_string_lossy());
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{bin}</string>
+        <string>tray</string>
+        <string>--file</string>
+        <string>{status}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"#,
+        label = TRAY_LABEL,
+        bin = e(binary),
+        status = e(status_file),
+    )
 }
 
 /// Renderiza o plist do LaunchAgent. Puro e testável.
@@ -98,7 +135,8 @@ fn gui_domain() -> String {
 
 /// Instala o LaunchAgent: resolve paths absolutos, prepara diretórios padrão,
 /// copia o config se necessário, grava o plist e registra no launchd.
-pub fn install(repo: &str, mount: &str) -> anyhow::Result<()> {
+/// `with_tray` registra um segundo agente que sobe a tray no login.
+pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
     let binary = std::env::current_exe()?;
     let repo = std::fs::canonicalize(repo)
         .map_err(|e| anyhow::anyhow!("repo {} inacessível: {}", repo, e))?;
@@ -149,6 +187,23 @@ pub fn install(repo: &str, mount: &str) -> anyhow::Result<()> {
         );
     }
 
+    if with_tray {
+        let tray_plist = render_tray_plist(&binary, &status_file);
+        let tray_path = tray_plist_path();
+        std::fs::write(&tray_path, tray_plist)?;
+        let _ = launchctl(&["bootout", &format!("{}/{}", gui_domain(), TRAY_LABEL)]);
+        let out = launchctl(&["bootstrap", &gui_domain(), tray_path.to_str().unwrap()])?;
+        if !out.status.success() {
+            eprintln!(
+                "[{}] install: bootstrap da tray falhou ({}) — rode `drive-sync tray` manualmente",
+                log_ts(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        } else {
+            println!("[{}] install: tray registrada ({})", log_ts(), TRAY_LABEL);
+        }
+    }
+
     println!("[{}] install: LaunchAgent registrado ({})", log_ts(), LABEL);
     println!("  plist:  {}", plist_path.display());
     println!("  repo:   {}", repo.display());
@@ -174,6 +229,13 @@ pub fn uninstall() -> anyhow::Result<()> {
     let plist_path = agent_plist_path();
     match std::fs::remove_file(&plist_path) {
         Ok(()) => println!("[{}] uninstall: {} removido", log_ts(), plist_path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    // Tray (se instalada): bootout de agente ausente é ignorado.
+    let _ = launchctl(&["bootout", &format!("{}/{}", gui_domain(), TRAY_LABEL)]);
+    match std::fs::remove_file(tray_plist_path()) {
+        Ok(()) => println!("[{}] uninstall: agente da tray removido", log_ts()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }

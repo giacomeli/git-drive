@@ -6,6 +6,7 @@ pub mod notify;
 pub mod paths;
 pub mod status;
 pub mod sync;
+pub mod tray;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -65,9 +65,25 @@ fn cli() -> Command {
                         .value_name("MOUNT_PATH")
                         .required(true)
                         .help("Ponto de montagem do drive"),
+                )
+                .arg(
+                    Arg::new("with-tray")
+                        .long("with-tray")
+                        .help("Registra também a tray para subir no login")
+                        .action(clap::ArgAction::SetTrue),
                 ),
         )
         .subcommand(Command::new("uninstall").about("Para o daemon e remove o LaunchAgent"))
+        .subcommand(
+            Command::new("tray")
+                .about("Ícone de status na barra de menus (monitor do daemon)")
+                .arg(
+                    Arg::new("file")
+                        .long("file")
+                        .value_name("PATH")
+                        .help("Caminho do status.json (padrão: ./logs/status.json, depois o padrão do macOS)"),
+                ),
+        )
         .arg(
             Arg::new("repo")
                 .short('r')
@@ -127,10 +143,18 @@ fn main() -> anyhow::Result<()> {
         return drive_sync::launchd::install(
             sub.get_one::<String>("repo").unwrap(),
             sub.get_one::<String>("mount").unwrap(),
+            sub.get_flag("with-tray"),
         );
     }
     if matches.subcommand_matches("uninstall").is_some() {
         return drive_sync::launchd::uninstall();
+    }
+    if let Some(sub) = matches.subcommand_matches("tray") {
+        let file =
+            drive_sync::paths::resolve_status_for_read(sub.get_one::<String>("file").map(String::as_str));
+        // A tray toma a main thread com o event loop do AppKit — por isso o
+        // dispatch acontece antes de qualquer runtime tokio.
+        return drive_sync::tray::run(file);
     }
 
     run_mount(&matches)
