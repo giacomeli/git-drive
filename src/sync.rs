@@ -1,0 +1,847 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use parking_lot::Mutex;
+use tokio::sync::Notify;
+use tokio::time::{sleep, Instant};
+use tokio::task;
+
+use crate::git;
+use crate::log_ts;
+
+#[derive(Debug, Clone)]
+pub enum SyncOp {
+    Write { path: String, content: Vec<u8> },
+    Delete { path: String },
+    Mkdir { path: String },
+    Rmdir { path: String },
+    Rename { from: String, to: String },
+}
+
+impl SyncOp {
+    pub fn primary_path(&self) -> &str {
+        match self {
+            SyncOp::Write { path, .. } => path,
+            SyncOp::Delete { path } => path,
+            SyncOp::Mkdir { path } => path,
+            SyncOp::Rmdir { path } => path,
+            SyncOp::Rename { to, .. } => to,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SyncManager {
+    inner: Arc<Mutex<Inner>>,
+    notify: Arc<Notify>,
+    debounce_secs: u64,
+    repo_path: PathBuf,
+    branch: String,
+    user_name: Option<String>,
+    user_email: Option<String>,
+    remote_name: Option<String>,
+    remote_token: Option<String>,
+    refresh_flag: Arc<AtomicBool>,
+}
+
+struct Inner {
+    buffer: HashMap<String, SyncOp>,
+    last_op: Option<Instant>,
+}
+
+impl SyncManager {
+    pub fn new(repo_path: &str, debounce_secs: u64) -> Self {
+        Self::new_full(
+            repo_path,
+            "main".to_string(),
+            debounce_secs,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub fn new_with_identity(
+        repo_path: &str,
+        branch: String,
+        debounce_secs: u64,
+        user_name: Option<String>,
+        user_email: Option<String>,
+    ) -> Self {
+        Self::new_full(
+            repo_path,
+            branch,
+            debounce_secs,
+            user_name,
+            user_email,
+            None,
+            None,
+        )
+    }
+
+    pub fn new_full(
+        repo_path: &str,
+        branch: String,
+        debounce_secs: u64,
+        user_name: Option<String>,
+        user_email: Option<String>,
+        remote_name: Option<String>,
+        remote_token: Option<String>,
+    ) -> Self {
+        Self::new_full_with_pull(
+            repo_path,
+            branch,
+            debounce_secs,
+            user_name,
+            user_email,
+            remote_name,
+            remote_token,
+            0, // 0 desliga o pull watcher
+        )
+    }
+
+    pub fn new_full_with_pull(
+        repo_path: &str,
+        branch: String,
+        debounce_secs: u64,
+        user_name: Option<String>,
+        user_email: Option<String>,
+        remote_name: Option<String>,
+        remote_token: Option<String>,
+        pull_interval_secs: u64,
+    ) -> Self {
+        let manager = SyncManager {
+            inner: Arc::new(Mutex::new(Inner {
+                buffer: HashMap::new(),
+                last_op: None,
+            })),
+            notify: Arc::new(Notify::new()),
+            debounce_secs,
+            repo_path: PathBuf::from(repo_path),
+            branch,
+            user_name,
+            user_email,
+            remote_name,
+            remote_token,
+            refresh_flag: Arc::new(AtomicBool::new(false)),
+        };
+
+        manager.spawn_watcher();
+        if pull_interval_secs > 0 && manager.remote_name.is_some() {
+            manager.spawn_pull_watcher(pull_interval_secs);
+        }
+        manager
+    }
+
+    /// Retorna o valor atual da refresh_flag e zera. Usado por `GitDriveFS`
+    /// para decidir quando reconstruir os índices.
+    pub fn take_refresh_flag(&self) -> bool {
+        self.refresh_flag.swap(false, Ordering::SeqCst)
+    }
+
+    fn spawn_pull_watcher(&self, interval_secs: u64) {
+        let inner = self.inner.clone();
+        let repo_path = self.repo_path.clone();
+        let branch = self.branch.clone();
+        let remote_name = self.remote_name.clone();
+        let remote_token = self.remote_token.clone();
+        let user_name = self.user_name.clone();
+        let user_email = self.user_email.clone();
+        let refresh_flag = self.refresh_flag.clone();
+
+        task::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(interval_secs)).await;
+
+                // Não roda pull enquanto há lote pendente (evita corrida com commit local)
+                let pending = { !inner.lock().buffer.is_empty() };
+                if pending {
+                    continue;
+                }
+                let Some(ref remote) = remote_name else {
+                    break;
+                };
+
+                let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("[{}] pull: erro ao abrir repo: {}", log_ts(), e);
+                        continue;
+                    }
+                };
+
+                if let Err(e) =
+                    git::fetch_remote(&repo, &branch, remote, remote_token.as_deref())
+                {
+                    eprintln!("[{}] pull: erro no fetch: {}", log_ts(), e);
+                    continue;
+                }
+
+                // Com identidade: merge 3-way + conflicted copy em caso de conflito.
+                // Sem identidade: degrada para FF-only (não dá pra criar merge commit).
+                let outcome: Result<git::MergeOutcome, git2::Error> =
+                    match (user_name.as_deref(), user_email.as_deref()) {
+                        (Some(name), Some(email)) => {
+                            let suffix = conflict_suffix();
+                            git::pull_and_merge(&repo, &branch, remote, name, email, &suffix)
+                        }
+                        _ => git::merge_ff_only(&repo, &branch).map(|applied| {
+                            if applied {
+                                git::MergeOutcome::FastForwarded
+                            } else {
+                                git::MergeOutcome::NoOp
+                            }
+                        }),
+                    };
+
+                match outcome {
+                    Ok(git::MergeOutcome::NoOp) => {}
+                    Ok(git::MergeOutcome::FastForwarded) => {
+                        println!("[{}] pull: fast-forward aplicado", log_ts());
+                        refresh_flag.store(true, Ordering::SeqCst);
+                    }
+                    Ok(git::MergeOutcome::Merged) => {
+                        println!("[{}] pull: merge 3-way sem conflitos", log_ts());
+                        refresh_flag.store(true, Ordering::SeqCst);
+                    }
+                    Ok(git::MergeOutcome::Conflicted { resolved, suffix }) => {
+                        println!(
+                            "[{}] pull: resolveu {} conflito(s) — locais em *.{}: {:?}",
+                            log_ts(),
+                            resolved.len(),
+                            suffix,
+                            resolved
+                        );
+                        refresh_flag.store(true, Ordering::SeqCst);
+                    }
+                    Err(e) => {
+                        eprintln!("[{}] pull: erro no merge: {}", log_ts(), e);
+                    }
+                }
+            }
+        });
+    }
+
+    pub fn queue_write(&self, path: &str, content: Vec<u8>) {
+        self.enqueue(SyncOp::Write {
+            path: path.to_string(),
+            content,
+        });
+    }
+
+    pub fn queue_delete(&self, path: &str) {
+        self.enqueue(SyncOp::Delete {
+            path: path.to_string(),
+        });
+    }
+
+    pub fn queue_mkdir(&self, path: &str) {
+        self.enqueue(SyncOp::Mkdir {
+            path: path.to_string(),
+        });
+    }
+
+    pub fn queue_rmdir(&self, path: &str) {
+        self.enqueue(SyncOp::Rmdir {
+            path: path.to_string(),
+        });
+    }
+
+    pub fn queue_rename(&self, from: &str, to: &str) {
+        self.enqueue(SyncOp::Rename {
+            from: from.to_string(),
+            to: to.to_string(),
+        });
+    }
+
+    fn enqueue(&self, op: SyncOp) {
+        if op_touches_ephemeral(&op) {
+            return;
+        }
+        {
+            let mut inner = self.inner.lock();
+            let key = op.primary_path().to_string();
+            inner.buffer.insert(key, op);
+            inner.last_op = Some(Instant::now());
+        }
+        self.notify.notify_one();
+    }
+
+    pub fn buffer_snapshot(&self) -> Vec<SyncOp> {
+        let inner = self.inner.lock();
+        inner.buffer.values().cloned().collect()
+    }
+
+    fn spawn_watcher(&self) {
+        let debounce_secs = self.debounce_secs;
+        let notify = self.notify.clone();
+        let inner = self.inner.clone();
+        let repo_path = self.repo_path.clone();
+        let branch = self.branch.clone();
+        let user_name = self.user_name.clone();
+        let user_email = self.user_email.clone();
+        let remote_name = self.remote_name.clone();
+        let remote_token = self.remote_token.clone();
+        let refresh_flag = self.refresh_flag.clone();
+
+        task::spawn(async move {
+            loop {
+                notify.notified().await;
+
+                loop {
+                    sleep(Duration::from_secs(debounce_secs)).await;
+
+                    let drained = {
+                        let mut inner = inner.lock();
+                        let should_drain = inner
+                            .last_op
+                            .map(|l| l.elapsed() >= Duration::from_secs(debounce_secs))
+                            .unwrap_or(false)
+                            && !inner.buffer.is_empty();
+                        if !should_drain {
+                            None
+                        } else {
+                            Some(inner.buffer.drain().collect::<Vec<_>>())
+                        }
+                    };
+
+                    if let Some(changes) = drained {
+                        println!("[{}] drain: sincronizando alterações", log_ts());
+                        let mut sorted: Vec<SyncOp> = changes.into_iter().map(|(_, v)| v).collect();
+                        // Ordem causal segura: criar dirs → escrever arquivos → renomear → deletar.
+                        // O HashMap dá ordem arbitrária; sem isso, rename pode rodar antes do
+                        // mkdir do mesmo path e falhar com ENOENT.
+                        sorted.sort_by_key(op_priority);
+                        let ops: Vec<&SyncOp> = sorted.iter().collect();
+                        for op in &ops {
+                            apply_op_to_disk(&repo_path, op);
+                        }
+                        let committed = commit_batch(
+                            &repo_path,
+                            &branch,
+                            &user_name,
+                            &user_email,
+                            &ops,
+                        );
+                        if committed {
+                            if let Some(ref remote) = remote_name {
+                                let ok = push_batch(&repo_path, &branch, remote, &remote_token);
+                                if !ok {
+                                    let recovered = reconcile_and_retry_push(
+                                        &repo_path,
+                                        &branch,
+                                        remote,
+                                        &remote_token,
+                                        &user_name,
+                                        &user_email,
+                                    );
+                                    if recovered {
+                                        refresh_flag.store(true, Ordering::SeqCst);
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+    }
+}
+
+fn apply_op_to_disk(repo_path: &Path, op: &SyncOp) {
+    match op {
+        SyncOp::Write { path, content } => {
+            let full = repo_path.join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            match std::fs::write(&full, content) {
+                Ok(_) => println!("[{}] disk: write {}", log_ts(), path),
+                Err(e) => eprintln!("[{}] disk: erro ao salvar {}: {}", log_ts(), path, e),
+            }
+        }
+        SyncOp::Delete { path } => {
+            let full = repo_path.join(path);
+            match std::fs::remove_file(&full) {
+                Ok(_) => println!("[{}] disk: unlink {}", log_ts(), path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Path nunca chegou ao disco (ex.: temp dirs `.sb-*` que o
+                    // filtro bloqueia na criação mas deixa passar no delete).
+                    // Idempotente: já não existe = remoção bem-sucedida.
+                }
+                Err(e) => eprintln!("[{}] disk: erro ao remover {}: {}", log_ts(), path, e),
+            }
+        }
+        SyncOp::Mkdir { path } => {
+            let full = repo_path.join(path);
+            if let Err(e) = std::fs::create_dir_all(&full) {
+                eprintln!("[{}] disk: erro ao criar diretório {}: {}", log_ts(), path, e);
+                return;
+            }
+            let keep = full.join(".gitkeep");
+            if !keep.exists() {
+                if let Err(e) = std::fs::write(&keep, b"") {
+                    eprintln!(
+                        "[{}] disk: erro ao criar .gitkeep em {}: {}",
+                        log_ts(),
+                        path,
+                        e
+                    );
+                    return;
+                }
+            }
+            println!("[{}] disk: mkdir {}", log_ts(), path);
+        }
+        SyncOp::Rmdir { path } => {
+            let full = repo_path.join(path);
+            let keep = full.join(".gitkeep");
+            let _ = std::fs::remove_file(&keep);
+            match std::fs::remove_dir(&full) {
+                Ok(_) => println!("[{}] disk: rmdir {}", log_ts(), path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Mesmo racional do Delete: diretório que nunca chegou ao
+                    // disco (ex.: `.sb-*`) gera ENOENT no rmdir. Silencia.
+                }
+                Err(e) => eprintln!(
+                    "[{}] disk: erro ao remover diretório {}: {}",
+                    log_ts(),
+                    path,
+                    e
+                ),
+            }
+        }
+        SyncOp::Rename { from, to } => {
+            let from_full = repo_path.join(from);
+            let to_full = repo_path.join(to);
+            if let Some(parent) = to_full.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            match std::fs::rename(&from_full, &to_full) {
+                Ok(_) => println!("[{}] disk: rename {} -> {}", log_ts(), from, to),
+                Err(e) => eprintln!(
+                    "[{}] disk: erro ao renomear {} -> {}: {}",
+                    log_ts(),
+                    from,
+                    to,
+                    e
+                ),
+            }
+        }
+    }
+}
+
+/// Retorna `true` se um commit foi criado (para sinalizar se vale a pena
+/// tentar push em seguida).
+fn commit_batch(
+    repo_path: &Path,
+    branch: &str,
+    user_name: &Option<String>,
+    user_email: &Option<String>,
+    ops: &[&SyncOp],
+) -> bool {
+    let (Some(name), Some(email)) = (user_name.as_deref(), user_email.as_deref()) else {
+        println!(
+            "[{}] commit: user_name/user_email ausentes — commit ignorado",
+            log_ts()
+        );
+        return false;
+    };
+    let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[{}] commit: erro ao abrir repo: {}", log_ts(), e);
+            return false;
+        }
+    };
+    let message = build_commit_message(ops);
+    match git::commit_working_tree(&repo, branch, name, email, &message) {
+        Ok(Some(oid)) => {
+            println!("[{}] commit: criado {}", log_ts(), oid);
+            true
+        }
+        Ok(None) => {
+            println!("[{}] commit: tree limpa, nada a commitar", log_ts());
+            false
+        }
+        Err(e) => {
+            eprintln!("[{}] commit: erro: {}", log_ts(), e);
+            false
+        }
+    }
+}
+
+fn push_batch(repo_path: &Path, branch: &str, remote: &str, token: &Option<String>) -> bool {
+    let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[{}] push: erro ao abrir repo: {}", log_ts(), e);
+            return false;
+        }
+    };
+    match git::push_to_remote(&repo, branch, remote, token.as_deref()) {
+        Ok(_) => {
+            println!("[{}] push: {} ok", log_ts(), remote);
+            true
+        }
+        Err(e) => {
+            eprintln!("[{}] push: erro em {}: {}", log_ts(), remote, e);
+            false
+        }
+    }
+}
+
+/// Push falhou (geralmente non-FF). Faz fetch + pull_and_merge + retry de push único.
+/// Retorna `true` se o retry teve sucesso (implica que o working tree mudou e o caller
+/// deve sinalizar refresh pro FUSE).
+fn reconcile_and_retry_push(
+    repo_path: &Path,
+    branch: &str,
+    remote: &str,
+    token: &Option<String>,
+    user_name: &Option<String>,
+    user_email: &Option<String>,
+) -> bool {
+    let (Some(name), Some(email)) = (user_name.as_deref(), user_email.as_deref()) else {
+        eprintln!(
+            "[{}] reconcile: push falhou e sem identidade — impossível reconciliar",
+            log_ts()
+        );
+        return false;
+    };
+    let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[{}] reconcile: erro ao abrir repo: {}", log_ts(), e);
+            return false;
+        }
+    };
+
+    if let Err(e) = git::fetch_remote(&repo, branch, remote, token.as_deref()) {
+        eprintln!("[{}] reconcile: erro no fetch: {}", log_ts(), e);
+        return false;
+    }
+
+    let suffix = conflict_suffix();
+    match git::pull_and_merge(&repo, branch, remote, name, email, &suffix) {
+        Ok(git::MergeOutcome::NoOp) => {
+            eprintln!(
+                "[{}] reconcile: sem divergência — erro original pode ser rede/auth",
+                log_ts()
+            );
+            return false;
+        }
+        Ok(git::MergeOutcome::Conflicted { ref resolved, ref suffix }) => {
+            println!(
+                "[{}] reconcile: {} conflito(s) — locais em *.{}: {:?}",
+                log_ts(),
+                resolved.len(),
+                suffix,
+                resolved
+            );
+        }
+        Ok(o) => {
+            println!("[{}] reconcile: aplicado ({:?})", log_ts(), o);
+        }
+        Err(e) => {
+            eprintln!("[{}] reconcile: erro no pull_and_merge: {}", log_ts(), e);
+            return false;
+        }
+    }
+
+    match git::push_to_remote(&repo, branch, remote, token.as_deref()) {
+        Ok(_) => {
+            println!("[{}] push: retry em {} ok", log_ts(), remote);
+            true
+        }
+        Err(e) => {
+            eprintln!("[{}] push: retry ainda falhou: {}", log_ts(), e);
+            false
+        }
+    }
+}
+
+/// Gera sufixo único para conflicted copies. Formato: `conflict-<hostname>-<unix_ts>`.
+fn conflict_suffix() -> String {
+    let host = gethostname_or("unknown");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("conflict-{}-{}", host, ts)
+}
+
+fn gethostname_or(fallback: &str) -> String {
+    let mut buf = [0u8; 256];
+    let ret = unsafe {
+        libc::gethostname(
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len() as libc::size_t,
+        )
+    };
+    if ret != 0 {
+        return fallback.to_string();
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    match std::str::from_utf8(&buf[..len]) {
+        Ok(s) if !s.is_empty() => s.to_string(),
+        _ => fallback.to_string(),
+    }
+}
+
+fn build_commit_message(ops: &[&SyncOp]) -> String {
+    let n = ops.len();
+    let paths: Vec<&str> = ops.iter().map(|op| op.primary_path()).collect();
+    let preview: Vec<&str> = paths.iter().take(3).copied().collect();
+    let more = if n > preview.len() {
+        format!(", +{} more", n - preview.len())
+    } else {
+        String::new()
+    };
+    format!("drive-sync: {} changes ({}{})", n, preview.join(", "), more)
+}
+
+/// Paths que o macOS gera como ruído e que nunca devem vazar pro working tree/commit.
+/// Detecta qualquer componente do caminho que bata com um padrão conhecido.
+/// Paths que nunca devem aparecer no working tree — sujeira gerada e deletada
+/// pelo próprio macOS (AppleDouble, metadados de Finder/Spotlight/Trash).
+/// Filtramos TODAS as ops: a gente não quer nem o rastro delas em commit.
+fn is_fully_ephemeral_path(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    for component in path.split('/') {
+        if component.starts_with("._") {
+            return true;
+        }
+        if matches!(
+            component,
+            ".DS_Store"
+                | ".Spotlight-V100"
+                | ".Trashes"
+                | ".TemporaryItems"
+                | ".fseventsd"
+                | ".DocumentRevisions-V100"
+                | ".apdisk"
+                | ".VolumeIcon.icns"
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Padrão do safe-save do TextEdit/NSDocument: `<nome>.sb-<hex>-<rand>`.
+/// Temp dirs e backups hardlinkados. Usamos esse padrão só pra bloquear a
+/// **criação** (Write/Mkdir). Delete/Rmdir/Rename passam, pra que o usuário
+/// possa limpar resíduos `.sb-*` que já estejam commitados no repo.
+fn is_textedit_scratch_path(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    path.split('/').any(|c| c.contains(".sb-"))
+}
+
+fn op_touches_ephemeral(op: &SyncOp) -> bool {
+    match op {
+        SyncOp::Write { path, .. } | SyncOp::Mkdir { path } => {
+            is_fully_ephemeral_path(path) || is_textedit_scratch_path(path)
+        }
+        SyncOp::Delete { path } | SyncOp::Rmdir { path } => is_fully_ephemeral_path(path),
+        SyncOp::Rename { from, to } => {
+            is_fully_ephemeral_path(from)
+                || is_fully_ephemeral_path(to)
+                || is_textedit_scratch_path(to)
+        }
+    }
+}
+
+/// Ordem de aplicação dentro de um batch. Garante que dependências causais sejam
+/// respeitadas mesmo quando o `HashMap` de buffer serializa em ordem arbitrária:
+/// o diretório existe antes do arquivo; o rename acha a origem; deletes fecham
+/// a batch pra não brigar com writes que criariam o mesmo path.
+pub(crate) fn op_priority(op: &SyncOp) -> u8 {
+    match op {
+        SyncOp::Mkdir { .. } => 0,
+        SyncOp::Write { .. } => 1,
+        SyncOp::Rename { .. } => 2,
+        SyncOp::Delete { .. } => 3,
+        SyncOp::Rmdir { .. } => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mgr() -> SyncManager {
+        SyncManager::new("/tmp/ignored", 60)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn queue_write_appends_to_buffer() {
+        let m = mgr();
+        m.queue_write("a.txt", b"hello".to_vec());
+        let snap = m.buffer_snapshot();
+        assert_eq!(snap.len(), 1);
+        match &snap[0] {
+            SyncOp::Write { path, content } => {
+                assert_eq!(path, "a.txt");
+                assert_eq!(content.as_slice(), b"hello");
+            }
+            other => panic!("esperado Write, obtido {:?}", other),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn queue_write_twice_same_path_coalesces() {
+        let m = mgr();
+        m.queue_write("a.txt", b"first".to_vec());
+        m.queue_write("a.txt", b"second".to_vec());
+        let snap = m.buffer_snapshot();
+        assert_eq!(snap.len(), 1);
+        match &snap[0] {
+            SyncOp::Write { content, .. } => assert_eq!(content.as_slice(), b"second"),
+            other => panic!("esperado Write, obtido {:?}", other),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn queue_mkdir_then_rmdir_same_path_last_wins() {
+        let m = mgr();
+        m.queue_mkdir("foo");
+        m.queue_rmdir("foo");
+        let snap = m.buffer_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert!(matches!(snap[0], SyncOp::Rmdir { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn queue_rename_uses_destination_as_key() {
+        let m = mgr();
+        m.queue_rename("a.txt", "b.txt");
+        m.queue_write("b.txt", b"x".to_vec());
+        let snap = m.buffer_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert!(matches!(snap[0], SyncOp::Write { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn queue_delete_creates_delete_op() {
+        let m = mgr();
+        m.queue_delete("x.txt");
+        let snap = m.buffer_snapshot();
+        assert_eq!(snap.len(), 1);
+        match &snap[0] {
+            SyncOp::Delete { path } => assert_eq!(path, "x.txt"),
+            other => panic!("esperado Delete, obtido {:?}", other),
+        }
+    }
+
+    #[test]
+    fn is_ephemeral_path_flags_apple_double_and_system_dirs() {
+        assert!(is_fully_ephemeral_path("._hi.txt"));
+        assert!(is_fully_ephemeral_path("foo/._hi.txt"));
+        assert!(is_fully_ephemeral_path(".DS_Store"));
+        assert!(is_fully_ephemeral_path("docs/.DS_Store"));
+        assert!(is_fully_ephemeral_path(".Spotlight-V100"));
+        assert!(is_fully_ephemeral_path(".Trashes/whatever"));
+        assert!(!is_fully_ephemeral_path("hi.txt"));
+        assert!(!is_fully_ephemeral_path("foo/hi.txt"));
+        // .sb-* não entra em `is_ephemeral_path` (filtro total) — só em
+        // `is_textedit_scratch_path`, que é parcial.
+        assert!(!is_fully_ephemeral_path("hi.txt.sb-36d9af71-iFhNoR"));
+        assert!(!is_fully_ephemeral_path(""));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn textedit_scratch_paths_block_creation_but_allow_delete() {
+        let m = mgr();
+        // Criação: filtra
+        m.queue_write("hi.txt.sb-36d9af71-backup", b"x".to_vec());
+        m.queue_mkdir("hi.txt.sb-36d9af71-tempdir");
+        // Delete/rmdir: passa (usuário consegue limpar `.sb-*` legado)
+        m.queue_delete("hi.txt.sb-36d9af71-old-backup");
+        m.queue_rmdir("hi.txt.sb-36d9af71-old-tempdir");
+        let snap = m.buffer_snapshot();
+        assert_eq!(snap.len(), 2, "esperado só Delete+Rmdir, obtido {:?}", snap);
+        assert!(snap.iter().any(|op| matches!(op, SyncOp::Delete { .. })));
+        assert!(snap.iter().any(|op| matches!(op, SyncOp::Rmdir { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn queue_write_drops_ephemeral_path() {
+        let m = mgr();
+        m.queue_write("._hi.txt", b"junk".to_vec());
+        m.queue_write(".DS_Store", b"junk".to_vec());
+        m.queue_write("hi.txt", b"real".to_vec());
+        let snap = m.buffer_snapshot();
+        assert_eq!(snap.len(), 1);
+        match &snap[0] {
+            SyncOp::Write { path, .. } => assert_eq!(path, "hi.txt"),
+            other => panic!("esperado Write para hi.txt, obtido {:?}", other),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn queue_rename_drops_when_either_side_is_ephemeral() {
+        let m = mgr();
+        m.queue_rename("hi.txt", "._hi.txt");
+        m.queue_rename("._hi.txt", "hi.txt");
+        assert_eq!(m.buffer_snapshot().len(), 0);
+    }
+
+    #[test]
+    fn op_priority_orders_mkdir_before_rename_before_rmdir() {
+        let ops = vec![
+            SyncOp::Rename { from: "a".into(), to: "b".into() },
+            SyncOp::Rmdir { path: "old".into() },
+            SyncOp::Mkdir { path: "a".into() },
+            SyncOp::Write { path: "b/f".into(), content: vec![] },
+            SyncOp::Delete { path: "zzz".into() },
+        ];
+        let mut sorted = ops;
+        sorted.sort_by_key(op_priority);
+        let kinds: Vec<&'static str> = sorted
+            .iter()
+            .map(|op| match op {
+                SyncOp::Mkdir { .. } => "mkdir",
+                SyncOp::Write { .. } => "write",
+                SyncOp::Rename { .. } => "rename",
+                SyncOp::Delete { .. } => "delete",
+                SyncOp::Rmdir { .. } => "rmdir",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["mkdir", "write", "rename", "delete", "rmdir"]);
+    }
+
+    #[test]
+    fn build_commit_message_three_paths() {
+        let ops_owned = [
+            SyncOp::Write { path: "a.txt".into(), content: vec![] },
+            SyncOp::Write { path: "b.txt".into(), content: vec![] },
+            SyncOp::Write { path: "c.txt".into(), content: vec![] },
+        ];
+        let ops: Vec<&SyncOp> = ops_owned.iter().collect();
+        let m = build_commit_message(&ops);
+        assert!(m.contains("3 changes"), "{}", m);
+        assert!(m.contains("a.txt"));
+    }
+
+    #[test]
+    fn build_commit_message_more_than_three_truncates() {
+        let ops_owned: Vec<SyncOp> = (0..5)
+            .map(|i| SyncOp::Write {
+                path: format!("f{}.txt", i),
+                content: vec![],
+            })
+            .collect();
+        let ops: Vec<&SyncOp> = ops_owned.iter().collect();
+        let m = build_commit_message(&ops);
+        assert!(m.contains("5 changes"), "{}", m);
+        assert!(m.contains("+2 more"), "{}", m);
+    }
+}

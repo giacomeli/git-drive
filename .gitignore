@@ -1,2 +1,11 @@
 .vscode
 target
+.DS_Store
+logs/
+
+# ponto de montagem usado nos testes manuais — nunca versionar o conteúdo montado
+gitmount/
+
+# drive-sync: config.json pode conter remote_token em texto plano —
+# remova esta linha apenas se você tem certeza de que não vai versionar credenciais.
+config.json

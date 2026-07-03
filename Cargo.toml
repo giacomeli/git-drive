@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-fuser = "0.14"
+fuser = { version = "0.14", features = ["abi-7-21"] }
 libc = "0.2"
 git2 = "0.18"
 anyhow = "1.0"
@@ -13,3 +13,17 @@ parking_lot = "0.12"
 notify = "6.1"
 tokio = { version = "1.36", features = ["full"] }
 clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+env_logger = "0.11"
+
+[dev-dependencies]
+tempfile = "3"
+serial_test = "3"
+
+# Patch local em fuser 0.14.0: corrige panic em SetAttr::crtime/chgtime/bkuptime
+# (overflow `Instant + Duration`) que mata o daemon quando o Finder envia
+# SETATTR com crtime ruim ao colar arquivos. Bug ainda presente em fuser 0.17
+# upstream. Ver vendor/fuser/src/ll/request.rs (procurar "PATCH local").
+[patch.crates-io]
+fuser = { path = "vendor/fuser" }
