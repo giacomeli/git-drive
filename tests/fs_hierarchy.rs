@@ -560,3 +560,69 @@ async fn apply_truncate_larger_zero_fills_suffix_only() {
         Some(b"hi\0\0".as_slice())
     );
 }
+
+// ---- Regressão RF2 (Fase 0): flush só enfileira escrita real (dirty flag) ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn flush_without_write_does_not_enqueue() {
+    // flush roda em todo close(2), inclusive de fd aberto só para leitura.
+    // Antes do fix, qualquer buffer existente era re-enfileirado — podendo
+    // reverter mudanças remotas mergeadas com conteúdo antigo.
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"hello", "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("a.txt").unwrap();
+
+    assert!(fs.apply_flush(ino).is_none());
+    assert!(fs.sync_snapshot_for_test().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn flush_after_write_enqueues_once() {
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"hello", "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("a.txt").unwrap();
+
+    fs.apply_write(ino, 5, b" world").unwrap();
+    assert_eq!(fs.apply_flush(ino).as_deref(), Some("a.txt"));
+    let ops = fs.sync_snapshot_for_test();
+    assert!(
+        ops.iter().any(|op| matches!(op,
+            drive_sync::sync::SyncOp::Write { path, content }
+                if path == "a.txt" && content.as_slice() == b"hello world"
+        )),
+        "esperado Write(a.txt) com conteúdo completo, obtido {:?}",
+        ops
+    );
+
+    // Segundo flush sem escrita nova (ex.: close de leitura) não re-enfileira
+    assert!(fs.apply_flush(ino).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn truncate_clears_dirty_mark() {
+    // apply_truncate já materializa a op — o flush seguinte não deve duplicar.
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"hello", "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("a.txt").unwrap();
+
+    fs.apply_write(ino, 0, b"H").unwrap();
+    fs.apply_truncate(ino, 4).unwrap();
+    assert!(fs.apply_flush(ino).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn rename_after_write_clears_dirty_mark() {
+    // O rename de arquivo enfileira o conteúdo corrente (Write(dest)+Delete(src));
+    // o flush posterior do mesmo inode não deve enfileirar de novo.
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"hello", "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("a.txt").unwrap();
+
+    fs.apply_write(ino, 5, b"!").unwrap();
+    fs.apply_rename(1, "a.txt", 1, "b.txt").unwrap();
+    assert!(fs.apply_flush(ino).is_none());
+}

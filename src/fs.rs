@@ -43,6 +43,15 @@ pub struct GitDriveFS {
     next_inode: Arc<AtomicU64>,
     sync: SyncManager,
     write_buffers: Arc<parking_lot::Mutex<HashMap<u64, Vec<u8>>>>,
+    /// Inodes com escrita ainda não enfileirada no sync ("dirty"). O flush só
+    /// gera `SyncOp::Write` para inodes marcados — flush roda em todo close(2),
+    /// inclusive de fds de leitura, e sem a marca re-enfileiraria conteúdo
+    /// antigo (podendo reverter mudanças remotas mergeadas).
+    dirty: HashSet<u64>,
+    /// Última `commit_generation` do `SyncManager` observada. Quando avança,
+    /// buffers limpos (não-dirty) são descartados — o conteúdo deles já está
+    /// no HEAD e mantê-los esconderia mudanças remotas futuras do `read`.
+    last_commit_gen: u64,
     uid: u32,
     gid: u32,
     mode_overrides: Arc<parking_lot::Mutex<HashMap<u64, u16>>>,
@@ -135,6 +144,8 @@ impl GitDriveFS {
             next_inode,
             sync,
             write_buffers: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            dirty: HashSet::new(),
+            last_commit_gen: 0,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             mode_overrides: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -320,6 +331,7 @@ impl GitDriveFS {
         if let Some(f) = self.files_by_inode.get_mut(&ino) {
             f.size = new_len;
         }
+        self.dirty.insert(ino);
         Ok(data.len() as u32)
     }
 
@@ -341,12 +353,42 @@ impl GitDriveFS {
             f.size = new_size;
         }
         self.sync.queue_write(&path, data);
+        // Conteúdo do buffer acabou de ser enfileirado — inode volta a "limpo";
+        // um flush subsequente sem escrita nova não deve duplicar a op.
+        self.dirty.remove(&ino);
         Ok(())
+    }
+
+    /// Flush de um inode: enfileira o buffer no sync APENAS se houve escrita
+    /// desde o último flush (dirty). Retorna o path enfileirado, ou `None` se
+    /// não havia nada a fazer (ex.: close de fd aberto só para leitura).
+    pub fn apply_flush(&mut self, ino: u64) -> Option<String> {
+        if !self.dirty.contains(&ino) {
+            return None;
+        }
+        let path = self.files_by_inode.get(&ino)?.path.clone();
+        let data = self.write_buffers.lock().get(&ino).cloned()?;
+        self.sync.queue_write(&path, data);
+        self.dirty.remove(&ino);
+        self.touch(ino);
+        Some(path)
+    }
+
+    /// Descarta buffers de inodes sem escrita pendente (não-dirty). Buffers
+    /// dirty nunca são tocados — o conteúdo deles ainda não chegou ao sync.
+    fn gc_clean_buffers(&mut self) {
+        let dirty = &self.dirty;
+        self.write_buffers.lock().retain(|ino, _| dirty.contains(ino));
     }
 
     /// Conteúdo corrente visível para leitura (buffer ou blob do HEAD).
     pub fn read_content_for_test(&self, ino: u64) -> Option<Vec<u8>> {
         self.current_file_content(ino)
+    }
+
+    /// Quantidade de write buffers vivos (introspecção para testes).
+    pub fn buffered_count_for_test(&self) -> usize {
+        self.write_buffers.lock().len()
     }
 
     pub fn apply_create(
@@ -424,6 +466,7 @@ impl GitDriveFS {
             .children
             .remove(&ino);
         self.write_buffers.lock().remove(&ino);
+        self.dirty.remove(&ino);
         self.sync.queue_delete(&entry.path);
         Ok(())
     }
@@ -470,9 +513,22 @@ impl GitDriveFS {
         if !self.sync.buffer_snapshot().is_empty() {
             return;
         }
+        // GC de buffers limpos quando um commit local novo aconteceu: com o
+        // sync buffer vazio (checado acima), tudo que foi enfileirado já foi
+        // drenado, e o commit garante que o conteúdo está no HEAD. Descartar
+        // o buffer faz o `read` voltar a enxergar o HEAD — sem isso, mudanças
+        // remotas nesse arquivo ficariam invisíveis para sempre.
+        let gen = self.sync.commit_generation();
+        if gen != self.last_commit_gen {
+            self.last_commit_gen = gen;
+            self.gc_clean_buffers();
+        }
         if !self.sync.take_refresh_flag() {
             return;
         }
+        // Refresh pós-pull: o HEAD avançou por fetch/merge (que só roda com
+        // working tree limpo). Buffers limpos refletem o HEAD antigo — descartar.
+        self.gc_clean_buffers();
         let repo = match git::open_repo(&self.repo_path) {
             Ok(r) => r,
             Err(e) => {
@@ -696,6 +752,8 @@ impl GitDriveFS {
 
         self.sync.queue_write(&src_path, tgt_content);
         self.sync.queue_write(&tgt_path, src_content);
+        self.dirty.remove(&src_ino);
+        self.dirty.remove(&tgt_ino);
         self.touch(src_ino);
         self.touch(tgt_ino);
 
@@ -828,6 +886,9 @@ impl GitDriveFS {
                 .unwrap_or_default();
             self.sync.queue_write(&new_path, content);
             self.sync.queue_delete(&old_path);
+            // Conteúdo corrente (incluindo escritas pendentes) foi enfileirado
+            // no destino — inode volta a "limpo".
+            self.dirty.remove(&src);
         }
         Ok(())
     }
@@ -989,18 +1050,12 @@ impl Filesystem for GitDriveFS {
         _lock_owner: u64,
         reply: fuser::ReplyEmpty,
     ) {
-        // Clone em vez de remove: o conteúdo precisa ficar disponível para
-        // reads subsequentes (e pro `apply_implicit_swap`, que roda DEPOIS do
-        // flush no ciclo de safe save do TextEdit). Antes com `remove`, o swap
-        // lia do blob HEAD (ou cai em empty), porque o buffer já tinha sido
-        // drenado — resultado: commits sobrescrevendo hi.txt com conteúdo vazio.
-        // O buffer é limpo em unlink/rename/rmdir via `discard_buffered`.
-        if let Some(entry) = self.files_by_inode.get(&ino) {
-            if let Some(data) = self.write_buffers.lock().get(&ino).cloned() {
-                println!("[{}] FLUSH inode={} path={}", log_ts(), ino, entry.path);
-                self.sync.queue_write(&entry.path, data);
-                self.touch(ino);
-            }
+        // O buffer NÃO é drenado aqui: o conteúdo fica disponível para reads
+        // subsequentes (e pro `apply_implicit_swap`, que roda DEPOIS do flush
+        // no ciclo de safe save do TextEdit). O enfileiramento é condicionado
+        // ao dirty flag em `apply_flush` — flush de fd de leitura é no-op.
+        if let Some(path) = self.apply_flush(ino) {
+            println!("[{}] FLUSH inode={} path={}", log_ts(), ino, path);
         }
         reply.ok();
     }
@@ -1243,6 +1298,8 @@ impl Filesystem for GitDriveFS {
         // Queue writes pra materializar em disco + commit
         self.sync.queue_write(&path_a, content_b);
         self.sync.queue_write(&path_b, content_a);
+        self.dirty.remove(&ino_a);
+        self.dirty.remove(&ino_b);
 
         self.touch(ino_a);
         self.touch(ino_b);

@@ -354,3 +354,122 @@ async fn sync_flow_push_failure_does_not_rollback_commit() {
     let head = test.repo.head().unwrap().peel_to_commit().unwrap();
     assert!(head.message().unwrap().contains("x.txt"));
 }
+
+// ---- Regressão RF3 (Fase 0): invalidação de write buffers ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn clean_buffers_dropped_after_local_commit_dirty_survives() {
+    // Buffers "limpos" (conteúdo já enfileirado e commitado) devem ser
+    // descartados quando a commit_generation avança; buffers dirty (escrita
+    // pendente sem flush) devem sobreviver intactos.
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"old", "add a");
+    commit_file(&test.repo, "b.txt", b"old-b", "add b");
+
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    let mut fs = drive_sync::fs::GitDriveFS::new(
+        test.dir.path().to_str().unwrap(),
+        "main".to_string(),
+        sync,
+    )
+    .unwrap();
+    let ino_a = fs.find_inode("a.txt").unwrap();
+    let ino_b = fs.find_inode("b.txt").unwrap();
+
+    // a.txt: escrita completa + flush (segue para drain + commit)
+    fs.apply_write(ino_a, 0, b"new").unwrap();
+    fs.apply_flush(ino_a).expect("flush de a.txt deve enfileirar");
+    // b.txt: escrita pendente sem flush (dirty)
+    fs.apply_write(ino_b, 0, b"pending").unwrap();
+
+    wait_flush().await; // drain aplica + commita (commit_generation avança)
+
+    fs.refresh_if_needed();
+
+    assert_eq!(
+        fs.buffered_count_for_test(),
+        1,
+        "apenas o buffer dirty (b.txt) deve sobreviver ao gc"
+    );
+    assert_eq!(
+        fs.read_content_for_test(ino_a).as_deref(),
+        Some(b"new".as_slice()),
+        "a.txt deve vir do HEAD commitado"
+    );
+    assert_eq!(
+        fs.read_content_for_test(ino_b).as_deref(),
+        Some(b"pending".as_slice()),
+        "b.txt deve continuar vindo do buffer dirty"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn remote_update_visible_after_refresh_despite_local_buffer() {
+    // Cenário-título do bug RF3: depois de uma escrita local, o buffer ficava
+    // vivo para sempre e o read nunca mais enxergava mudanças remotas naquele
+    // arquivo (buffer tem precedência sobre o HEAD).
+    let test = init_repo();
+    let bare = init_bare_remote();
+    let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+    test.repo.remote("origin", &bare_url).unwrap();
+    commit_file(&test.repo, "hi.txt", b"local-v1", "add hi");
+    drive_sync::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
+
+    let sync = SyncManager::new_full_with_pull(
+        test.dir.path().to_str().unwrap(),
+        "main".to_string(),
+        1,
+        Some("Alice".to_string()),
+        Some("a@x.com".to_string()),
+        Some("origin".to_string()),
+        None,
+        1,
+    );
+    let mut fs = drive_sync::fs::GitDriveFS::new(
+        test.dir.path().to_str().unwrap(),
+        "main".to_string(),
+        sync,
+    )
+    .unwrap();
+    let ino = fs.find_inode("hi.txt").unwrap();
+
+    // Escrita local: v2 (cria buffer) + flush + drain + commit + push
+    fs.apply_write(ino, 0, b"local-v2").unwrap();
+    fs.apply_flush(ino).expect("flush deve enfileirar");
+    wait_flush().await;
+
+    // B clona (já com v2), escreve v3 e publica
+    let dir_b = tempfile::tempdir().unwrap();
+    let repo_b = git2::Repository::clone(&bare_url, dir_b.path()).unwrap();
+    {
+        let mut cfg = repo_b.config().unwrap();
+        cfg.set_str("user.name", "Bob").unwrap();
+        cfg.set_str("user.email", "b@x.com").unwrap();
+    }
+    std::fs::write(dir_b.path().join("hi.txt"), b"remote-v3").unwrap();
+    let mut index = repo_b.index().unwrap();
+    index.add_path(std::path::Path::new("hi.txt")).unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo_b.find_tree(tree_id).unwrap();
+    let sig = git2::Signature::now("Bob", "b@x.com").unwrap();
+    let parent = repo_b.head().unwrap().peel_to_commit().unwrap();
+    repo_b
+        .commit(Some("HEAD"), &sig, &sig, "v3 from B", &tree, &[&parent])
+        .unwrap();
+    drive_sync::git::push_to_remote(&repo_b, "main", "origin", None).unwrap();
+
+    // esperar o pull watcher trazer o FF
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+
+    fs.refresh_if_needed();
+    assert_eq!(
+        fs.read_content_for_test(ino).as_deref(),
+        Some(b"remote-v3".as_slice()),
+        "read deve refletir a versão remota após o refresh, não o buffer antigo"
+    );
+}

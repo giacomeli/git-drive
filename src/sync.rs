@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use parking_lot::Mutex;
@@ -44,6 +44,10 @@ pub struct SyncManager {
     remote_name: Option<String>,
     remote_token: Option<String>,
     refresh_flag: Arc<AtomicBool>,
+    /// Incrementado a cada commit local criado pelo drain. `GitDriveFS` compara
+    /// com o último valor visto para descartar write buffers "limpos" (conteúdo
+    /// já commitado no HEAD) — ver `refresh_if_needed`.
+    commit_generation: Arc<AtomicU64>,
 }
 
 struct Inner {
@@ -127,6 +131,7 @@ impl SyncManager {
             remote_name,
             remote_token,
             refresh_flag: Arc::new(AtomicBool::new(false)),
+            commit_generation: Arc::new(AtomicU64::new(0)),
         };
 
         manager.spawn_watcher();
@@ -147,6 +152,11 @@ impl SyncManager {
     /// internos usam o mesmo mecanismo via clone do `Arc`.
     pub fn raise_refresh_flag(&self) {
         self.refresh_flag.store(true, Ordering::SeqCst);
+    }
+
+    /// Número de commits locais criados pelo drain desde o boot. Monotônico.
+    pub fn commit_generation(&self) -> u64 {
+        self.commit_generation.load(Ordering::SeqCst)
     }
 
     fn spawn_pull_watcher(&self, interval_secs: u64) {
@@ -293,6 +303,7 @@ impl SyncManager {
         let remote_name = self.remote_name.clone();
         let remote_token = self.remote_token.clone();
         let refresh_flag = self.refresh_flag.clone();
+        let commit_generation = self.commit_generation.clone();
 
         task::spawn(async move {
             loop {
@@ -334,6 +345,7 @@ impl SyncManager {
                             &ops,
                         );
                         if committed {
+                            commit_generation.fetch_add(1, Ordering::SeqCst);
                             if let Some(ref remote) = remote_name {
                                 let ok = push_batch(&repo_path, &branch, remote, &remote_token);
                                 if !ok {
