@@ -1312,3 +1312,169 @@ async fn persistent_read_handle_sees_new_head_after_refresh() {
         "handle persistente não pode servir HEAD antigo após refresh"
     );
 }
+
+// ---- Fase 2.6: leitura transparente de arquivos chunkados ----
+
+use drive_sync::chunk::{chunk_reader_into_repo, shard_rel_path, Manifest};
+
+/// Materializa payload como manifest + chunks no working tree e commita tudo.
+fn commit_chunked(repo: &git2::Repository, rel: &str, payload: &[u8], chunk_size: u64) -> Manifest {
+    let workdir = repo.workdir().unwrap();
+    let m = chunk_reader_into_repo(&mut &payload[..], chunk_size, workdir).unwrap();
+    std::fs::write(workdir.join(rel), m.serialize()).unwrap();
+
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let sig = git2::Signature::now("Test User", "test@example.com").unwrap();
+    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "chunked", &tree, &[&parent])
+        .unwrap();
+    m
+}
+
+fn chunk_payload() -> Vec<u8> {
+    (0..250u32).map(|i| (i % 251) as u8).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn chunked_file_exposes_real_size_and_reads_reassembled() {
+    let test = init_repo();
+    let payload = chunk_payload();
+    commit_chunked(&test.repo, "big.bin", &payload, 100);
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+
+    let ino = fs.find_inode("big.bin").expect("arquivo chunkado no índice");
+    assert_eq!(
+        fs.apply_getattr(ino).unwrap().size,
+        250,
+        "getattr deve expor o tamanho REAL, não o do manifest"
+    );
+    assert_eq!(fs.apply_read(ino, 0, 250).unwrap(), payload);
+    assert_eq!(
+        fs.apply_read(ino, 90, 20).unwrap(),
+        payload[90..110].to_vec(),
+        "leitura atravessando fronteira de chunk"
+    );
+    assert_eq!(fs.apply_read(ino, 240, 100).unwrap(), payload[240..].to_vec());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn chunks_dir_is_invisible_in_mount() {
+    let test = init_repo();
+    commit_chunked(&test.repo, "big.bin", &chunk_payload(), 100);
+    let fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+
+    assert_eq!(fs.find_inode(".chunks"), None, ".chunks é artefato interno");
+    let entries = fs.apply_readdir(1).unwrap();
+    assert!(
+        !entries.iter().any(|(_, _, n)| n == ".chunks"),
+        "readdir não pode listar .chunks: {:?}",
+        entries
+    );
+    assert_eq!(fs.file_count(), 1, "só big.bin (chunks fora do índice)");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn corrupted_chunk_read_is_eio() {
+    let test = init_repo();
+    let payload = chunk_payload();
+    let m = commit_chunked(&test.repo, "big.bin", &payload, 100);
+    // Corromper o segundo chunk no working tree
+    let victim = test.dir.path().join(shard_rel_path(&m.hashes[1]));
+    std::fs::write(&victim, b"corrompido").unwrap();
+
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("big.bin").unwrap();
+    assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), payload[..100].to_vec(), "chunk íntegro lê normal");
+    assert_eq!(
+        fs.apply_read(ino, 100, 100),
+        Err(libc::EIO),
+        "hash mismatch deve virar EIO, nunca conteúdo errado"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn write_to_chunked_file_roundtrip_via_buffer() {
+    let test = init_repo();
+    let payload = chunk_payload();
+    commit_chunked(&test.repo, "big.bin", &payload, 100);
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("big.bin").unwrap();
+
+    // Escrita parcial: o buffer nasce da REMONTAGEM (nunca do manifest cru)
+    fs.apply_write(ino, 10, b"XYZ").unwrap();
+    let mut expected = payload.clone();
+    expected[10..13].copy_from_slice(b"XYZ");
+    assert_eq!(fs.apply_read(ino, 0, 250).unwrap(), expected);
+
+    let flushed = fs.apply_flush(ino);
+    assert!(flushed.is_some());
+    let snap = fs.sync_snapshot_for_test();
+    let content_len = snap
+        .iter()
+        .find_map(|op| match op {
+            drive_sync::sync::SyncOp::Write { path, content } if path == "big.bin" => {
+                Some(content.to_vec().len())
+            }
+            _ => None,
+        })
+        .expect("write de big.bin na fila");
+    assert_eq!(content_len, 250, "fila carrega o conteúdo expandido modificado");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn rename_chunked_file_queues_manifest_not_expanded_content() {
+    let test = init_repo();
+    commit_chunked(&test.repo, "big.bin", &chunk_payload(), 100);
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("big.bin").unwrap();
+    // Detecção acontece no primeiro acesso
+    let _ = fs.apply_getattr(ino).unwrap();
+
+    fs.apply_rename(1, "big.bin", 1, "renomeado.bin").unwrap();
+    let snap = fs.sync_snapshot_for_test();
+    let write_bytes = snap
+        .iter()
+        .find_map(|op| match op {
+            drive_sync::sync::SyncOp::Write { path, content } if path == "renomeado.bin" => {
+                Some(content.to_vec())
+            }
+            _ => None,
+        })
+        .expect("write do novo path na fila");
+    assert!(
+        Manifest::is_manifest_bytes(&write_bytes),
+        "rename de chunkado enfileira o MANIFEST (pequeno), não o conteúdo expandido"
+    );
+    assert!(snap.iter().any(|op| matches!(op,
+        drive_sync::sync::SyncOp::Delete { path } if path == "big.bin")));
+
+    // E o novo path continua legível (chunks intactos)
+    let ino2 = fs.find_inode("renomeado.bin").unwrap();
+    assert_eq!(fs.apply_read(ino2, 0, 250).unwrap(), chunk_payload());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn chunked_view_survives_refresh() {
+    let test = init_repo();
+    let payload = chunk_payload();
+    commit_chunked(&test.repo, "big.bin", &payload, 100);
+    let sync = SyncManager::new(test.dir.path().to_str().unwrap(), 5);
+    let sync_handle = sync.clone();
+    let mut fs = GitDriveFS::new(test.dir.path().to_str().unwrap(), "main".to_string(), sync)
+        .expect("GitDriveFS::new");
+    let ino = fs.find_inode("big.bin").unwrap();
+    assert_eq!(fs.apply_getattr(ino).unwrap().size, 250);
+
+    sync_handle.raise_refresh_flag();
+    fs.refresh_if_needed();
+    assert_eq!(fs.find_inode("big.bin"), Some(ino));
+    assert_eq!(fs.apply_getattr(ino).unwrap().size, 250);
+    assert_eq!(fs.apply_read(ino, 0, 250).unwrap(), payload);
+    assert_eq!(fs.find_inode(".chunks"), None, ".chunks continua invisível pós-refresh");
+}

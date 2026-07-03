@@ -281,6 +281,13 @@ pub struct GitDriveFS {
     /// boot/refresh). Consultado depois de `times` (sessão) e antes de
     /// `boot_time` (resíduo: local-only e diretórios).
     derived_times: HashMap<u64, SystemTime>,
+    /// Cache lazy de detecção de manifest por inode (Fase 2.6): `Some` =
+    /// arquivo chunkado (manifest parseado), `None` = checado e não é.
+    /// Limpo junto com o gc de buffers (HEAD mudou).
+    manifests: parking_lot::Mutex<HashMap<u64, Option<Arc<crate::chunk::Manifest>>>>,
+    /// Último chunk verificado servido ao `read` — leitura sequencial de
+    /// arquivo chunkado paga hash+disco uma vez por chunk, não por syscall.
+    last_chunk: Option<(u64, usize, Vec<u8>)>,
     boot_time: SystemTime,
     xattrs: Arc<parking_lot::Mutex<HashMap<u64, HashMap<OsString, Vec<u8>>>>>,
 }
@@ -346,6 +353,10 @@ impl GitDriveFS {
         dirs_sorted.sort_by_key(|p| p.matches('/').count());
 
         for dir_path in dirs_sorted {
+            // `.chunks` é artefato interno do chunking (Fase 2.6) — invisível.
+            if crate::chunk::is_chunk_path(&dir_path) {
+                continue;
+            }
             let inode = next_inode.fetch_add(1, Ordering::SeqCst);
             let parent_path = match dir_path.rfind('/') {
                 Some(i) => dir_path[..i].to_string(),
@@ -374,7 +385,7 @@ impl GitDriveFS {
             // vazio" (decisão 8 da Fase 2): não entra nos índices nem aparece
             // no readdir — sem isso, o rmdir de pasta "vazia" falhava com
             // ENOTEMPTY após um refresh (achado da validação de 03-07-2026).
-            if leaf_name(&file_path) == ".gitkeep" {
+            if leaf_name(&file_path) == ".gitkeep" || crate::chunk::is_chunk_path(&file_path) {
                 continue;
             }
             let inode = next_inode.fetch_add(1, Ordering::SeqCst);
@@ -429,6 +440,8 @@ impl GitDriveFS {
             mode_overrides: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             times: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             derived_times: HashMap::new(),
+            manifests: parking_lot::Mutex::new(HashMap::new()),
+            last_chunk: None,
             boot_time: SystemTime::now(),
             xattrs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         };
@@ -564,6 +577,9 @@ impl GitDriveFS {
                 return self.read_local_only_content(f.kind, path);
             }
         }
+        if let Some(m) = self.manifest_for(ino) {
+            return self.reassemble_chunked(&m);
+        }
         let repo = git::open_repo(&self.repo_path).ok()?;
         let commit = git::get_commit(&repo, "HEAD").ok()?;
         git::read_file_at_commit(&repo, &commit, path).ok()
@@ -576,7 +592,7 @@ impl GitDriveFS {
         for child in &dir.children {
             if let Some(f) = self.files_by_inode.get(child) {
                 if leaf_name(&f.path) == name {
-                    return Ok(self.file_attr_for(f.inode, f.size));
+                    return Ok(self.file_attr_for(f.inode, self.effective_size(f.inode, f.size)));
                 }
             } else if let Some(d) = self.dirs_by_inode.get(child) {
                 if leaf_name(&d.path) == name {
@@ -591,7 +607,7 @@ impl GitDriveFS {
         if let Some(d) = self.dirs_by_inode.get(&ino) {
             Ok(self.dir_attr_for(d.inode))
         } else if let Some(f) = self.files_by_inode.get(&ino) {
-            Ok(self.file_attr_for(f.inode, f.size))
+            Ok(self.file_attr_for(f.inode, self.effective_size(f.inode, f.size)))
         } else {
             Err(libc::ENOENT)
         }
@@ -658,6 +674,131 @@ impl GitDriveFS {
         }
     }
 
+    // ---- Fase 2.6: arquivos chunkados (manifest + .chunks) ----
+
+    /// Manifest do inode, com detecção lazy cacheada (`Some` = chunkado).
+    fn manifest_for(&self, ino: u64) -> Option<Arc<crate::chunk::Manifest>> {
+        if let Some(cached) = self.manifests.lock().get(&ino) {
+            return cached.clone();
+        }
+        let candidate = match self.files_by_inode.get(&ino) {
+            Some(f)
+                if f.kind == git::FileKind::Regular
+                    && !f.local_only
+                    && f.size > 0
+                    && f.size <= crate::chunk::MANIFEST_MAX_BYTES =>
+            {
+                Some(f.path.clone())
+            }
+            _ => None,
+        };
+        let result = candidate.and_then(|path| {
+            let repo = git::open_repo(&self.repo_path).ok()?;
+            let commit = git::get_commit(&repo, "HEAD").ok()?;
+            let bytes = git::read_file_at_commit(&repo, &commit, &path).ok()?;
+            if !crate::chunk::Manifest::is_manifest_bytes(&bytes) {
+                return None;
+            }
+            crate::chunk::Manifest::parse(&bytes).ok().map(Arc::new)
+        });
+        self.manifests.lock().insert(ino, result.clone());
+        result
+    }
+
+    /// Tamanho visível ao userspace: buffer local vence; senão o tamanho real
+    /// do manifest; senão o tamanho cru do índice.
+    fn effective_size(&self, ino: u64, raw: u64) -> u64 {
+        if self.write_buffers.lock().contains_key(&ino) {
+            return raw;
+        }
+        self.manifest_for(ino).map(|m| m.total_size).unwrap_or(raw)
+    }
+
+    /// Lê e verifica um chunk do working tree. Hash divergente = EIO — nunca
+    /// conteúdo silenciosamente errado.
+    fn read_verified_chunk(
+        &self,
+        m: &crate::chunk::Manifest,
+        idx: usize,
+    ) -> Result<Vec<u8>, i32> {
+        let hash = m.hashes.get(idx).ok_or(libc::EIO)?;
+        let full =
+            std::path::Path::new(&self.repo_path).join(crate::chunk::shard_rel_path(hash));
+        let data = std::fs::read(&full).map_err(|_| libc::EIO)?;
+        if crate::chunk::sha256_hex(&data) != *hash {
+            eprintln!(
+                "[{}] chunk: hash divergente no chunk {} (idx {}) — EIO",
+                log_ts(),
+                hash,
+                idx
+            );
+            return Err(libc::EIO);
+        }
+        Ok(data)
+    }
+
+    /// Leitura remontada de arquivo chunkado, com cache do último chunk
+    /// (leitura sequencial paga disco+hash uma vez por chunk, não por syscall).
+    fn read_chunked(
+        &mut self,
+        ino: u64,
+        m: &crate::chunk::Manifest,
+        offset: usize,
+        size: usize,
+    ) -> Result<Vec<u8>, i32> {
+        let mut out = Vec::new();
+        let end = (offset as u64).saturating_add(size as u64).min(m.total_size);
+        for idx in m.chunks_for_range(offset as u64, size as u64) {
+            let cached = matches!(&self.last_chunk,
+                Some((c_ino, c_idx, _)) if *c_ino == ino && *c_idx == idx);
+            if !cached {
+                let data = self.read_verified_chunk(m, idx)?;
+                self.last_chunk = Some((ino, idx, data));
+            }
+            let data = &self.last_chunk.as_ref().expect("preenchido acima").2;
+            let chunk_start = idx as u64 * m.chunk_size;
+            let s = (offset as u64).max(chunk_start) - chunk_start;
+            let e = end.min(chunk_start + data.len() as u64) - chunk_start;
+            out.extend_from_slice(&data[s as usize..e as usize]);
+        }
+        Ok(out)
+    }
+
+    /// Conteúdo integral remontado (caminhos frios: swap, link, fallback).
+    fn reassemble_chunked(&self, m: &crate::chunk::Manifest) -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(m.total_size as usize);
+        for idx in 0..m.hashes.len() {
+            out.extend_from_slice(&self.read_verified_chunk(m, idx).ok()?);
+        }
+        Some(out)
+    }
+
+    /// Buffer de escrita para chunkado: remonta chunk a chunk direto no spool
+    /// quando o total excede o limiar — RAM limitada a um chunk.
+    fn buffer_from_manifest(&self, m: &crate::chunk::Manifest) -> Option<WriteBuffer> {
+        if self.spool_threshold_bytes > 0 && m.total_size >= self.spool_threshold_bytes {
+            let n = self.spool_counter.fetch_add(1, Ordering::SeqCst);
+            let path = self.spool_dir.join(format!("buf-{}", n));
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .ok()?;
+            use std::os::unix::fs::FileExt;
+            let mut off: u64 = 0;
+            for idx in 0..m.hashes.len() {
+                let data = self.read_verified_chunk(m, idx).ok()?;
+                file.write_all_at(&data, off).ok()?;
+                off += data.len() as u64;
+            }
+            Some(WriteBuffer::Spooled(SpooledBuffer { file, path, len: off }))
+        } else {
+            self.reassemble_chunked(m)
+                .map(|v| self.make_buffer_from_vec(v))
+        }
+    }
+
     /// Garante que o inode tem buffer de escrita, inicializando-o com o
     /// conteúdo corrente do arquivo (blob no HEAD) na primeira mutação.
     /// Semântica POSIX: `write`/`truncate` operam sobre o conteúdo existente —
@@ -667,8 +808,20 @@ impl GitDriveFS {
         if self.write_buffers.lock().contains_key(&ino) {
             return;
         }
-        let base = self.content_for_inode_at_path(ino, path).unwrap_or_default();
-        let buffer = self.make_buffer_from_vec(base);
+        let buffer = if let Some(m) = self.manifest_for(ino) {
+            // Chunkado: o buffer nasce da REMONTAGEM, nunca do manifest cru —
+            // mesma semântica POSIX do invariante da Fase 0.
+            self.buffer_from_manifest(&m).unwrap_or_else(|| {
+                eprintln!(
+                    "[{}] chunk: falha ao remontar buffer de escrita — nascendo vazio",
+                    log_ts()
+                );
+                WriteBuffer::Mem(Arc::new(Vec::new()))
+            })
+        } else {
+            let base = self.content_for_inode_at_path(ino, path).unwrap_or_default();
+            self.make_buffer_from_vec(base)
+        };
         self.write_buffers.lock().entry(ino).or_insert(buffer);
     }
 
@@ -739,6 +892,11 @@ impl GitDriveFS {
             Some(f) => (f.path.clone(), f.local_only, f.kind),
             None => return Err(libc::ENOENT),
         };
+        // Chunkado: leitura remontada por chunk (verificação de hash);
+        // o BlobCache nunca guarda nem o manifest cru nem chunks.
+        if let Some(m) = self.manifest_for(ino) {
+            return self.read_chunked(ino, &m, offset, size);
+        }
         if let Some(data) = self.read_cache.get(ino) {
             return Ok(slice_of(data, offset, size));
         }
@@ -821,6 +979,9 @@ impl GitDriveFS {
         let dirty = &self.dirty;
         self.write_buffers.lock().retain(|ino, _| dirty.contains(ino));
         self.read_cache.clear();
+        // HEAD mudou: manifests podem ter trocado de conteúdo/estado.
+        self.manifests.lock().clear();
+        self.last_chunk = None;
     }
 
     /// Conteúdo corrente visível para leitura (buffer ou blob do HEAD).
@@ -1000,6 +1161,7 @@ impl GitDriveFS {
         self.write_buffers.lock().remove(&ino);
         self.dirty.remove(&ino);
         self.read_cache.remove(ino);
+        self.manifests.lock().remove(&ino);
         self.sync.queue_delete(&entry.path);
         Ok(())
     }
@@ -1114,6 +1276,9 @@ impl GitDriveFS {
         dirs_sorted.sort_by_key(|p| p.matches('/').count());
 
         for dir_path in dirs_sorted {
+            if crate::chunk::is_chunk_path(&dir_path) {
+                continue;
+            }
             // `unwrap_or_else` (lazy): a forma eager com `unwrap_or` avaliava
             // o alloc sempre, vazando um inode por path existente a cada refresh.
             let inode = previous
@@ -1138,8 +1303,9 @@ impl GitDriveFS {
         }
 
         for git::ListedFile { path: file_path, size, kind } in files {
-            // Mesma regra da ingestão inicial: `.gitkeep` fica fora dos índices.
-            if leaf_name(&file_path) == ".gitkeep" {
+            // Mesma regra da ingestão inicial: `.gitkeep` e `.chunks` ficam
+            // fora dos índices.
+            if leaf_name(&file_path) == ".gitkeep" || crate::chunk::is_chunk_path(&file_path) {
                 continue;
             }
             let inode = previous
@@ -1551,6 +1717,17 @@ impl GitDriveFS {
                 // cai aqui e o filtro do enqueue descarta — memória apenas.)
                 self.sync.queue_rename(&old_path, &new_path);
             }
+        } else if self.manifest_for(src).is_some()
+            && !self.write_buffers.lock().contains_key(&src)
+        {
+            // Chunkado sem edição local: move só o MANIFEST — os chunks são
+            // content-addressed e ficam onde estão (o GC preserva enquanto
+            // houver manifest referenciando).
+            let m = self.manifest_for(src).expect("checado acima");
+            self.read_cache.remove(src);
+            self.sync.queue_write(&new_path, m.serialize());
+            self.sync.queue_delete(&old_path);
+            self.dirty.remove(&src);
         } else {
             // Arquivo: traduz rename em Write(dest) + Delete(src). Isso desacopla
             // da existência do src em disco (que pode ter sido criada em ops que
@@ -2269,7 +2446,7 @@ impl Filesystem for GitDriveFS {
                             let size = self
                                 .files_by_inode
                                 .get(child_ino)
-                                .map(|f| f.size)
+                                .map(|f| self.effective_size(f.inode, f.size))
                                 .unwrap_or(0);
                             self.file_attr_for(*child_ino, size)
                         }
