@@ -215,6 +215,7 @@ pub struct Config {
 | 6 | Sem FIFOs/sockets/hardlinks reais | Symlinks suportados (Fase 2.5); `link` é cópia |
 | 7 | `chmod` em memória, `chown` ignorado | uid/gid são os do processo do mount |
 | 8 | Cache de blobs não cobre arquivo maior que o orçamento | miss usa handle de repo persistente (sem reabrir por syscall) |
+| 11 | Arquivos acima de `chunk_threshold_mb` viram manifest + `.chunks/` | transparente no mount; clone puro vê os artefatos (`src/chunk.rs`) |
 | 9 | Refresh depende de syscalls FUSE | TTL de 1s no kernel pode mascarar mudanças remotas por ~1s |
 | 10 | Sem criptografia | fora do escopo desta etapa; reservado para próxima spec |
 

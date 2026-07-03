@@ -201,6 +201,7 @@ ler o path novo antes do commit caía num blob inexistente no HEAD e retornava `
 7. **Cache de blobs não cobre arquivos maiores que o orçamento** (`read_cache_mb`) — leituras deles vão ao repo a cada syscall, mas por um handle persistente (uma abertura por mount, não uma por syscall).
 8. **Write buffers acima de `large_file_threshold_mb` vivem em spool** (`.git/drive-sync-spool/`) com acesso randômico — pico de RAM limitado ao limiar; snapshot da fila é aplicado no drain com `rename`.
 9. **Arquivos ignorados pelo `.gitignore` do repo são local-only visíveis** — aparecem no mount, persistem no working tree entre remounts e nunca entram em commit/push.
+10. **Arquivos chunkados são transparentes** — path com manifest expõe tamanho real e leitura remontada por chunk (sha256 verificado, mismatch = `EIO`); `.chunks/` é invisível no mount.
 
 ---
 

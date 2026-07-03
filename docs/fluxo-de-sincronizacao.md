@@ -142,7 +142,7 @@ Fluxo, ver `src/sync.rs::spawn_watcher`:
 2. Loop interno dorme por `debounce_secs`.
 3. Sob o lock de `inner`: se `last_op.elapsed() >= debounce` e a fila não está vazia, `mem::take` da fila; caso contrário continua esperando.
 4. Adquire `repo_lock` (segura pelo ciclo inteiro; não há `.await` no escopo do guard).
-5. Itera o lote **na ordem da fila** chamando `apply_op_to_disk` para cada `SyncOp`.
+5. Itera o lote **na ordem da fila** chamando `apply_op_to_disk` para cada `SyncOp`. Em seguida, com chunking habilitado (`chunk_threshold_mb > 0`), a varredura converte qualquer arquivo bruto acima do limiar em manifest + `.chunks/` (cobre ops recém-aplicadas E arquivos chegados por fora do FUSE — nenhum blob acima do limiar é stageado) e o GC remove chunks que nenhum manifest do working tree referencia.
 6. Se `user_name`/`user_email` estão presentes, `commit_batch` gera a mensagem `drive-sync: <N> changes (...)` e chama `git::commit_working_tree` (`add_all` com `IndexAddOption::DEFAULT` — arquivos que casam com o `.gitignore` do repo montado ficam fora do commit por especificação; no mount eles viram local-only visíveis). Commit criado incrementa `commit_generation`.
 7. Se houve commit e `remote_name` está configurado, `push_batch` chama `git::push_to_remote`. Push rejeitado (tipicamente non-FF) dispara `reconcile_and_retry_push`: fetch + `pull_and_merge` + um retry de push. Recuperação seta `refresh_flag`. O commit local nunca é revertido.
 8. Ao final do ciclo, `status.record_drain` registra ops aplicadas, oid do commit, resultado do push e ops ainda pendentes na fila — e persiste o `status.json`.
@@ -282,7 +282,7 @@ A única coalescência hoje é Write-sobre-Write (`push_coalescing` em `src/sync
 | `src/git.rs` | `commit_working_tree`, `push_to_remote`, `fetch_remote`, `merge_ff_only`, `pull_and_merge`, `is_working_tree_clean` |
 | `src/status.rs` | `SyncStatus`/`StatusState`, escrita atômica do `status.json`, formatação do subcomando |
 | `src/notify.rs` | Notificações macOS (osascript) com rate limit para eventos persistentes |
-| `src/config.rs` | Origem de `write_debounce_secs`, `pull_interval_secs`, `read_cache_mb`, `large_file_threshold_mb`, identidade e token |
+| `src/config.rs` | Origem de `write_debounce_secs`, `pull_interval_secs`, `read_cache_mb`, `large_file_threshold_mb`, `chunk_threshold_mb`, `chunk_size_mb`, identidade e token |
 
 Docs relacionadas:
 

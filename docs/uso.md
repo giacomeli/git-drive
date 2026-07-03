@@ -170,6 +170,8 @@ Se o repo é local-only (`git init` sem `git remote add`), ignore esta etapa int
   "pull_interval_secs": 60,
   "read_cache_mb": 64,
   "large_file_threshold_mb": 64,
+  "chunk_threshold_mb": 95,
+  "chunk_size_mb": 80,
   "user_name": "Juliano",
   "user_email": "juliano@example.com",
   "remote_token": null
@@ -182,6 +184,8 @@ Se o repo é local-only (`git init` sem `git remote add`), ignore esta etapa int
 | `pull_interval_secs` | `0` desliga o pull watcher (útil em repos locais-only). Aumente se o remote muda pouco para reduzir chamadas de rede. |
 | `read_cache_mb` | Orçamento do cache de leitura em MiB (default `64`). Aumente para repos com arquivos grandes lidos com frequência; `0` desativa (toda leitura vai ao repo, via handle persistente). |
 | `large_file_threshold_mb` | Limiar em MiB acima do qual buffers de escrita vão para arquivo de spool em disco em vez de RAM (default `64`). Copiar um vídeo de 4 GiB para o drive não exige 4 GiB de RAM. `0` desativa o spool. |
+| `chunk_threshold_mb` | Arquivo acima disso (default `95`) é sincronizado como manifest + chunks de até `chunk_size_mb` em `.chunks/` — abaixo do limite de 100 MB por arquivo do GitHub. `0` desativa (pushes de arquivos grandes voltam a ser rejeitados pelo GitHub). |
+| `chunk_size_mb` | Tamanho máximo de cada chunk (default `80`). |
 | `user_name` / `user_email` | Se qualquer um for `null`, drive-sync **aplica as mudanças no working tree mas não commita**. Deixe ambos preenchidos para ter histórico. |
 | `remote_token` | PAT para HTTPS. `null` cai para ssh-agent / credential helper. |
 
@@ -336,7 +340,25 @@ drive, persistem no working tree entre remounts, mas **nunca entram em commit ne
 mecanismo de exclusão do drive — não há allowlist própria. Para política local sem tocar o
 `.gitignore` do repo, use `.git/info/exclude`. Atenção: local-only não sincroniza entre máquinas.
 
-### 8.9. O que **não** funciona
+### 8.9. Arquivos grandes (chunking)
+
+Arquivo acima de `chunk_threshold_mb` (default 95 MiB) é sincronizado em pedaços: no repo, o path
+vira um **manifest** texto pequeno e o conteúdo vai para `.chunks/<2 hex>/<sha256>`, cada chunk
+abaixo do limite de 100 MB por arquivo do GitHub. **No drive você não percebe nada** — o arquivo
+aparece inteiro, com o tamanho real, e a leitura é remontada com verificação de integridade.
+
+O que um clone Git puro (sem drive-sync) vê: o manifest e o diretório `.chunks/`. Recuperação
+manual de um arquivo:
+
+```bash
+# o manifest lista os hashes na ordem; concatene os chunks:
+grep '^sha256 ' arquivo.zip | awk '{print ".chunks/" substr($2,1,2) "/" $2}' | xargs cat > arquivo-recuperado.zip
+```
+
+Não crie conteúdo próprio dentro de `.chunks/` — o diretório é reservado e o GC do drive-sync
+remove o que nenhum manifest referencia.
+
+### 8.10. O que **não** funciona
 
 | Operação | Motivo |
 | --- | --- |
