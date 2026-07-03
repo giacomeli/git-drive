@@ -122,12 +122,12 @@ Regras que sustentam o modelo:
 | Op | Método do trait | Função pura | Comportamento |
 | --- | --- | --- | --- |
 | `lookup` | `lookup` | `apply_lookup(parent, name)` | Busca filho em `dirs_by_inode[parent].children` pelo `leaf_name`. Refresh antes. |
-| `getattr` | `getattr` | `apply_getattr(ino)` | Retorna `FileAttr` com uid/gid do processo e mtime estável. Refresh antes. |
+| `getattr` | `getattr` | `apply_getattr(ino)` | Retorna `FileAttr` com uid/gid do processo e mtime estável (derivado do último commit que tocou o path; sessão tem precedência). Refresh antes. |
 | `setattr` | `setattr` | `apply_truncate(ino, size)` | `mode` vai para `mode_overrides` (in-memory); `size` trunca o buffer preservando conteúdo; times atualizam `times`. |
 | `readdir` | `readdir` | `apply_readdir(ino)` | Lista `.`, `..` e children ordenados por nome. Refresh só na primeira página (`offset == 0`). |
 | `readdirplus` | `readdirplus` | `apply_readdir(ino)` | Variante com atributos inline — Finder usa `getattrlistbulk`. |
 | `open` | `open` | — | Sempre aceita, fh = ino. |
-| `read` | `read` | `apply_read(ino, offset, size)` | Buffer do inode, cache de blobs, blob do HEAD (miss popula o cache). Erros viram `EIO`. |
+| `read` | `read` | `apply_read(ino, offset, size)` | Buffer do inode (RAM ou spool), cache de blobs, working tree (local-only) ou blob do HEAD via handle de repo persistente (miss popula o cache). Erros viram `EIO`. |
 | `write` | `write` | `apply_write(ino, offset, data)` | Buffer inicializado do HEAD; escrita em offset; atualiza `entry.size`; marca dirty. |
 | `flush` | `flush` | `apply_flush(ino)` | Enfileira `queue_write` só se dirty; limpa a marca; `touch`. |
 | `release` | `release` | — | Apenas loga. |
@@ -138,6 +138,8 @@ Regras que sustentam o modelo:
 | `rename` | `rename` | `apply_rename(parent, name, new_parent, new_name)` | Move inode entre parents, atualiza paths de descendentes, reindexa. Flags do `renameatx_np` (patch no vendor/fuser): `RENAME_SWAP` roteia para `apply_exchange`, `RENAME_EXCL` retorna `EEXIST` se o destino existe. Dir usa `queue_rename` — exceto endpoints efêmeros: destino efêmero expande em Delete/Rmdir recursivo (bottom-up) e origem efêmera materializa via Mkdir/Write. Arquivo vira `queue_write(dest) + queue_delete(src)`, popula buffer não-dirty e limpa dirty. Nomes vazios (fallback defensivo do parse antigo) acionam o swap implícito. |
 | `exchange` | `exchange` (macOS) | `apply_exchange(parent, name, newparent, newname)` | Troca conteúdo de dois arquivos (safe save do TextEdit/iWork). Atualiza buffers, enfileira os dois writes, limpa dirty. Mesma lógica atende `rename` com `RENAME_SWAP`. |
 | `link` | `link` | — | Simulado via cópia com inode novo (modelo 1 inode = 1 path). Cobre o backup transiente do safe save. |
+| `readlink` | `readlink` | `apply_readlink(ino)` | Alvo do symlink (conteúdo do blob `120000`). `EINVAL` para arquivo regular. |
+| `symlink` | `symlink` | `apply_symlink(parent, name, target)` | Cria entry com kind symlink, buffer com o texto do alvo e enfileira `SyncOp::Symlink` (barreira na fila causal). |
 | `statfs` | `statfs` | — | Volume advertido com ~1 TiB livre — sinal para o userland, não quota. |
 | `setxattr`/`getxattr`/`listxattr`/`removexattr` | idem | — | `HashMap` em memória por inode; `ENOATTR` no macOS, `ENODATA` no Linux. |
 
@@ -154,7 +156,7 @@ Regras que sustentam o modelo:
 | `EIO` | Erro do `git2` em `read` |
 | `EXDEV` | Swap implícito sem par no destino (defesa contra encodings ambíguos do exchangedata) |
 
-Não implementadas (default `ENOSYS`): `symlink`, `readlink`, `mknod`, `fsync`, `fallocate`, `copy_file_range`.
+Não implementadas (default `ENOSYS`): `mknod`, `fsync`, `fallocate`, `copy_file_range`.
 
 ---
 
@@ -191,12 +193,14 @@ ler o path novo antes do commit caía num blob inexistente no HEAD e retornava `
 ## Limitações
 
 1. **TTL de 1s** no kernel mascara mudanças vindas do pull por até 1 segundo.
-2. **Sem symlinks / FIFOs / hardlinks reais** (`link` é cópia).
+2. **Sem FIFOs / hardlinks reais** (`link` é cópia). Symlinks são suportados: alvo opaco, nunca resolvido (no-follow); alvo absoluto quebra em outra máquina, como no Git puro.
 3. **Permissões e xattrs em memória** — `chmod` aceito mas não persiste entre montagens; `chown` ignorado.
-4. **Timestamps em memória** — começam no boot do mount, avançam em escrita real, não persistem.
+4. **mtime derivado do histórico** — arquivo não tocado na sessão expõe o timestamp do último commit que tocou o path (revwalk único com teto de 4096 commits; resíduo cai no timestamp do HEAD). Toques da sessão (flush/setattr) têm precedência e não persistem entre montagens. `atime`/`ctime`/`crtime` espelham o mtime disponível.
 5. **Escritas não-commitadas são perdidas em crash** antes do debounce drenar.
 6. **Swap implícito exige exatamente um arquivo-filho** no diretório de origem — ambiguidade retorna `EXDEV` e o app degrada para o fluxo de cópia.
-7. **Cache de blobs não cobre arquivos maiores que o orçamento** (`read_cache_mb`) — leituras deles reabrem o repo a cada syscall.
+7. **Cache de blobs não cobre arquivos maiores que o orçamento** (`read_cache_mb`) — leituras deles vão ao repo a cada syscall, mas por um handle persistente (uma abertura por mount, não uma por syscall).
+8. **Write buffers acima de `large_file_threshold_mb` vivem em spool** (`.git/drive-sync-spool/`) com acesso randômico — pico de RAM limitado ao limiar; snapshot da fila é aplicado no drain com `rename`.
+9. **Arquivos ignorados pelo `.gitignore` do repo são local-only visíveis** — aparecem no mount, persistem no working tree entre remounts e nunca entram em commit/push.
 
 ---
 

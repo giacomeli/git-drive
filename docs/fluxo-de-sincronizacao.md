@@ -107,15 +107,21 @@ pub struct SyncManager {
 ```rust
 #[derive(Debug, Clone)]
 pub enum SyncOp {
-    Write { path: String, content: Vec<u8> },
+    Write { path: String, content: WriteContent },
     Delete { path: String },
     Mkdir { path: String },
     Rmdir { path: String },
     Rename { from: String, to: String },
+    Symlink { path: String, target: String },
 }
 ```
 
-A fila preserva a **ordem de chegada** — a ordem do kernel FUSE é a ordem causal. Única coalescência permitida (`push_coalescing`): um `Write` substitui in-place o `Write` mais recente do mesmo path, desde que nenhuma op posterior a ele toque um path relacionado (igual ou ancestral/descendente) — `Rename`, `Delete`, `Mkdir` e `Rmdir` funcionam como barreiras. A correção nunca depende da coalescência; ela só evita conteúdo redundante em write storms.
+`WriteContent` tem duas formas: `Mem(Arc<Vec<u8>>)` — o MESMO `Arc` do write buffer do inode, sem
+cópia no flush — e `Spooled(PathBuf)` — snapshot em arquivo de spool (`.git/drive-sync-spool/`)
+para buffers acima de `large_file_threshold_mb`, aplicado no drain com `rename` (sem passar pela
+RAM).
+
+A fila preserva a **ordem de chegada** — a ordem do kernel FUSE é a ordem causal. Única coalescência permitida (`push_coalescing`): um `Write` substitui in-place o `Write` mais recente do mesmo path, desde que nenhuma op posterior a ele toque um path relacionado (igual ou ancestral/descendente) — `Rename`, `Delete`, `Mkdir`, `Rmdir` e `Symlink` funcionam como barreiras. Snapshot spooled substituído tem o arquivo removido na hora. A correção nunca depende da coalescência; ela só evita conteúdo redundante em write storms.
 
 Essa estrutura substituiu um `HashMap<String, SyncOp>` chaveado por path com sort por tipo de op no drain, que tinha duas classes de bug:
 
@@ -137,7 +143,7 @@ Fluxo, ver `src/sync.rs::spawn_watcher`:
 3. Sob o lock de `inner`: se `last_op.elapsed() >= debounce` e a fila não está vazia, `mem::take` da fila; caso contrário continua esperando.
 4. Adquire `repo_lock` (segura pelo ciclo inteiro; não há `.await` no escopo do guard).
 5. Itera o lote **na ordem da fila** chamando `apply_op_to_disk` para cada `SyncOp`.
-6. Se `user_name`/`user_email` estão presentes, `commit_batch` gera a mensagem `drive-sync: <N> changes (...)` e chama `git::commit_working_tree`. Commit criado incrementa `commit_generation`.
+6. Se `user_name`/`user_email` estão presentes, `commit_batch` gera a mensagem `drive-sync: <N> changes (...)` e chama `git::commit_working_tree` (`add_all` com `IndexAddOption::DEFAULT` — arquivos que casam com o `.gitignore` do repo montado ficam fora do commit por especificação; no mount eles viram local-only visíveis). Commit criado incrementa `commit_generation`.
 7. Se houve commit e `remote_name` está configurado, `push_batch` chama `git::push_to_remote`. Push rejeitado (tipicamente non-FF) dispara `reconcile_and_retry_push`: fetch + `pull_and_merge` + um retry de push. Recuperação seta `refresh_flag`. O commit local nunca é revertido.
 8. Ao final do ciclo, `status.record_drain` registra ops aplicadas, oid do commit, resultado do push e ops ainda pendentes na fila — e persiste o `status.json`.
 
@@ -155,6 +161,7 @@ pós-reconcile e conflicted copies também disparam notificações macOS (`notif
 | `Mkdir` | `create_dir_all(path)` + `fs::write(path/.gitkeep)`. Necessário porque Git não rastreia diretórios vazios. |
 | `Rmdir` | Remove `.gitkeep` (se existir) + `fs::remove_dir` (ENOENT silencioso). |
 | `Rename` | `create_dir_all(parent do destino)` + `fs::rename`. |
+| `Symlink` | Remove path pré-existente + `std::os::unix::fs::symlink(target, path)` — o `add_all` estagia como entrada `120000`. |
 
 Erros são logados e o lote segue — arquivos restantes são tentados. **Sem atomicidade multi-arquivo**: um crash no meio do lote deixa estado parcial no working tree (sem commit).
 
@@ -275,7 +282,7 @@ A única coalescência hoje é Write-sobre-Write (`push_coalescing` em `src/sync
 | `src/git.rs` | `commit_working_tree`, `push_to_remote`, `fetch_remote`, `merge_ff_only`, `pull_and_merge`, `is_working_tree_clean` |
 | `src/status.rs` | `SyncStatus`/`StatusState`, escrita atômica do `status.json`, formatação do subcomando |
 | `src/notify.rs` | Notificações macOS (osascript) com rate limit para eventos persistentes |
-| `src/config.rs` | Origem de `write_debounce_secs`, `pull_interval_secs`, `read_cache_mb`, identidade e token |
+| `src/config.rs` | Origem de `write_debounce_secs`, `pull_interval_secs`, `read_cache_mb`, `large_file_threshold_mb`, identidade e token |
 
 Docs relacionadas:
 

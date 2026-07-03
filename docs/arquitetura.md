@@ -27,7 +27,7 @@ flowchart LR
 ```text
 drive-sync/
 ├── Cargo.toml                    # deps: fuser, git2, tokio, clap, parking_lot, serde, tempfile, serial_test
-├── config.json                   # (em .gitignore) write_debounce_secs, pull_interval_secs, user_name, user_email, remote_token
+├── config.json                   # (em .gitignore) debounce, pull, read_cache_mb, large_file_threshold_mb, identidade, remote_token
 ├── CLAUDE.md
 ├── README.md
 ├── .gitignore
@@ -209,12 +209,12 @@ pub struct Config {
 | --- | --- | --- |
 | 1 | `.gitkeep` automático em `mkdir`/`rmdir` | Git não rastreia diretórios vazios — workaround em `src/sync.rs` |
 | 2 | Credenciais em texto plano | `config.json` no `.gitignore` por padrão |
-| 3 | Merge apenas fast-forward | `src/git.rs::merge_ff_only` — divergência exige resolução manual |
+| 3 | Conflito de merge vira conflicted copy | `pull_and_merge` 3-way; sem identidade degrada para FF-only |
 | 4 | Push falho não é revertido | commit local permanece; próxima iteração retenta |
 | 5 | HEAD detached aborta boot | `src/main.rs` |
-| 6 | Sem symlinks/FIFOs/sockets/hardlinks | `GitDriveFS` só cobre `RegularFile` e `Directory` |
-| 7 | `perm` fixo + uid/gid hardcoded | sem `chmod`/`chown` |
-| 8 | Sem cache de blobs em `read` | ver performance |
+| 6 | Sem FIFOs/sockets/hardlinks reais | Symlinks suportados (Fase 2.5); `link` é cópia |
+| 7 | `chmod` em memória, `chown` ignorado | uid/gid são os do processo do mount |
+| 8 | Cache de blobs não cobre arquivo maior que o orçamento | miss usa handle de repo persistente (sem reabrir por syscall) |
 | 9 | Refresh depende de syscalls FUSE | TTL de 1s no kernel pode mascarar mudanças remotas por ~1s |
 | 10 | Sem criptografia | fora do escopo desta etapa; reservado para próxima spec |
 

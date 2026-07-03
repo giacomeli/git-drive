@@ -169,6 +169,7 @@ Se o repo é local-only (`git init` sem `git remote add`), ignore esta etapa int
   "write_debounce_secs": 5,
   "pull_interval_secs": 60,
   "read_cache_mb": 64,
+  "large_file_threshold_mb": 64,
   "user_name": "Juliano",
   "user_email": "juliano@example.com",
   "remote_token": null
@@ -179,7 +180,8 @@ Se o repo é local-only (`git init` sem `git remote add`), ignore esta etapa int
 | --- | --- |
 | `write_debounce_secs` | Diminua (`1`–`2`) para ver commits mais rápido em dev; aumente (`30`) se fizer muitas escritas em rajada para agrupar em menos commits. |
 | `pull_interval_secs` | `0` desliga o pull watcher (útil em repos locais-only). Aumente se o remote muda pouco para reduzir chamadas de rede. |
-| `read_cache_mb` | Orçamento do cache de leitura em MiB (default `64`). Aumente para repos com arquivos grandes lidos com frequência; `0` desativa (cada leitura reabre o repo). |
+| `read_cache_mb` | Orçamento do cache de leitura em MiB (default `64`). Aumente para repos com arquivos grandes lidos com frequência; `0` desativa (toda leitura vai ao repo, via handle persistente). |
+| `large_file_threshold_mb` | Limiar em MiB acima do qual buffers de escrita vão para arquivo de spool em disco em vez de RAM (default `64`). Copiar um vídeo de 4 GiB para o drive não exige 4 GiB de RAM. `0` desativa o spool. |
 | `user_name` / `user_email` | Se qualquer um for `null`, drive-sync **aplica as mudanças no working tree mas não commita**. Deixe ambos preenchidos para ter histórico. |
 | `remote_token` | PAT para HTTPS. `null` cai para ssh-agent / credential helper. |
 
@@ -320,15 +322,29 @@ rm /tmp/gitmount/notas/hello.txt
 rmdir /tmp/gitmount/notas/2026   # precisa estar vazio
 ```
 
-### 8.7. O que **não** funciona (v0.1.0)
+### 8.7. Symlinks
+
+`ln -s alvo link` funciona: o symlink é commitado como entrada `120000` (mesma representação do
+Git puro) e chega ao remote. O alvo é texto opaco — drive-sync nunca o resolve nem valida; um
+symlink com alvo absoluto criado numa máquina fica quebrado em outra, exatamente como em um clone
+comum.
+
+### 8.8. Arquivos ignorados (`.gitignore`)
+
+Arquivos que casam com o `.gitignore` do repo montado são **local-only visíveis**: aparecem no
+drive, persistem no working tree entre remounts, mas **nunca entram em commit nem push**. É o
+mecanismo de exclusão do drive — não há allowlist própria. Para política local sem tocar o
+`.gitignore` do repo, use `.git/info/exclude`. Atenção: local-only não sincroniza entre máquinas.
+
+### 8.9. O que **não** funciona
 
 | Operação | Motivo |
 | --- | --- |
-| Symlinks (`ln -s`) | `FileType::Symlink` fora do escopo. |
-| Hardlinks (`ln`) | idem. |
-| `chmod` / `chown` | `perm` fixo `0o644`/`0o755`, `uid`/`gid` = 1000. |
-| FIFOs, sockets, device files | Só `RegularFile` e `Directory`. |
+| Hardlinks (`ln`) | Simulado como cópia (modelo 1 inode = 1 path). |
+| `chmod` / `chown` | `chmod` aceito só em memória (não persiste entre montagens); `chown` ignorado; `uid`/`gid` são os do processo do mount. |
+| FIFOs, sockets, device files | Só `RegularFile`, `Directory` e `Symlink`. |
 | Modificar `.git/` | O próprio `.git` do repo montado não é exposto via FUSE. |
+| Git LFS | Repos com LFS mostram o ponteiro de texto, não o conteúdo (libgit2 sem filtros smudge/clean). |
 
 ---
 
