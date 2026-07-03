@@ -865,3 +865,41 @@ async fn apply_exchange_missing_side_is_enoent() {
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
     assert_eq!(fs.apply_exchange(1, "a.txt", 1, "nope.txt"), Err(libc::ENOENT));
 }
+
+// ---- Fase 2 RF5/RF6: Lixeira nativa e .gitkeep oculto ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn gitkeep_is_hidden_and_empty_dir_accepts_rmdir_after_refresh() {
+    // Regressão do achado da validação manual: após refresh, o .gitkeep
+    // virava filho visível e o rmdir de pasta "vazia" falhava com ENOTEMPTY.
+    let test = init_repo();
+    commit_file(&test.repo, "vazia/.gitkeep", b"", "add dir vazia");
+    let sync = SyncManager::new(test.dir.path().to_str().unwrap(), 5);
+    let sync_handle = sync.clone();
+    let mut fs = GitDriveFS::new(test.dir.path().to_str().unwrap(), "main".to_string(), sync)
+        .expect("GitDriveFS::new");
+
+    assert_eq!(fs.file_count(), 0, ".gitkeep não deve entrar nos índices");
+    let dir_ino = fs.find_inode("vazia").unwrap();
+    let entries = fs.apply_readdir(dir_ino).unwrap();
+    assert_eq!(entries.len(), 2, "só . e .. — obtido {:?}", entries);
+
+    // Após refresh, a regra se mantém
+    sync_handle.raise_refresh_flag();
+    fs.refresh_if_needed();
+    assert_eq!(fs.file_count(), 0);
+    assert_eq!(fs.apply_rmdir(1, "vazia"), Ok(()), "rmdir de dir vazia deve funcionar");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn mkdir_trashes_at_root_is_allowed_in_memory() {
+    // Fase 2: Lixeira nativa — o EPERM foi removido; o dir é efêmero (não
+    // entra na fila do sync).
+    let test = init_repo();
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let (ino, _) = fs.apply_mkdir(1, ".Trashes").unwrap();
+    assert!(fs.find_inode(".Trashes").is_some());
+    assert!(fs.sync_snapshot_for_test().is_empty(), "op de dir efêmero é filtrada");
+    let (sub, _) = fs.apply_mkdir(ino, "501").unwrap();
+    assert!(sub > 0);
+}

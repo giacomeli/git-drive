@@ -236,6 +236,13 @@ impl GitDriveFS {
         }
 
         for (file_path, size) in files {
+            // `.gitkeep` é artefato interno da ilusão "Git não rastreia dir
+            // vazio" (decisão 8 da Fase 2): não entra nos índices nem aparece
+            // no readdir — sem isso, o rmdir de pasta "vazia" falhava com
+            // ENOTEMPTY após um refresh (achado da validação de 03-07-2026).
+            if leaf_name(&file_path) == ".gitkeep" {
+                continue;
+            }
             let inode = next_inode.fetch_add(1, Ordering::SeqCst);
             let parent_path = match file_path.rfind('/') {
                 Some(i) => file_path[..i].to_string(),
@@ -778,6 +785,10 @@ impl GitDriveFS {
         }
 
         for (file_path, size) in files {
+            // Mesma regra da ingestão inicial: `.gitkeep` fica fora dos índices.
+            if leaf_name(&file_path) == ".gitkeep" {
+                continue;
+            }
             let inode = previous
                 .get(&file_path)
                 .copied()
@@ -1829,24 +1840,12 @@ impl Filesystem for GitDriveFS {
             reply.error(libc::EINVAL);
             return;
         };
-        // Bloqueia criação de `.Trashes` no root. Quando o user faz "Move to
-        // Trash" no Finder, macOS cria `.Trashes/<uid>/` e tenta usar
-        // exchangedata pra mover o arquivo selecionado pra lá. Como
-        // exchangedata é encodado pelo macFUSE como FUSE_RENAME com nomes
-        // vazios, e o target dir está vazio (sem par pra swap), nosso
-        // `apply_implicit_swap` falhava com ENOENT → "(error code -43)" no
-        // Finder. Recusando `.Trashes` aqui (EPERM), o Finder degrada para o
-        // fluxo de "permanent delete via UNLINK direto" (mostra dialog
-        // "Are you sure? This will permanently delete..."), que envia o nome
-        // do arquivo explicitamente e funciona.
-        if parent == ROOT_INODE && filename == ".Trashes" {
-            eprintln!(
-                "[{}] MKDIR REJECT .Trashes (forçar UNLINK pelo Finder em vez de exchangedata)",
-                log_ts()
-            );
-            reply.error(libc::EPERM);
-            return;
-        }
+        // `.Trashes` é permitido (Lixeira nativa do Finder, Fase 2). O EPERM
+        // que existia aqui era mitigação para o parse quebrado do rename do
+        // macFUSE (nomes vazios + swap ambíguo), corrigido em b8f2647. O dir
+        // é efêmero: existe só em memória, e mover itens para dentro vira
+        // remoção no repo (expansão da Fase 1) com conteúdo recuperável via
+        // buffers até esvaziar a Lixeira ou remontar.
         println!(
             "[{}] MKDIR parent={} name={:?}",
             log_ts(),
