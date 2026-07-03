@@ -20,6 +20,14 @@ fn default_large_file_threshold_mb() -> u64 {
     64
 }
 
+fn default_chunk_threshold_mb() -> u64 {
+    95
+}
+
+fn default_chunk_size_mb() -> u64 {
+    80
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default = "default_write_debounce_secs")]
@@ -33,6 +41,14 @@ pub struct Config {
     /// spool em disco (pico de RAM limitado). `0` desativa o spool.
     #[serde(default = "default_large_file_threshold_mb")]
     pub large_file_threshold_mb: u64,
+    /// Limiar em MiB acima do qual um arquivo é convertido em manifest +
+    /// chunks (`.chunks/`) no commit — nenhum blob acima disso é stageado.
+    /// Default abaixo do limite de 100 MB por arquivo do GitHub. `0` desativa.
+    #[serde(default = "default_chunk_threshold_mb")]
+    pub chunk_threshold_mb: u64,
+    /// Tamanho máximo de cada chunk, em MiB.
+    #[serde(default = "default_chunk_size_mb")]
+    pub chunk_size_mb: u64,
     #[serde(default)]
     pub user_name: Option<String>,
     #[serde(default)]
@@ -48,6 +64,8 @@ impl Default for Config {
             pull_interval_secs: default_pull_interval_secs(),
             read_cache_mb: default_read_cache_mb(),
             large_file_threshold_mb: default_large_file_threshold_mb(),
+            chunk_threshold_mb: default_chunk_threshold_mb(),
+            chunk_size_mb: default_chunk_size_mb(),
             user_name: None,
             user_email: None,
             remote_token: None,
@@ -120,6 +138,22 @@ mod tests {
         assert!(cfg.user_name.is_none());
         assert!(cfg.user_email.is_none());
         assert!(cfg.remote_token.is_none());
+    }
+
+    #[test]
+    fn load_from_default_chunking_fields() {
+        let (_dir, path) = write_config("{}");
+        let cfg = Config::load_from(&path);
+        assert_eq!(cfg.chunk_threshold_mb, 95);
+        assert_eq!(cfg.chunk_size_mb, 80);
+    }
+
+    #[test]
+    fn load_from_chunking_overrides_and_disable() {
+        let (_dir, path) = write_config(r#"{"chunk_threshold_mb": 0, "chunk_size_mb": 40}"#);
+        let cfg = Config::load_from(&path);
+        assert_eq!(cfg.chunk_threshold_mb, 0, "0 desativa o chunking");
+        assert_eq!(cfg.chunk_size_mb, 40);
     }
 
     #[test]
