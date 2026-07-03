@@ -847,14 +847,27 @@ impl GitDriveFS {
         }
         let (src_ino, src_name, src_path) = {
             let dir = self.dirs_by_inode.get(&source_parent).ok_or(libc::ENOENT)?;
-            let mut picked: Option<u64> = None;
-            for child in &dir.children {
-                if self.files_by_inode.contains_key(child) {
-                    picked = Some(*child);
-                    break;
-                }
+            // O encoding do macFUSE não transporta QUAL arquivo trocar — o
+            // contrato do safe-save é um temp dir com UM arquivo. Com zero ou
+            // mais de um, qualquer escolha é chute, e chute errado troca o
+            // conteúdo do arquivo errado (corrupção silenciosa). EXDEV degrada
+            // o app para o fluxo de cópia, que funciona.
+            let file_children: Vec<u64> = dir
+                .children
+                .iter()
+                .filter(|c| self.files_by_inode.contains_key(c))
+                .copied()
+                .collect();
+            if file_children.len() != 1 {
+                eprintln!(
+                    "[{}] swap implicit ambíguo: source_parent={} tem {} arquivos (esperado 1) — retornando EXDEV",
+                    log_ts(),
+                    source_parent,
+                    file_children.len()
+                );
+                return Err(libc::EXDEV);
             }
-            let ino = picked.ok_or(libc::ENOENT)?;
+            let ino = file_children[0];
             let entry = self.files_by_inode.get(&ino).unwrap();
             (ino, leaf_name(&entry.path).to_string(), entry.path.clone())
         };
@@ -1041,9 +1054,55 @@ impl GitDriveFS {
         self.reindex_paths();
 
         if src_is_dir {
-            // Diretório: usamos Rename nativo no disco (mv). Dirs vazios/cheios
-            // transitam tranquilamente.
-            self.sync.queue_rename(&old_path, &new_path);
+            let src_eph = crate::sync::is_fully_ephemeral_path(&old_path);
+            let dest_eph = crate::sync::is_fully_ephemeral_path(&new_path);
+            if dest_eph && !src_eph {
+                // Mover dir real para área efêmera (ex.: Trash) = remoção do
+                // repo. O filtro descartaria o Rename inteiro e o disco
+                // divergiria do índice. Expandimos em Delete/Rmdir dos paths
+                // ANTIGOS (reais), bottom-up. Buffers preservam o conteúdo em
+                // memória: reads dentro do Trash continuam funcionando e um
+                // rename de volta rematerializa.
+                let (mut dirs, files) = self.collect_subtree(src);
+                let to_old = |p: &str| format!("{}{}", old_path, &p[new_path.len()..]);
+                for (ino, path) in &files {
+                    let old = to_old(path);
+                    let content = self
+                        .content_for_inode_at_path(*ino, &old)
+                        .unwrap_or_default();
+                    self.write_buffers.lock().insert(*ino, content);
+                    self.read_cache.remove(*ino);
+                    self.dirty.remove(ino);
+                    self.sync.queue_delete(&old);
+                }
+                dirs.sort_by_key(|(_, p)| std::cmp::Reverse(p.matches('/').count()));
+                for (_, path) in &dirs {
+                    self.sync.queue_rmdir(&to_old(path));
+                }
+            } else if src_eph && !dest_eph {
+                // Dir efêmero virando real = materialização: o conteúdo só
+                // existe em memória (ou no HEAD, se era legado commitado).
+                // Mkdir top-down + Write com conteúdo corrente.
+                let (mut dirs, files) = self.collect_subtree(src);
+                let to_old = |p: &str| format!("{}{}", old_path, &p[new_path.len()..]);
+                dirs.sort_by_key(|(_, p)| p.matches('/').count());
+                for (_, path) in &dirs {
+                    self.sync.queue_mkdir(path);
+                }
+                for (ino, path) in &files {
+                    let old = to_old(path);
+                    let content = self
+                        .content_for_inode_at_path(*ino, &old)
+                        .unwrap_or_default();
+                    self.sync.queue_write(path, content);
+                    self.dirty.remove(ino);
+                }
+            } else {
+                // Diretório: usamos Rename nativo no disco (mv). Dirs
+                // vazios/cheios transitam tranquilamente. (Efêmero -> efêmero
+                // cai aqui e o filtro do enqueue descarta — memória apenas.)
+                self.sync.queue_rename(&old_path, &new_path);
+            }
         } else {
             // Arquivo: traduz rename em Write(dest) + Delete(src). Isso desacopla
             // da existência do src em disco (que pode ter sido criada em ops que
@@ -1065,6 +1124,23 @@ impl GitDriveFS {
             self.dirty.remove(&src);
         }
         Ok(())
+    }
+
+    /// Coleta a subárvore de `root_ino` (inclusive): dirs e arquivos com os
+    /// paths correntes do índice. Travessia local, sem I/O.
+    fn collect_subtree(&self, root_ino: u64) -> (Vec<(u64, String)>, Vec<(u64, String)>) {
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        let mut stack = vec![root_ino];
+        while let Some(ino) = stack.pop() {
+            if let Some(d) = self.dirs_by_inode.get(&ino) {
+                dirs.push((ino, d.path.clone()));
+                stack.extend(d.children.iter().copied());
+            } else if let Some(f) = self.files_by_inode.get(&ino) {
+                files.push((ino, f.path.clone()));
+            }
+        }
+        (dirs, files)
     }
 
     fn update_descendant_paths(&mut self, old_prefix: &str, new_prefix: &str) {

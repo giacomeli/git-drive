@@ -716,3 +716,119 @@ async fn apply_read_after_rename_returns_content_not_eio() {
     fs.apply_rename(1, "a.txt", 1, "b.txt").unwrap();
     assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"hello");
 }
+
+// ---- Fase 1 RF2: validação do swap implícito ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn implicit_swap_with_two_files_in_source_returns_exdev() {
+    // O contrato do safe-save é um temp dir com UM arquivo. Com dois, escolher
+    // qualquer um é chute — antes o código pegava o primeiro da iteração do
+    // HashSet e podia trocar o conteúdo do arquivo errado.
+    let test = init_repo();
+    commit_file(&test.repo, "tmpdir/a.txt", b"aaa", "add a");
+    commit_file(&test.repo, "tmpdir/b.txt", b"bbb", "add b");
+    commit_file(&test.repo, "a.txt", b"root-a", "add root a");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let tmpdir_ino = fs.find_inode("tmpdir").unwrap();
+    let root_a = fs.find_inode("a.txt").unwrap();
+
+    // RENAME com nomes vazios = encoding do exchangedata no macFUSE
+    let result = fs.apply_rename(tmpdir_ino, "", 1, "");
+    assert_eq!(result, Err(libc::EXDEV));
+
+    // Nenhum conteúdo alterado, nenhuma op enfileirada
+    assert_eq!(fs.read_content_for_test(root_a).as_deref(), Some(b"root-a".as_slice()));
+    assert!(fs.sync_snapshot_for_test().is_empty());
+}
+
+// ---- Fase 1 RF3: renames envolvendo paths efêmeros ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn dir_rename_to_ephemeral_queues_recursive_removal() {
+    // Antes, o filtro descartava o Rename inteiro: o disco mantinha o dir e o
+    // índice em memória dizia que ele tinha virado efêmero — divergência.
+    let test = init_repo();
+    commit_file(&test.repo, "d/f.txt", b"conteudo-f", "add f");
+    commit_file(&test.repo, "d/sub/g.txt", b"conteudo-g", "add g");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let f_ino = fs.find_inode("d/f.txt").unwrap();
+
+    fs.apply_rename(1, "d", 1, "._d").unwrap();
+
+    let ops = fs.sync_snapshot_for_test();
+    use drive_sync::sync::SyncOp;
+    assert!(
+        !ops.iter().any(|op| matches!(op, SyncOp::Rename { .. })),
+        "não deve haver Rename na fila, obtido {:?}",
+        ops
+    );
+    assert!(ops.iter().any(|op| matches!(op, SyncOp::Delete { path } if path == "d/f.txt")));
+    assert!(ops.iter().any(|op| matches!(op, SyncOp::Delete { path } if path == "d/sub/g.txt")));
+    let pos_sub = ops.iter().position(|op| matches!(op, SyncOp::Rmdir { path } if path == "d/sub"));
+    let pos_root = ops.iter().position(|op| matches!(op, SyncOp::Rmdir { path } if path == "d"));
+    assert!(pos_sub.is_some() && pos_root.is_some(), "rmdirs esperados, obtido {:?}", ops);
+    assert!(pos_sub < pos_root, "rmdir deve ser bottom-up");
+
+    // Conteúdo continua legível dentro da área efêmera (Trash)
+    assert_eq!(fs.apply_read(f_ino, 0, 100).unwrap(), b"conteudo-f");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn dir_rename_from_ephemeral_materializes_content() {
+    let test = init_repo();
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+
+    // Dir efêmero construído em memória (todas as ops são filtradas da fila)
+    let (dir_ino, _) = fs.apply_mkdir(1, "._hidden").unwrap();
+    let (f_ino, _) = fs.apply_create(dir_ino, "f.txt").unwrap();
+    fs.apply_write(f_ino, 0, b"segredo").unwrap();
+    fs.apply_flush(f_ino);
+    assert!(fs.sync_snapshot_for_test().is_empty(), "ops efêmeras devem ter sido filtradas");
+
+    fs.apply_rename(1, "._hidden", 1, "visible").unwrap();
+
+    let ops = fs.sync_snapshot_for_test();
+    use drive_sync::sync::SyncOp;
+    let pos_mkdir = ops.iter().position(|op| matches!(op, SyncOp::Mkdir { path } if path == "visible"));
+    let pos_write = ops.iter().position(|op| matches!(op,
+        SyncOp::Write { path, content } if path == "visible/f.txt" && content.as_slice() == b"segredo"));
+    assert!(pos_mkdir.is_some(), "mkdir esperado, obtido {:?}", ops);
+    assert!(pos_write.is_some(), "write com conteúdo esperado, obtido {:?}", ops);
+    assert!(pos_mkdir < pos_write, "mkdir deve preceder o write");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn file_rename_to_ephemeral_queues_only_delete() {
+    // Regressão do comportamento atual (correto): Write(destino efêmero) é
+    // filtrado, Delete(origem real) passa — o arquivo some do repo.
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"hello", "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+
+    fs.apply_rename(1, "a.txt", 1, "._a.txt").unwrap();
+
+    let ops = fs.sync_snapshot_for_test();
+    use drive_sync::sync::SyncOp;
+    assert_eq!(ops.len(), 1, "esperado só o Delete, obtido {:?}", ops);
+    assert!(matches!(&ops[0], SyncOp::Delete { path } if path == "a.txt"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn file_rename_from_ephemeral_materializes_write() {
+    // Regressão do comportamento atual (correto): Write(destino real) passa
+    // com o conteúdo corrente; Delete(origem efêmera) é filtrado.
+    let test = init_repo();
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let (ino, _) = fs.apply_create(1, "._tmp.txt").unwrap();
+    fs.apply_write(ino, 0, b"data").unwrap();
+    fs.apply_flush(ino);
+    assert!(fs.sync_snapshot_for_test().is_empty());
+
+    fs.apply_rename(1, "._tmp.txt", 1, "real.txt").unwrap();
+
+    let ops = fs.sync_snapshot_for_test();
+    use drive_sync::sync::SyncOp;
+    assert_eq!(ops.len(), 1, "esperado só o Write, obtido {:?}", ops);
+    assert!(matches!(&ops[0], SyncOp::Write { path, content }
+        if path == "real.txt" && content.as_slice() == b"data"));
+}

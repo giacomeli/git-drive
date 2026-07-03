@@ -666,7 +666,7 @@ fn build_commit_message(ops: &[&SyncOp]) -> String {
 /// Paths que nunca devem aparecer no working tree — sujeira gerada e deletada
 /// pelo próprio macOS (AppleDouble, metadados de Finder/Spotlight/Trash).
 /// Filtramos TODAS as ops: a gente não quer nem o rastro delas em commit.
-fn is_fully_ephemeral_path(path: &str) -> bool {
+pub(crate) fn is_fully_ephemeral_path(path: &str) -> bool {
     if path.is_empty() {
         return false;
     }
