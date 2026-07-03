@@ -100,7 +100,7 @@ pub fn redirect_io_to_log_file(verbose: bool) -> std::io::Result<std::path::Path
     // faz linha-a-linha — necessário pra `tail -f` e pro tee thread acordar
     // logo após cada println.
     unsafe {
-        let stdout_stream = libc::fdopen(libc::STDOUT_FILENO, b"w\0".as_ptr() as *const _);
+        let stdout_stream = libc::fdopen(libc::STDOUT_FILENO, c"w".as_ptr());
         if !stdout_stream.is_null() {
             libc::setvbuf(stdout_stream, std::ptr::null_mut(), libc::_IOLBF, 0);
         }
