@@ -585,6 +585,16 @@ pub struct fuse_mkdir_in {
 #[derive(Debug, FromBytes, FromZeroes)]
 pub struct fuse_rename_in {
     pub newdir: u64,
+    // PATCH local: macFUSE define fuse_rename_in com dois campos extras no
+    // Apple (flags do renameatx_np: RENAME_SWAP/RENAME_EXCL + padding).
+    // Sem eles, o parse lia os nomes 8 bytes antes do lugar certo e TODO
+    // rename chegava ao Filesystem com name/newname VAZIOS (o kernel zera os
+    // bytes de flags em renames comuns, que viravam dois NULs). Ver
+    // macfuse/library include/fuse_kernel.h.
+    #[cfg(target_os = "macos")]
+    pub flags: u32,
+    #[cfg(target_os = "macos")]
+    pub padding: u32,
 }
 
 #[repr(C)]

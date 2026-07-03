@@ -608,6 +608,19 @@ mod op {
                 name: self.newname,
             }
         }
+        /// PATCH local: flags do renameatx_np no macFUSE (RENAME_SWAP = 0x2,
+        /// RENAME_EXCL = 0x4). Em outras plataformas o FUSE_RENAME não carrega
+        /// flags (use RENAME2).
+        pub fn flags(&self) -> u32 {
+            #[cfg(target_os = "macos")]
+            {
+                self.arg.flags
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                0
+            }
+        }
     }
 
     /// Create a hard link.

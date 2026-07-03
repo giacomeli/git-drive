@@ -15,6 +15,12 @@ use crate::sync::SyncManager;
 const TTL: Duration = Duration::from_secs(1);
 const ROOT_INODE: u64 = 1;
 
+/// Flags do `renameatx_np(2)` do macOS, propagadas pelo macFUSE no
+/// `fuse_rename_in` (patch local no vendor/fuser). SWAP = troca atômica de
+/// conteúdo (exchange); EXCL = falhar se o destino existe.
+const APPLE_RENAME_SWAP: u32 = 0x2;
+const APPLE_RENAME_EXCL: u32 = 0x4;
+
 /// Entradas (inode, path) de uma travessia de subárvore.
 type SubtreeEntries = Vec<(u64, String)>;
 const FILE_MODE: u16 = 0o644;
@@ -944,6 +950,65 @@ impl GitDriveFS {
         Ok(())
     }
 
+    /// Troca atômica de conteúdo entre dois arquivos nomeados — semântica do
+    /// exchangedata(2)/renameatx_np(RENAME_SWAP). Usada pelo callback
+    /// `exchange` (FUSE_EXCHANGE) e por `rename` com a flag SWAP.
+    pub fn apply_exchange(
+        &mut self,
+        parent: u64,
+        name: &str,
+        newparent: u64,
+        newname: &str,
+    ) -> Result<(), i32> {
+        let ino_a = match self.find_child_inode(parent, name) {
+            Some(i) if self.files_by_inode.contains_key(&i) => i,
+            Some(_) => return Err(libc::EISDIR),
+            None => return Err(libc::ENOENT),
+        };
+        let ino_b = match self.find_child_inode(newparent, newname) {
+            Some(i) if self.files_by_inode.contains_key(&i) => i,
+            Some(_) => return Err(libc::EISDIR),
+            None => return Err(libc::ENOENT),
+        };
+
+        let content_a = self.current_file_content(ino_a).unwrap_or_default();
+        let content_b = self.current_file_content(ino_b).unwrap_or_default();
+
+        let path_a = self.files_by_inode.get(&ino_a).map(|f| f.path.clone());
+        let path_b = self.files_by_inode.get(&ino_b).map(|f| f.path.clone());
+        let (Some(path_a), Some(path_b)) = (path_a, path_b) else {
+            return Err(libc::ENOENT);
+        };
+
+        // Trocar tamanhos em memória
+        let size_a = content_a.len() as u64;
+        let size_b = content_b.len() as u64;
+        if let Some(f) = self.files_by_inode.get_mut(&ino_a) {
+            f.size = size_b;
+        }
+        if let Some(f) = self.files_by_inode.get_mut(&ino_b) {
+            f.size = size_a;
+        }
+
+        // Buffers refletem o conteúdo trocado para reads antes do commit
+        {
+            let mut buffers = self.write_buffers.lock();
+            buffers.insert(ino_a, content_b.clone());
+            buffers.insert(ino_b, content_a.clone());
+        }
+
+        self.sync.queue_write(&path_a, content_b);
+        self.sync.queue_write(&path_b, content_a);
+        self.dirty.remove(&ino_a);
+        self.dirty.remove(&ino_b);
+        self.read_cache.remove(ino_a);
+        self.read_cache.remove(ino_b);
+
+        self.touch(ino_a);
+        self.touch(ino_b);
+        Ok(())
+    }
+
     pub fn apply_rename(
         &mut self,
         parent: u64,
@@ -951,11 +1016,10 @@ impl GitDriveFS {
         new_parent: u64,
         new_name: &str,
     ) -> Result<(), i32> {
-        // Caso especial: macFUSE encoda o swap atômico do TextEdit como
-        // FUSE_RENAME com ambos os nomes vazios. Quando isso chega, a intenção
-        // é "trocar o conteúdo do único arquivo em source_parent com o de
-        // mesmo nome em target_parent" — equivalente a exchangedata(2).
-        // Sem esse tratamento o save no TextEdit falha com ENOENT → -43 no Finder.
+        // Fallback defensivo: nomes vazios eram artefato do parse desalinhado
+        // do fuse_rename_in no macFUSE (8 bytes de flags/padding lidos como
+        // nomes) — corrigido no vendor/fuser. Se algum encoding ainda chegar
+        // assim, cai na heurística antiga de swap do único arquivo-filho.
         if name.is_empty() && new_name.is_empty() {
             return self.apply_implicit_swap(parent, new_parent);
         }
@@ -1497,67 +1561,10 @@ impl Filesystem for GitDriveFS {
             newname
         );
 
-        let ino_a = match self.find_child_inode(parent, name) {
-            Some(i) if self.files_by_inode.contains_key(&i) => i,
-            Some(_) => {
-                reply.error(libc::EISDIR);
-                return;
-            }
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-        let ino_b = match self.find_child_inode(newparent, newname) {
-            Some(i) if self.files_by_inode.contains_key(&i) => i,
-            Some(_) => {
-                reply.error(libc::EISDIR);
-                return;
-            }
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-
-        let content_a = self.current_file_content(ino_a).unwrap_or_default();
-        let content_b = self.current_file_content(ino_b).unwrap_or_default();
-
-        let path_a = self.files_by_inode.get(&ino_a).map(|f| f.path.clone());
-        let path_b = self.files_by_inode.get(&ino_b).map(|f| f.path.clone());
-        let (Some(path_a), Some(path_b)) = (path_a, path_b) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-
-        // Trocar tamanhos em memória
-        let size_a = content_a.len() as u64;
-        let size_b = content_b.len() as u64;
-        if let Some(f) = self.files_by_inode.get_mut(&ino_a) {
-            f.size = size_b;
+        match self.apply_exchange(parent, name, newparent, newname) {
+            Ok(()) => reply.ok(),
+            Err(code) => reply.error(code),
         }
-        if let Some(f) = self.files_by_inode.get_mut(&ino_b) {
-            f.size = size_a;
-        }
-
-        // Atualizar write_buffers pra que reads subsequentes vejam o conteúdo trocado
-        // antes do commit
-        {
-            let mut buffers = self.write_buffers.lock();
-            buffers.insert(ino_a, content_b.clone());
-            buffers.insert(ino_b, content_a.clone());
-        }
-
-        // Queue writes pra materializar em disco + commit
-        self.sync.queue_write(&path_a, content_b);
-        self.sync.queue_write(&path_b, content_a);
-        self.dirty.remove(&ino_a);
-        self.dirty.remove(&ino_b);
-
-        self.touch(ino_a);
-        self.touch(ino_b);
-
-        reply.ok();
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
@@ -1904,6 +1911,32 @@ impl Filesystem for GitDriveFS {
             nn,
             flags
         );
+        // renameatx_np(RENAME_SWAP): TextEdit/iWork usam no safe save quando o
+        // FS anuncia suporte. Semântica de exchangedata — troca de conteúdo.
+        if flags & APPLE_RENAME_SWAP != 0 {
+            match self.apply_exchange(parent, n, new_parent, nn) {
+                Ok(()) => {
+                    println!("[{}] RENAME(SWAP) ok {:?} <-> {:?}", log_ts(), n, nn);
+                    reply.ok();
+                }
+                Err(code) => {
+                    eprintln!(
+                        "[{}] RENAME(SWAP) ERR {:?} <-> {:?} code={}",
+                        log_ts(),
+                        n,
+                        nn,
+                        code
+                    );
+                    reply.error(code);
+                }
+            }
+            return;
+        }
+        // renameatx_np(RENAME_EXCL): falha se o destino já existe.
+        if flags & APPLE_RENAME_EXCL != 0 && self.child_exists(new_parent, nn) {
+            reply.error(libc::EEXIST);
+            return;
+        }
         match self.apply_rename(parent, n, new_parent, nn) {
             Ok(()) => {
                 println!(

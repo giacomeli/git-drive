@@ -832,3 +832,36 @@ async fn file_rename_from_ephemeral_materializes_write() {
     assert!(matches!(&ops[0], SyncOp::Write { path, content }
         if path == "real.txt" && content.as_slice() == b"data"));
 }
+
+// ---- Correção do parse de RENAME do macFUSE: exchange com nomes reais ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn apply_exchange_swaps_contents_by_name() {
+    // Com o fuse_rename_in corrigido no vendor, o swap do safe save chega com
+    // nomes reais e usa apply_exchange (mesma lógica do FUSE_EXCHANGE).
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"conteudo-a", "add a");
+    commit_file(&test.repo, "b.txt", b"conteudo-b", "add b");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino_a = fs.find_inode("a.txt").unwrap();
+    let ino_b = fs.find_inode("b.txt").unwrap();
+
+    fs.apply_exchange(1, "a.txt", 1, "b.txt").unwrap();
+
+    assert_eq!(fs.read_content_for_test(ino_a).as_deref(), Some(b"conteudo-b".as_slice()));
+    assert_eq!(fs.read_content_for_test(ino_b).as_deref(), Some(b"conteudo-a".as_slice()));
+    let ops = fs.sync_snapshot_for_test();
+    use drive_sync::sync::SyncOp;
+    assert!(ops.iter().any(|op| matches!(op, SyncOp::Write { path, content }
+        if path == "a.txt" && content.as_slice() == b"conteudo-b")));
+    assert!(ops.iter().any(|op| matches!(op, SyncOp::Write { path, content }
+        if path == "b.txt" && content.as_slice() == b"conteudo-a")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn apply_exchange_missing_side_is_enoent() {
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"x", "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    assert_eq!(fs.apply_exchange(1, "a.txt", 1, "nope.txt"), Err(libc::ENOENT));
+}

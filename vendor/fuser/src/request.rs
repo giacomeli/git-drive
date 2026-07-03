@@ -285,7 +285,9 @@ impl<'a> Request<'a> {
                     x.src().name.as_ref(),
                     x.dest().dir.into(),
                     x.dest().name.as_ref(),
-                    0,
+                    // PATCH local: propagar as flags do renameatx_np do macFUSE
+                    // (antes hardcoded 0).
+                    x.flags(),
                     self.reply(),
                 );
             }
