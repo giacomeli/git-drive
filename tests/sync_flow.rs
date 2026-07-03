@@ -473,3 +473,88 @@ async fn remote_update_visible_after_refresh_despite_local_buffer() {
         "read deve refletir a versão remota após o refresh, não o buffer antigo"
     );
 }
+
+// ---- Regressão RF5 (Fase 0): batch com ordem causal ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn batch_chained_dir_renames_apply_in_order() {
+    // Antes (HashMap + sort por tipo), dois renames no mesmo batch executavam
+    // em ordem arbitrária — um falhava com ENOENT e o disco divergia do índice.
+    let test = init_repo();
+    commit_file(&test.repo, "d1/f.txt", b"x", "add d1");
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    sync.queue_rename("d1", "d2");
+    sync.queue_rename("d2", "d3");
+    wait_flush().await;
+
+    assert!(!file_exists(test.dir.path(), "d1"), "d1 não deve sobrar");
+    assert!(!file_exists(test.dir.path(), "d2"), "d2 não deve sobrar");
+    assert_eq!(read_file(test.dir.path(), "d3/f.txt"), b"x");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn batch_rename_roundtrip_restores_original() {
+    let test = init_repo();
+    commit_file(&test.repo, "d1/f.txt", b"x", "add d1");
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    sync.queue_rename("d1", "d2");
+    sync.queue_rename("d2", "d1");
+    wait_flush().await;
+
+    assert!(!file_exists(test.dir.path(), "d2"), "d2 não deve sobrar");
+    assert_eq!(read_file(test.dir.path(), "d1/f.txt"), b"x");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn batch_mkdir_rename_write_into_renamed_dir() {
+    // Fluxo comum do Finder: criar pasta -> renomear -> soltar arquivo dentro,
+    // tudo dentro do debounce. Antes, o Write (prioridade menor que Rename)
+    // criava o destino via create_dir_all e o fs::rename falhava com
+    // "destino existe e não está vazio" — o dir antigo ressuscitava.
+    let test = init_repo();
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    sync.queue_mkdir("na");
+    sync.queue_rename("na", "nb");
+    sync.queue_write("nb/f.txt", b"conteudo".to_vec());
+    wait_flush().await;
+
+    assert!(!file_exists(test.dir.path(), "na"), "dir original não deve sobrar");
+    assert_eq!(read_file(test.dir.path(), "nb/f.txt"), b"conteudo");
+    assert!(
+        file_exists(test.dir.path(), "nb/.gitkeep"),
+        ".gitkeep do mkdir deve ter viajado com o rename"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn batch_create_write_delete_leaves_no_residue() {
+    let test = init_repo();
+    let head_before = test.repo.head().unwrap().peel_to_commit().unwrap().id();
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    sync.queue_write("tmp.txt", b"efemero".to_vec());
+    sync.queue_delete("tmp.txt");
+    wait_flush().await;
+
+    assert!(!file_exists(test.dir.path(), "tmp.txt"));
+    let head_after = test.repo.head().unwrap().peel_to_commit().unwrap().id();
+    assert_eq!(
+        head_before, head_after,
+        "working tree líquido inalterado não deve gerar commit"
+    );
+}

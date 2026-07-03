@@ -51,7 +51,11 @@ pub struct SyncManager {
 }
 
 struct Inner {
-    buffer: HashMap<String, SyncOp>,
+    /// Fila em ordem de chegada. A ordem do kernel FUSE É a ordem causal —
+    /// preservá-la elimina por construção os bugs de "rename encadeado
+    /// embaralhado" e "write aplicado antes do rename do diretório" que a
+    /// combinação HashMap + sort por tipo de op produzia.
+    buffer: Vec<SyncOp>,
     last_op: Option<Instant>,
 }
 
@@ -119,7 +123,7 @@ impl SyncManager {
     ) -> Self {
         let manager = SyncManager {
             inner: Arc::new(Mutex::new(Inner {
-                buffer: HashMap::new(),
+                buffer: Vec::new(),
                 last_op: None,
             })),
             notify: Arc::new(Notify::new()),
@@ -280,16 +284,20 @@ impl SyncManager {
         }
         {
             let mut inner = self.inner.lock();
-            let key = op.primary_path().to_string();
-            inner.buffer.insert(key, op);
+            push_coalescing(&mut inner.buffer, op);
             inner.last_op = Some(Instant::now());
         }
         self.notify.notify_one();
     }
 
     pub fn buffer_snapshot(&self) -> Vec<SyncOp> {
-        let inner = self.inner.lock();
-        inner.buffer.values().cloned().collect()
+        self.inner.lock().buffer.clone()
+    }
+
+    /// Checagem barata (sem clonar conteúdos) de fila não-vazia. Usada como
+    /// guarda no caminho quente do FUSE (`refresh_if_needed`).
+    pub fn has_pending_ops(&self) -> bool {
+        !self.inner.lock().buffer.is_empty()
     }
 
     fn spawn_watcher(&self) {
@@ -322,18 +330,14 @@ impl SyncManager {
                         if !should_drain {
                             None
                         } else {
-                            Some(inner.buffer.drain().collect::<Vec<_>>())
+                            Some(std::mem::take(&mut inner.buffer))
                         }
                     };
 
                     if let Some(changes) = drained {
                         println!("[{}] drain: sincronizando alterações", log_ts());
-                        let mut sorted: Vec<SyncOp> = changes.into_iter().map(|(_, v)| v).collect();
-                        // Ordem causal segura: criar dirs → escrever arquivos → renomear → deletar.
-                        // O HashMap dá ordem arbitrária; sem isso, rename pode rodar antes do
-                        // mkdir do mesmo path e falhar com ENOENT.
-                        sorted.sort_by_key(op_priority);
-                        let ops: Vec<&SyncOp> = sorted.iter().collect();
+                        // Aplicação na ordem de chegada — a fila já é causal.
+                        let ops: Vec<&SyncOp> = changes.iter().collect();
                         for op in &ops {
                             apply_op_to_disk(&repo_path, op);
                         }
@@ -678,17 +682,57 @@ fn op_touches_ephemeral(op: &SyncOp) -> bool {
     }
 }
 
-/// Ordem de aplicação dentro de um batch. Garante que dependências causais sejam
-/// respeitadas mesmo quando o `HashMap` de buffer serializa em ordem arbitrária:
-/// o diretório existe antes do arquivo; o rename acha a origem; deletes fecham
-/// a batch pra não brigar com writes que criariam o mesmo path.
-pub(crate) fn op_priority(op: &SyncOp) -> u8 {
+/// `true` se `a` e `b` são o mesmo path ou um é ancestral do outro
+/// (limite de componente em '/': "a" contém "a/b", mas não "ab").
+fn paths_related(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let a_contains_b = b
+        .strip_prefix(a)
+        .map(|rest| rest.starts_with('/'))
+        .unwrap_or(false);
+    let b_contains_a = a
+        .strip_prefix(b)
+        .map(|rest| rest.starts_with('/'))
+        .unwrap_or(false);
+    a_contains_b || b_contains_a
+}
+
+/// Paths que uma op toca (rename toca origem e destino).
+fn op_paths(op: &SyncOp) -> [Option<&str>; 2] {
     match op {
-        SyncOp::Mkdir { .. } => 0,
-        SyncOp::Write { .. } => 1,
-        SyncOp::Rename { .. } => 2,
-        SyncOp::Delete { .. } => 3,
-        SyncOp::Rmdir { .. } => 4,
+        SyncOp::Rename { from, to } => [Some(from), Some(to)],
+        other => [Some(other.primary_path()), None],
+    }
+}
+
+/// Anexa `op` à fila preservando a ordem de chegada. Única coalescência
+/// permitida: `Write` substitui in-place o `Write` mais recente do MESMO path,
+/// desde que nenhuma op posterior a ele toque um path relacionado (igual ou
+/// ancestral/descendente) — rename, delete, mkdir e rmdir são barreiras.
+/// A correção nunca depende da coalescência; ela só evita conteúdo redundante
+/// em write storms (flushes repetidos do mesmo arquivo dentro do debounce).
+pub(crate) fn push_coalescing(queue: &mut Vec<SyncOp>, op: SyncOp) {
+    if let SyncOp::Write { path, content } = op {
+        for existing in queue.iter_mut().rev() {
+            if let SyncOp::Write { path: p, content: c } = existing {
+                if *p == path {
+                    *c = content;
+                    return;
+                }
+            }
+            let blocking = op_paths(existing)
+                .into_iter()
+                .flatten()
+                .any(|p| paths_related(p, &path));
+            if blocking {
+                break;
+            }
+        }
+        queue.push(SyncOp::Write { path, content });
+    } else {
+        queue.push(op);
     }
 }
 
@@ -729,23 +773,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn queue_mkdir_then_rmdir_same_path_last_wins() {
+    async fn queue_mkdir_then_rmdir_same_path_keeps_causal_order() {
+        // Semântica da fila causal (Fase 0): as duas ops são mantidas na ordem
+        // de chegada — o drain aplica mkdir e depois rmdir (estado final
+        // idêntico, sem depender de heurística de "última ganha").
         let m = mgr();
         m.queue_mkdir("foo");
         m.queue_rmdir("foo");
         let snap = m.buffer_snapshot();
-        assert_eq!(snap.len(), 1);
-        assert!(matches!(snap[0], SyncOp::Rmdir { .. }));
+        assert_eq!(snap.len(), 2);
+        assert!(matches!(snap[0], SyncOp::Mkdir { .. }));
+        assert!(matches!(snap[1], SyncOp::Rmdir { .. }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn queue_rename_uses_destination_as_key() {
+    async fn queue_rename_then_write_to_destination_keeps_both_in_order() {
+        // Antes (HashMap keyed por destino), o Write APAGAVA o Rename da fila.
+        // Na fila causal ambos sobrevivem, na ordem de chegada.
         let m = mgr();
         m.queue_rename("a.txt", "b.txt");
         m.queue_write("b.txt", b"x".to_vec());
         let snap = m.buffer_snapshot();
-        assert_eq!(snap.len(), 1);
-        assert!(matches!(snap[0], SyncOp::Write { .. }));
+        assert_eq!(snap.len(), 2);
+        assert!(matches!(snap[0], SyncOp::Rename { .. }));
+        assert!(matches!(snap[1], SyncOp::Write { .. }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -814,27 +865,46 @@ mod tests {
     }
 
     #[test]
-    fn op_priority_orders_mkdir_before_rename_before_rmdir() {
-        let ops = vec![
-            SyncOp::Rename { from: "a".into(), to: "b".into() },
-            SyncOp::Rmdir { path: "old".into() },
-            SyncOp::Mkdir { path: "a".into() },
-            SyncOp::Write { path: "b/f".into(), content: vec![] },
-            SyncOp::Delete { path: "zzz".into() },
-        ];
-        let mut sorted = ops;
-        sorted.sort_by_key(op_priority);
-        let kinds: Vec<&'static str> = sorted
-            .iter()
-            .map(|op| match op {
-                SyncOp::Mkdir { .. } => "mkdir",
-                SyncOp::Write { .. } => "write",
-                SyncOp::Rename { .. } => "rename",
-                SyncOp::Delete { .. } => "delete",
-                SyncOp::Rmdir { .. } => "rmdir",
-            })
-            .collect();
-        assert_eq!(kinds, vec!["mkdir", "write", "rename", "delete", "rmdir"]);
+    fn push_coalescing_write_over_write_same_path_replaces_in_place() {
+        let mut q = Vec::new();
+        push_coalescing(&mut q, SyncOp::Write { path: "a.txt".into(), content: b"v1".to_vec() });
+        push_coalescing(&mut q, SyncOp::Write { path: "b.txt".into(), content: b"other".to_vec() });
+        push_coalescing(&mut q, SyncOp::Write { path: "a.txt".into(), content: b"v2".to_vec() });
+        assert_eq!(q.len(), 2);
+        assert!(matches!(&q[0], SyncOp::Write { path, content }
+            if path == "a.txt" && content.as_slice() == b"v2"));
+    }
+
+    #[test]
+    fn push_coalescing_rename_is_barrier_for_write() {
+        // Write(b) não pode atravessar Rename{a->b}: o conteúdo pré e pós
+        // rename são estados diferentes do path.
+        let mut q = Vec::new();
+        push_coalescing(&mut q, SyncOp::Write { path: "b.txt".into(), content: b"pre".to_vec() });
+        push_coalescing(&mut q, SyncOp::Rename { from: "a.txt".into(), to: "b.txt".into() });
+        push_coalescing(&mut q, SyncOp::Write { path: "b.txt".into(), content: b"post".to_vec() });
+        assert_eq!(q.len(), 3);
+        assert!(matches!(&q[2], SyncOp::Write { content, .. } if content.as_slice() == b"post"));
+    }
+
+    #[test]
+    fn push_coalescing_dir_rename_is_barrier_for_nested_write() {
+        // Rename de diretório é barreira para writes DENTRO dele (prefixo).
+        let mut q = Vec::new();
+        push_coalescing(&mut q, SyncOp::Write { path: "d/f.txt".into(), content: b"v1".to_vec() });
+        push_coalescing(&mut q, SyncOp::Rename { from: "c".into(), to: "d".into() });
+        push_coalescing(&mut q, SyncOp::Write { path: "d/f.txt".into(), content: b"v2".to_vec() });
+        assert_eq!(q.len(), 3, "write pós-rename não pode coalescer com o pré-rename");
+    }
+
+    #[test]
+    fn paths_related_respects_component_boundary() {
+        assert!(paths_related("a", "a"));
+        assert!(paths_related("a", "a/b"));
+        assert!(paths_related("a/b/c", "a/b"));
+        assert!(!paths_related("a", "ab"));
+        assert!(!paths_related("ab", "a"));
+        assert!(!paths_related("a/b", "a/bc"));
     }
 
     #[test]

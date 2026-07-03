@@ -510,7 +510,7 @@ impl GitDriveFS {
         // mostra "(error code -43)". A flag continua setada (não consumimos
         // com take_refresh_flag), então o refresh roda no próximo
         // lookup/getattr/readdir após o drain.
-        if !self.sync.buffer_snapshot().is_empty() {
+        if self.sync.has_pending_ops() {
             return;
         }
         // GC de buffers limpos quando um commit local novo aconteceu: com o
