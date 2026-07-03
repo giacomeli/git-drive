@@ -577,8 +577,8 @@ impl GitDriveFS {
         dirs_sorted.sort_by_key(|p| p.matches('/').count());
 
         for dir_path in dirs_sorted {
-            // `unwrap_or_else` (lazy): `unwrap_or(&self.alloc_inode())` avaliava
-            // o alloc SEMPRE, vazando um inode por path existente a cada refresh.
+            // `unwrap_or_else` (lazy): a forma eager com `unwrap_or` avaliava
+            // o alloc sempre, vazando um inode por path existente a cada refresh.
             let inode = previous
                 .get(&dir_path)
                 .copied()
