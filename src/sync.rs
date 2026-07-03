@@ -9,6 +9,7 @@ use tokio::task;
 
 use crate::git;
 use crate::log_ts;
+use crate::notify::{self, Notifier, NotifyEvent};
 use crate::status::StatusState;
 
 #[derive(Debug, Clone)]
@@ -56,6 +57,8 @@ pub struct SyncManager {
     repo_lock: Arc<Mutex<()>>,
     /// Estado observável (status.json + subcomando `status`).
     status: Arc<StatusState>,
+    /// Notificações macOS (nasce desligado; o modo mount real habilita).
+    notifier: Arc<Notifier>,
 }
 
 struct Inner {
@@ -148,6 +151,7 @@ impl SyncManager {
             commit_generation: Arc::new(AtomicU64::new(0)),
             repo_lock: Arc::new(Mutex::new(())),
             status,
+            notifier: Arc::new(Notifier::new()),
         };
 
         manager.spawn_watcher();
@@ -194,6 +198,7 @@ impl SyncManager {
             commit_generation: self.commit_generation.clone(),
             repo_lock: self.repo_lock.clone(),
             status: self.status.clone(),
+            notifier: self.notifier.clone(),
         }
     }
 
@@ -218,6 +223,16 @@ impl SyncManager {
         self.status.clone()
     }
 
+    /// Acesso ao notificador (o main usa para eventos de mount/parada).
+    pub fn notifier(&self) -> Arc<Notifier> {
+        self.notifier.clone()
+    }
+
+    /// Habilita as notificações do macOS (modo mount real).
+    pub fn enable_notifications(&self) {
+        self.notifier.enable();
+    }
+
     fn spawn_pull_watcher(&self, interval_secs: u64) {
         let inner = self.inner.clone();
         let repo_path = self.repo_path.clone();
@@ -229,6 +244,7 @@ impl SyncManager {
         let refresh_flag = self.refresh_flag.clone();
         let repo_lock = self.repo_lock.clone();
         let status = self.status.clone();
+        let notifier = self.notifier.clone();
 
         task::spawn(async move {
             loop {
@@ -260,13 +276,17 @@ impl SyncManager {
                 // Tree suja = mudanças locais ainda não commitadas (típico do
                 // modo sem identidade) — um fast-forward as destruiria.
                 match git::is_working_tree_clean(&repo) {
-                    Ok(true) => {}
+                    Ok(true) => {
+                        // Condição de bloqueio resolvida — rearma a notificação.
+                        notifier.reset(notify::KEY_PULL_BLOCKED);
+                    }
                     Ok(false) => {
                         println!(
                             "[{}] pull: working tree com mudanças não commitadas — pulando",
                             log_ts()
                         );
                         status.record_pull("pulado: working tree sujo");
+                        notifier.notify(NotifyEvent::PullBlocked);
                         continue;
                     }
                     Err(e) => {
@@ -324,12 +344,12 @@ impl SyncManager {
                             resolved
                         );
                         status.record_pull(&format!("merge com {} conflito(s)", resolved.len()));
-                        status.add_conflicts(
-                            resolved
-                                .iter()
-                                .map(|p| format!("{}.{}", p, suffix))
-                                .collect(),
-                        );
+                        let copies: Vec<String> = resolved
+                            .iter()
+                            .map(|p| format!("{}.{}", p, suffix))
+                            .collect();
+                        status.add_conflicts(copies.clone());
+                        notifier.notify(NotifyEvent::Conflicts { copies });
                         refresh_flag.store(true, Ordering::SeqCst);
                     }
                     Err(e) => {
@@ -446,6 +466,7 @@ struct DrainCtx {
     commit_generation: Arc<AtomicU64>,
     repo_lock: Arc<Mutex<()>>,
     status: Arc<StatusState>,
+    notifier: Arc<Notifier>,
 }
 
 impl DrainCtx {
@@ -481,10 +502,14 @@ impl DrainCtx {
                         &self.user_name,
                         &self.user_email,
                         &self.status,
+                        &self.notifier,
                     );
                     pushed = Some(recovered);
                     if recovered {
                         self.refresh_flag.store(true, Ordering::SeqCst);
+                    } else {
+                        // Push + reconcile falharam: commit local sem publicar.
+                        self.notifier.notify(NotifyEvent::PushFailed);
                     }
                 }
             }
@@ -644,6 +669,7 @@ fn push_batch(repo_path: &Path, branch: &str, remote: &str, token: &Option<Strin
 /// Push falhou (geralmente non-FF). Faz fetch + pull_and_merge + retry de push único.
 /// Retorna `true` se o retry teve sucesso (implica que o working tree mudou e o caller
 /// deve sinalizar refresh pro FUSE).
+#[allow(clippy::too_many_arguments)]
 fn reconcile_and_retry_push(
     repo_path: &Path,
     branch: &str,
@@ -652,6 +678,7 @@ fn reconcile_and_retry_push(
     user_name: &Option<String>,
     user_email: &Option<String>,
     status: &StatusState,
+    notifier: &Notifier,
 ) -> bool {
     let (Some(name), Some(email)) = (user_name.as_deref(), user_email.as_deref()) else {
         eprintln!(
@@ -690,12 +717,12 @@ fn reconcile_and_retry_push(
                 suffix,
                 resolved
             );
-            status.add_conflicts(
-                resolved
-                    .iter()
-                    .map(|p| format!("{}.{}", p, suffix))
-                    .collect(),
-            );
+            let copies: Vec<String> = resolved
+                .iter()
+                .map(|p| format!("{}.{}", p, suffix))
+                .collect();
+            status.add_conflicts(copies.clone());
+            notifier.notify(NotifyEvent::Conflicts { copies });
         }
         Ok(o) => {
             println!("[{}] reconcile: aplicado ({:?})", log_ts(), o);

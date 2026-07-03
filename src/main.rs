@@ -258,6 +258,12 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     // shutdown ordenado (decisões 6 e 7 da Fase 2).
     let session = fuser::spawn_mount2(fs, &mount_path, &options)?;
     println!("[{}] boot: volume montado em {}", log_ts(), mount_path);
+    sync_handle.enable_notifications();
+    sync_handle
+        .notifier()
+        .notify(drive_sync::notify::NotifyEvent::Mounted {
+            mount: mount_path.clone(),
+        });
 
     // Espera por SIGTERM/SIGINT (launchd/Ctrl-C) ou pelo fim externo da
     // sessão (eject no Finder / umount).
@@ -294,6 +300,9 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     session.join();
     sync_handle.drain_now();
     sync_handle.status_state().record_stopped();
+    sync_handle
+        .notifier()
+        .notify(drive_sync::notify::NotifyEvent::Stopped);
     println!("[{}] shutdown: parada limpa concluída", log_ts());
 
     Ok(())
