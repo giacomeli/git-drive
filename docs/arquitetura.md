@@ -133,8 +133,13 @@ pub struct GitDriveFS {
     next_inode: Arc<AtomicU64>,                // alocador monotônico
     sync: SyncManager,
     write_buffers: Arc<parking_lot::Mutex<HashMap<u64, Vec<u8>>>>,
+    dirty: HashSet<u64>,                       // inodes com escrita não enfileirada
+    last_commit_gen: u64,                      // base do gc de buffers limpos
+    // ... mode_overrides, times, xattrs (metadados em memória)
 }
 ```
+
+O ciclo de vida dos write buffers (inicialização a partir do HEAD, dirty flag, gc pós-commit/pós-pull) está detalhado em [filesystem-fuse.md](./filesystem-fuse.md#ciclo-de-vida-do-write-buffer).
 
 ### `SyncOp` — `src/sync.rs`
 
@@ -164,8 +169,12 @@ pub struct SyncManager {
     remote_name: Option<String>,
     remote_token: Option<String>,
     refresh_flag: Arc<AtomicBool>,
+    commit_generation: Arc<AtomicU64>,   // commits do drain (base do gc de buffers)
+    repo_lock: Arc<Mutex<()>>,           // serializa drain e pull sobre o repo
 }
 ```
+
+A fila interna (`Inner.buffer`) é um `Vec<SyncOp>` em **ordem de chegada** — a ordem do kernel FUSE é a ordem causal. Detalhes em [fluxo-de-sincronizacao.md](./fluxo-de-sincronizacao.md#syncop-e-a-fila-causal).
 
 ### `Config` — `src/config.rs`
 
