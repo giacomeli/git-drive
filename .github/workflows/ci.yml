@@ -26,6 +26,8 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
+      - name: macFUSE (SDK para o build.rs do vendor/fuser; kext nao carrega em CI)
+        run: brew install --cask macfuse
       - name: Suite completa (mesma do CLAUDE.md)
         run: cargo test
 
@@ -40,7 +42,14 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('Cargo.lock') }}
-      - name: Clippy (warnings fora de vendor/ sao regressao)
+      - name: macFUSE (SDK para o build.rs do vendor/fuser; kext nao carrega em CI)
+        run: brew install --cask macfuse
+      # Dois passos de proposito: o primeiro falha o job em erro de compilacao
+      # (um filtro com grep mascarava esse caso — aprendido no primeiro run);
+      # o segundo aplica a regua do projeto (warning fora de vendor/ = falha).
+      - name: Clippy compila
+        run: cargo clippy --all-targets
+      - name: Warnings fora de vendor/ sao regressao
         run: |
           cargo clippy --all-targets --message-format short 2>&1 \
             | grep -E '^(src|tests)/.*(warning|error)' > clippy-projeto.txt || true
@@ -73,14 +82,16 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('Cargo.lock') }}
-      - name: Dependencias de sistema (GTK para tray-icon/tao)
+      - name: Dependencias de sistema (GTK para tray-icon/tao, libfuse3 para o vendor/fuser)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
-      - name: MSRV 1.77 declarada no projeto
+          sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libfuse3-dev
+      # 1.78 e o piso real: o Cargo.lock (formato v4) exige cargo 1.78+;
+      # verificado localmente com `rustup run 1.78 cargo check --all-targets`.
+      - name: MSRV 1.78 declarada no projeto
         run: |
-          rustup toolchain install 1.77 --profile minimal
-          cargo +1.77 check --all-targets
+          rustup toolchain install 1.78 --profile minimal
+          rustup run 1.78 cargo check --all-targets
 
   # Fumaca Linux: sinalizacao, nao gate — o port funcional (mount fuse3,
   # systemd, notificacoes) e fatia futura da Fase 3. Vira job obrigatorio
@@ -97,9 +108,9 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
-      - name: Dependencias de sistema (GTK para tray-icon/tao)
+      - name: Dependencias de sistema (GTK para tray-icon/tao, libfuse3 para o vendor/fuser)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+          sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libfuse3-dev
       - name: Suite no Linux (fumaca)
         run: cargo test
