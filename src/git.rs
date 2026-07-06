@@ -146,6 +146,46 @@ pub fn commit_working_tree(
     Ok(Some(oid))
 }
 
+/// Chave SSH em disco para daemons sem ssh-agent (systemd/launchd não têm
+/// SSH_AUTH_SOCK). Preferência: id_ed25519, depois id_rsa.
+fn discover_ssh_key(home: &Path) -> Option<(std::path::PathBuf, Option<std::path::PathBuf>)> {
+    for name in ["id_ed25519", "id_rsa"] {
+        let private = home.join(".ssh").join(name);
+        if private.exists() {
+            let public = private.with_extension("pub");
+            return Some((private.clone(), public.exists().then_some(public)));
+        }
+    }
+    None
+}
+
+/// Callback de credenciais compartilhado por push e fetch: token HTTPS >
+/// ssh-agent > chave SSH em disco > default.
+fn credential_callback(
+    token: Option<&str>,
+    username_from_url: Option<&str>,
+) -> Result<git2::Cred, Error> {
+    if let Some(t) = token {
+        return git2::Cred::userpass_plaintext("x-access-token", t);
+    }
+    let Some(username) = username_from_url else {
+        return git2::Cred::default();
+    };
+    git2::Cred::ssh_key_from_agent(username)
+        .or_else(|agent_err| {
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default();
+            match discover_ssh_key(&home) {
+                Some((private, public)) => {
+                    git2::Cred::ssh_key(username, public.as_deref(), &private, None)
+                }
+                None => Err(agent_err),
+            }
+        })
+        .or_else(|_| git2::Cred::default())
+}
+
 /// Dá push de `refs/heads/<branch>:refs/heads/<branch>` para o remote indicado.
 /// Se `token` for Some, usa autenticação HTTPS userpass ("x-access-token").
 /// Caso contrário, delega ao sistema (ssh-agent / credential helper).
@@ -159,13 +199,7 @@ pub fn push_to_remote(
     let mut callbacks = git2::RemoteCallbacks::new();
     let token_owned = token.map(|t| t.to_string());
     callbacks.credentials(move |_url, username_from_url, _allowed| {
-        if let Some(ref t) = token_owned {
-            git2::Cred::userpass_plaintext("x-access-token", t)
-        } else if let Some(username) = username_from_url {
-            git2::Cred::ssh_key_from_agent(username).or_else(|_| git2::Cred::default())
-        } else {
-            git2::Cred::default()
-        }
+        credential_callback(token_owned.as_deref(), username_from_url)
     });
     // git2 retorna Ok no nível de transporte mesmo quando o servidor REJEITA a
     // atualização do ref (ex.: GH001 do GitHub para blob > 100 MB) — a rejeição
@@ -209,13 +243,7 @@ pub fn fetch_remote(
     let mut callbacks = git2::RemoteCallbacks::new();
     let token_owned = token.map(|t| t.to_string());
     callbacks.credentials(move |_url, username_from_url, _allowed| {
-        if let Some(ref t) = token_owned {
-            git2::Cred::userpass_plaintext("x-access-token", t)
-        } else if let Some(username) = username_from_url {
-            git2::Cred::ssh_key_from_agent(username).or_else(|_| git2::Cred::default())
-        } else {
-            git2::Cred::default()
-        }
+        credential_callback(token_owned.as_deref(), username_from_url)
     });
     let mut fetch_opts = git2::FetchOptions::new();
     fetch_opts.remote_callbacks(callbacks);
@@ -1019,6 +1047,25 @@ mod tests {
         let (dir, repo) = init_repo_with_commit();
         std::fs::write(dir.path().join("novo.txt"), b"untracked").unwrap();
         assert!(!is_working_tree_clean(&repo).unwrap());
+    }
+
+    #[test]
+    fn discover_ssh_key_prefers_ed25519_and_detects_pub() {
+        let dir = tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        assert!(discover_ssh_key(dir.path()).is_none());
+
+        std::fs::write(ssh.join("id_rsa"), b"k").unwrap();
+        let (private, public) = discover_ssh_key(dir.path()).unwrap();
+        assert!(private.ends_with(".ssh/id_rsa"));
+        assert!(public.is_none());
+
+        std::fs::write(ssh.join("id_ed25519"), b"k").unwrap();
+        std::fs::write(ssh.join("id_ed25519.pub"), b"p").unwrap();
+        let (private, public) = discover_ssh_key(dir.path()).unwrap();
+        assert!(private.ends_with(".ssh/id_ed25519"), "ed25519 tem preferência");
+        assert!(public.unwrap().ends_with("id_ed25519.pub"));
     }
 
     // ---- Fase 2.5, Bloco A: política de commit e ignorados ----
