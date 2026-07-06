@@ -41,7 +41,11 @@ pub fn init_repo() -> TestRepo {
 
 pub fn init_bare_remote() -> TempDir {
     let dir = tempfile::tempdir().expect("tempdir bare");
-    Repository::init_bare(dir.path()).expect("git init --bare");
+    let repo = Repository::init_bare(dir.path()).expect("git init --bare");
+    // Mesmo racional do init_repo: sem HEAD determinístico, um clone deste
+    // bare nasce no branch default do ambiente (master em CI) e os fluxos de
+    // push/pull que referenciam "main" quebram fora da máquina do dev.
+    repo.set_head("refs/heads/main").expect("set_head main");
     dir
 }
 

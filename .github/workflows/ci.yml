@@ -87,12 +87,13 @@ jobs:
           key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('Cargo.lock') }}
       - name: macFUSE (SDK para o build.rs do vendor/fuser; kext nao carrega em CI)
         run: brew install --cask macfuse
-      # 1.78 e o piso real: o Cargo.lock (formato v4) exige cargo 1.78+;
-      # verificado localmente com `rustup run 1.78 cargo check --all-targets`.
-      - name: MSRV 1.78 declarada no projeto
+      # 1.85 e o piso real do lock atual: unicode-segmentation 1.13.3 declara
+      # rust-version 1.85 (litemap/zerofrom pedem 1.81; o formato v4 do lock
+      # ja pedia 1.78). Validado com `rustup run 1.85 cargo check --all-targets`.
+      - name: MSRV 1.85 declarada no projeto
         run: |
-          rustup toolchain install 1.78 --profile minimal
-          rustup run 1.78 cargo check --all-targets
+          rustup toolchain install 1.85 --profile minimal
+          rustup run 1.85 cargo check --all-targets
 
   # Fumaca Linux: sinalizacao, nao gate — o port funcional (mount fuse3,
   # systemd, notificacoes) e fatia futura da Fase 3. Vira job obrigatorio
