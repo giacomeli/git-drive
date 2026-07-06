@@ -335,14 +335,15 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     // - `volname=drive-sync`: nome amigável em Finder no lugar de "macFUSE Volume 0".
     // - `noappledouble`: kernel não gera arquivos `._*` (AppleDouble) no mount.
     //   Reforça nosso filtro de ephemeral no sync, mas como fallback nativo.
-    let mut options = vec![
-        MountOption::FSName("gitdrive".to_string()),
-        MountOption::AutoUnmount,
-    ];
+    #[allow(unused_mut)]
+    let mut options = vec![MountOption::FSName("gitdrive".to_string())];
     #[cfg(target_os = "macos")]
     {
-        // AllowOther no Linux exige `user_allow_other` no /etc/fuse.conf
-        // (raramente habilitado) — mount single-user não precisa dele.
+        // AllowOther e AutoUnmount só no macOS: no Linux, o fusermount3
+        // exige `user_allow_other` no /etc/fuse.conf para allow_other — e o
+        // AutoUnmount do fuser INJETA allow_other implicitamente. O shutdown
+        // ordenado já desmonta; zumbi pós-crash é recuperado no boot.
+        options.push(MountOption::AutoUnmount);
         options.push(MountOption::AllowOther);
         options.push(MountOption::CUSTOM("local".to_string()));
         options.push(MountOption::CUSTOM("volname=drive-sync".to_string()));
@@ -444,6 +445,15 @@ fn prepare_mountpoint(mount: &str) -> anyhow::Result<()> {
                 canonical,
                 e
             );
+            // Linux: mounts FUSE de usuário desmontam via fusermount3 -u;
+            // `umount` direto costuma exigir root.
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = std::process::Command::new("fusermount3")
+                    .arg("-u")
+                    .arg(&canonical)
+                    .status();
+            }
             let status = std::process::Command::new("umount")
                 .arg("-f")
                 .arg(&canonical)
