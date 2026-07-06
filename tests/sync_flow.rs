@@ -1065,3 +1065,236 @@ async fn sweep_conversion_raises_refresh_so_mount_sees_new_chunked_file() {
     assert_eq!(fs.apply_getattr(ino).unwrap().size, 150, "tamanho real, não do manifest");
     assert_eq!(fs.apply_read(ino, 0, 200).unwrap(), payload);
 }
+
+// ---- Fase 2.7: criptografia em repouso no drain ----
+
+use drive_sync::crypt::Crypto;
+use std::sync::Arc;
+
+fn test_crypto() -> Arc<Crypto> {
+    Arc::new(Crypto::from_master_key(&[42u8; 32]))
+}
+
+/// Nenhum nome de entrada nem byte de blob da tree do HEAD contém os termos
+/// claros dados (invariante "repo opaco").
+fn tree_leaks_plaintext(repo: &Repository, terms: &[&str]) -> bool {
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    let tree = head.tree().unwrap();
+    let mut leaked = false;
+    tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+        let name = entry.name().unwrap_or("");
+        let full = format!("{}{}", root, name);
+        for t in terms {
+            if full.contains(t) {
+                leaked = true;
+            }
+        }
+        if entry.kind() == Some(git2::ObjectType::Blob) {
+            if let Ok(obj) = entry.to_object(repo) {
+                if let Some(blob) = obj.as_blob() {
+                    let content = blob.content();
+                    for t in terms {
+                        if content
+                            .windows(t.len())
+                            .any(|w| w == t.as_bytes())
+                        {
+                            leaked = true;
+                        }
+                    }
+                }
+            }
+        }
+        git2::TreeWalkResult::Ok
+    })
+    .unwrap();
+    leaked
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn encrypted_drain_commits_no_plaintext_names_or_content() {
+    let test = init_repo();
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    let crypto = test_crypto();
+    sync.set_crypto(Some(crypto.clone()));
+
+    sync.queue_mkdir("Pasta Pessoal");
+    sync.queue_write("Pasta Pessoal/segredo.txt", b"conteudo confidencial".to_vec());
+    sync.queue_symlink("atalho.txt", "Pasta Pessoal/segredo.txt");
+    wait_flush().await;
+
+    assert!(
+        !tree_leaks_plaintext(&test.repo, &["segredo", "Pasta", "Pessoal", "atalho", "confidencial"]),
+        "tree do HEAD não pode conter nomes nem conteúdo em claro"
+    );
+
+    // Conteúdo recuperável com a chave: acha o arquivo cifrado no worktree
+    let cipher_rel = crypto.enc_path("Pasta Pessoal/segredo.txt").unwrap();
+    let sealed = std::fs::read(test.dir.path().join(&cipher_rel)).expect("arquivo cifrado no worktree");
+    assert!(Crypto::is_encrypted_bytes(&sealed));
+    assert_eq!(crypto.open(&sealed).unwrap(), b"conteudo confidencial".to_vec());
+
+    // Symlink real com alvo cifrado por componente (modo 120000 preservado)
+    let link_rel = crypto.enc_path("atalho.txt").unwrap();
+    let meta = std::fs::symlink_metadata(test.dir.path().join(&link_rel)).unwrap();
+    assert!(meta.file_type().is_symlink());
+    let target = std::fs::read_link(test.dir.path().join(&link_rel)).unwrap();
+    assert_eq!(
+        crypto.dec_path(&target.to_string_lossy()),
+        "Pasta Pessoal/segredo.txt"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn encrypted_write_is_deterministic_no_commit_churn() {
+    let test = init_repo();
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    sync.set_crypto(Some(test_crypto()));
+
+    sync.queue_write("doc.txt", b"versao unica".to_vec());
+    wait_flush().await;
+    let head1 = test.repo.head().unwrap().peel_to_commit().unwrap().id();
+
+    // Mesmo conteúdo de novo: ciphertext idêntico -> tree igual -> sem commit
+    sync.queue_write("doc.txt", b"versao unica".to_vec());
+    wait_flush().await;
+    let head2 = test.repo.head().unwrap().peel_to_commit().unwrap().id();
+    assert_eq!(head1, head2, "convergência: rewrite idêntico não gera commit novo");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn encrypted_rename_and_delete_translate_paths() {
+    let test = init_repo();
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    let crypto = test_crypto();
+    sync.set_crypto(Some(crypto.clone()));
+
+    sync.queue_write("original.txt", b"dados".to_vec());
+    wait_flush().await;
+    let old_rel = crypto.enc_path("original.txt").unwrap();
+    assert!(test.dir.path().join(&old_rel).exists());
+
+    sync.queue_rename("original.txt", "renomeado.txt");
+    wait_flush().await;
+    let new_rel = crypto.enc_path("renomeado.txt").unwrap();
+    assert!(!test.dir.path().join(&old_rel).exists(), "origem cifrada deve sumir");
+    let sealed = std::fs::read(test.dir.path().join(&new_rel)).unwrap();
+    assert_eq!(crypto.open(&sealed).unwrap(), b"dados".to_vec());
+
+    sync.queue_delete("renomeado.txt");
+    wait_flush().await;
+    assert!(!test.dir.path().join(&new_rel).exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn encrypted_chunking_seals_chunks_and_manifest() {
+    let test = init_repo();
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    let crypto = test_crypto();
+    sync.set_crypto(Some(crypto.clone()));
+    sync.set_chunking(64, 32);
+
+    let payload: Vec<u8> = (0..200u8).collect();
+    sync.queue_write("grande.bin", payload.clone());
+    wait_flush().await;
+
+    assert!(!tree_leaks_plaintext(&test.repo, &["grande"]));
+
+    // Manifest selado no path cifrado; chunks são arquivos selados nomeados
+    // pelo sha256 do CIPHERTEXT; remontagem decifrada reproduz o original.
+    let cipher_rel = crypto.enc_path("grande.bin").unwrap();
+    let sealed_manifest = std::fs::read(test.dir.path().join(&cipher_rel)).unwrap();
+    assert!(Crypto::is_encrypted_bytes(&sealed_manifest));
+    let manifest = Manifest::parse(&crypto.open(&sealed_manifest).unwrap()).unwrap();
+    assert_eq!(manifest.total_size, 200, "manifest guarda tamanhos de PLAINTEXT");
+
+    let mut reassembled = Vec::new();
+    for h in &manifest.hashes {
+        let sealed_chunk = std::fs::read(test.dir.path().join(shard_rel_path(h))).unwrap();
+        assert_eq!(
+            &drive_sync::chunk::sha256_hex(&sealed_chunk),
+            h,
+            "hash do chunk é sobre o ciphertext (GC/integridade sem chave)"
+        );
+        reassembled.extend_from_slice(&crypto.open(&sealed_chunk).unwrap());
+    }
+    assert_eq!(reassembled, payload);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn enable_migration_encrypts_existing_worktree() {
+    let test = init_repo();
+    commit_file(&test.repo, "antigo.txt", b"historico claro", "add antigo");
+    commit_file(&test.repo, "docs/nota.md", b"outra nota", "add nota");
+
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    let crypto = test_crypto();
+    sync.set_crypto(Some(crypto.clone()));
+
+    // Qualquer atividade dispara o drain; a varredura migra o resto
+    sync.queue_write("gatilho.txt", b"x".to_vec());
+    wait_flush().await;
+
+    assert!(
+        !tree_leaks_plaintext(&test.repo, &["antigo", "historico", "nota", "outra", "gatilho"]),
+        "worktree pré-existente deve ser migrado para cifrado"
+    );
+    let sealed = std::fs::read(
+        test.dir.path().join(crypto.enc_path("antigo.txt").unwrap()),
+    )
+    .expect("arquivo migrado no path cifrado");
+    assert_eq!(crypto.open(&sealed).unwrap(), b"historico claro".to_vec());
+    assert!(
+        !test.dir.path().join("antigo.txt").exists(),
+        "arquivo claro não pode sobrar no worktree"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn disable_migration_decrypts_everything_back() {
+    let test = init_repo();
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    let crypto = test_crypto();
+    sync.set_crypto(Some(crypto.clone()));
+    sync.queue_write("privado/arquivo.txt", b"segredo".to_vec());
+    wait_flush().await;
+    assert!(!tree_leaks_plaintext(&test.repo, &["privado", "arquivo", "segredo"]));
+
+    // Desliga: alvo claro, chave disponível só para a migração
+    sync.set_crypto(None);
+    sync.set_migration_crypto(Some(crypto.clone()));
+    sync.queue_write("gatilho.txt", b"y".to_vec());
+    wait_flush().await;
+
+    let clear = std::fs::read(test.dir.path().join("privado/arquivo.txt"))
+        .expect("arquivo decifrado de volta no path claro");
+    assert_eq!(clear, b"segredo".to_vec());
+    let head = test.repo.head().unwrap().peel_to_commit().unwrap();
+    assert!(
+        head.tree().unwrap().get_path(std::path::Path::new("privado/arquivo.txt")).is_ok(),
+        "tree volta a ter o path claro"
+    );
+}

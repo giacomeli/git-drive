@@ -139,6 +139,19 @@ pub fn chunk_reader_into_repo(
     chunk_size: u64,
     repo_root: &Path,
 ) -> std::io::Result<Manifest> {
+    chunk_reader_into_repo_with(reader, chunk_size, repo_root, None)
+}
+
+/// Variante com transform por chunk (Fase 2.7: selar cada chunk). O hash que
+/// nomeia o chunk é do resultado TRANSFORMADO (ciphertext) — GC e verificação
+/// de integridade funcionam sem a chave. `total_size`/`chunk_size` do manifest
+/// continuam em bytes de PLAINTEXT (a leitura por offset precisa deles).
+pub fn chunk_reader_into_repo_with(
+    reader: &mut impl Read,
+    chunk_size: u64,
+    repo_root: &Path,
+    transform: Option<&dyn Fn(&[u8]) -> Vec<u8>>,
+) -> std::io::Result<Manifest> {
     let mut hashes = Vec::new();
     let mut total: u64 = 0;
     let mut buf = vec![0u8; chunk_size as usize];
@@ -147,8 +160,16 @@ pub fn chunk_reader_into_repo(
         if filled == 0 {
             break;
         }
-        let data = &buf[..filled];
+        let plain = &buf[..filled];
         total += filled as u64;
+        let transformed;
+        let data: &[u8] = match transform {
+            Some(f) => {
+                transformed = f(plain);
+                &transformed
+            }
+            None => plain,
+        };
         let hash = sha256_hex(data);
         let rel = shard_rel_path(&hash);
         let full = repo_root.join(&rel);

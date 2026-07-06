@@ -102,6 +102,9 @@ pub struct SyncManager {
     chunk_size_bytes: Arc<AtomicU64>,
     /// Criptografia em repouso (Fase 2.7): `Some` = repo cifrado.
     crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
+    /// Chave disponível SÓ para migração de volta ao claro (config desligado
+    /// mas worktree ainda cifrado — decifrar exige a chave).
+    migration_crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
 }
 
 struct Inner {
@@ -198,6 +201,7 @@ impl SyncManager {
             chunk_threshold_bytes: Arc::new(AtomicU64::new(95 * 1024 * 1024)),
             chunk_size_bytes: Arc::new(AtomicU64::new(80 * 1024 * 1024)),
             crypto: Arc::new(Mutex::new(None)),
+            migration_crypto: Arc::new(Mutex::new(None)),
         };
 
         manager.spawn_watcher();
@@ -235,6 +239,12 @@ impl SyncManager {
         *self.crypto.lock() = crypto;
     }
 
+    /// Chave para a migração de volta ao claro (criptografia desligada com
+    /// worktree ainda cifrado). Ignorada quando `set_crypto` está ativo.
+    pub fn set_migration_crypto(&self, crypto: Option<Arc<crate::crypt::Crypto>>) {
+        *self.migration_crypto.lock() = crypto;
+    }
+
     /// Configura o chunking de arquivos grandes (Fase 2.6). `threshold_bytes`
     /// 0 desativa. Setter pós-construção para não estender a assinatura já
     /// extensa de `new_full_with_pull`.
@@ -263,6 +273,7 @@ impl SyncManager {
             chunk_threshold_bytes: self.chunk_threshold_bytes.clone(),
             chunk_size_bytes: self.chunk_size_bytes.clone(),
             crypto: self.crypto.clone(),
+            migration_crypto: self.migration_crypto.clone(),
         }
     }
 
@@ -547,6 +558,7 @@ struct DrainCtx {
     chunk_threshold_bytes: Arc<AtomicU64>,
     chunk_size_bytes: Arc<AtomicU64>,
     crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
+    migration_crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
 }
 
 impl DrainCtx {
@@ -554,22 +566,65 @@ impl DrainCtx {
         // Serializa o ciclo inteiro (apply + commit + push + reconcile) com o
         // pull watcher (RF4 da Fase 0). Sem .await no escopo do guard.
         let _repo_guard = self.repo_lock.lock();
-        // Aplicação na ordem de chegada — a fila já é causal.
+        let crypto = self.crypto.lock().clone();
+        let migration_crypto = self.migration_crypto.lock().clone();
+        let chunk_threshold = self.chunk_threshold_bytes.load(Ordering::SeqCst);
+        let chunk_size = self.chunk_size_bytes.load(Ordering::SeqCst).max(1);
+        // Aplicação na ordem de chegada — a fila já é causal. Com criptografia,
+        // a tradução claro->cifrado de paths e conteúdo acontece AQUI (o FUSE
+        // e a fila trabalham 100% em claro).
         let ops: Vec<&SyncOp> = changes.iter().collect();
         for op in &ops {
-            apply_op_to_disk(&self.repo_path, op);
+            apply_op_to_disk(&self.repo_path, op, crypto.as_deref(), chunk_threshold);
         }
         // Chunking (Fase 2.6): a varredura converte QUALQUER arquivo bruto
-        // acima do limiar — dos ops recém-aplicados aos que chegaram por fora
-        // do FUSE. Invariante: nenhum blob acima do limiar é stageado. O GC
-        // remove chunks que nenhum manifest do working tree referencia mais.
-        let chunk_threshold = self.chunk_threshold_bytes.load(Ordering::SeqCst);
+        // acima do limiar — com criptografia, cada chunk é selado e o hash é
+        // do ciphertext. Invariante: nenhum blob bruto acima do limiar é
+        // stageado. Depois, as migrações de estado (Fase 2.7) conformam o
+        // worktree ao config; o GC remove chunks órfãos por último.
         let mut converted = 0usize;
         if chunk_threshold > 0 {
-            let chunk_size = self.chunk_size_bytes.load(Ordering::SeqCst).max(1);
-            converted =
-                convert_oversized_worktree_files(&self.repo_path, chunk_threshold, chunk_size);
-            gc_orphan_chunks(&self.repo_path);
+            converted += convert_oversized_worktree_files(
+                &self.repo_path,
+                chunk_threshold,
+                chunk_size,
+                crypto.as_deref(),
+            );
+        }
+        if let Some(c) = crypto.as_deref() {
+            let migrated = migrate_worktree_to_encrypted(&self.repo_path, c);
+            if migrated > 0 {
+                println!(
+                    "[{}] crypto: {} item(ns) migrado(s) para cifrado. AVISO: a história                      Git ANTERIOR permanece em claro no remote — para repo público,                      prefira começar de repo novo",
+                    log_ts(),
+                    migrated
+                );
+            }
+            converted += migrated;
+        } else if let Some(mk) = migration_crypto.as_deref() {
+            let migrated = migrate_worktree_to_clear(&self.repo_path, mk);
+            if migrated > 0 {
+                println!(
+                    "[{}] crypto: {} item(ns) decifrado(s) de volta ao claro",
+                    log_ts(),
+                    migrated
+                );
+                if chunk_threshold > 0 {
+                    converted += convert_oversized_worktree_files(
+                        &self.repo_path,
+                        chunk_threshold,
+                        chunk_size,
+                        None,
+                    );
+                }
+            }
+            converted += migrated;
+        }
+        if chunk_threshold > 0 {
+            gc_orphan_chunks(
+                &self.repo_path,
+                crypto.as_deref().or(migration_crypto.as_deref()),
+            );
         }
         let commit_oid = commit_batch(
             &self.repo_path,
@@ -625,22 +680,71 @@ impl DrainCtx {
     }
 }
 
-fn apply_op_to_disk(repo_path: &Path, op: &SyncOp) {
+/// Traduz um path CLARO da fila para o path no disco (cifrado quando a
+/// criptografia está ativa). Nome que estoura o limite do filesystem cai no
+/// claro com erro logado — preferível a perder a op.
+fn disk_rel_path(crypto: Option<&crate::crypt::Crypto>, clear: &str) -> String {
+    match crypto {
+        Some(c) => match c.enc_path(clear) {
+            Ok(enc) => enc,
+            Err(e) => {
+                eprintln!("[{}] crypto: {} em {:?} — mantendo claro", log_ts(), e, clear);
+                clear.to_string()
+            }
+        },
+        None => clear.to_string(),
+    }
+}
+
+fn apply_op_to_disk(
+    repo_path: &Path,
+    op: &SyncOp,
+    crypto: Option<&crate::crypt::Crypto>,
+    chunk_threshold: u64,
+) {
     match op {
         SyncOp::Write { path, content } => {
-            let full = repo_path.join(path);
+            let full = repo_path.join(disk_rel_path(crypto, path));
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            let result = match content {
-                WriteContent::Mem(data) => std::fs::write(&full, data.as_slice()),
+            let result = match (content, crypto) {
+                (WriteContent::Mem(data), None) => std::fs::write(&full, data.as_slice()),
+                (WriteContent::Mem(data), Some(c)) => {
+                    if chunk_threshold > 0 && data.len() as u64 > chunk_threshold {
+                        // Acima do limiar: plaintext temporário no path cifrado —
+                        // a varredura de chunking sela chunk a chunk em seguida
+                        // (selar inteiro aqui materializaria tudo em RAM).
+                        std::fs::write(&full, data.as_slice())
+                    } else {
+                        std::fs::write(&full, c.seal(data.as_slice()))
+                    }
+                }
                 // rename move o snapshot sem passar pela RAM; fallback para
                 // copy+remove se o spool estiver em outro volume.
-                WriteContent::Spooled(src) => std::fs::rename(src, &full).or_else(|_| {
-                    std::fs::copy(src, &full).map(|_| ())?;
-                    let _ = std::fs::remove_file(src);
-                    Ok(())
-                }),
+                (WriteContent::Spooled(src), None) => {
+                    std::fs::rename(src, &full).or_else(|_| {
+                        std::fs::copy(src, &full).map(|_| ())?;
+                        let _ = std::fs::remove_file(src);
+                        Ok(())
+                    })
+                }
+                (WriteContent::Spooled(src), Some(c)) => {
+                    let len = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+                    if chunk_threshold > 0 && len > chunk_threshold {
+                        // Mesmo racional do Mem grande: a varredura sela por chunk.
+                        std::fs::rename(src, &full).or_else(|_| {
+                            std::fs::copy(src, &full).map(|_| ())?;
+                            let _ = std::fs::remove_file(src);
+                            Ok(())
+                        })
+                    } else {
+                        std::fs::read(src).and_then(|plain| {
+                            let _ = std::fs::remove_file(src);
+                            std::fs::write(&full, c.seal(&plain))
+                        })
+                    }
+                }
             };
             match result {
                 Ok(_) => println!("[{}] disk: write {}", log_ts(), path),
@@ -648,8 +752,15 @@ fn apply_op_to_disk(repo_path: &Path, op: &SyncOp) {
             }
         }
         SyncOp::Delete { path } => {
-            let full = repo_path.join(path);
-            match std::fs::remove_file(&full) {
+            let full = repo_path.join(disk_rel_path(crypto, path));
+            let result = match std::fs::remove_file(&full) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && crypto.is_some() => {
+                    // Estado misto: a versão no disco pode ainda estar em claro.
+                    std::fs::remove_file(repo_path.join(path))
+                }
+                other => other,
+            };
+            match result {
                 Ok(_) => println!("[{}] disk: unlink {}", log_ts(), path),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     // Path nunca chegou ao disco (ex.: temp dirs `.sb-*` que o
@@ -660,14 +771,19 @@ fn apply_op_to_disk(repo_path: &Path, op: &SyncOp) {
             }
         }
         SyncOp::Mkdir { path } => {
-            let full = repo_path.join(path);
+            let full = repo_path.join(disk_rel_path(crypto, path));
             if let Err(e) = std::fs::create_dir_all(&full) {
                 eprintln!("[{}] disk: erro ao criar diretório {}: {}", log_ts(), path, e);
                 return;
             }
-            let keep = full.join(".gitkeep");
+            let keep_rel = disk_rel_path(crypto, &format!("{}/.gitkeep", path));
+            let keep = repo_path.join(keep_rel);
             if !keep.exists() {
-                if let Err(e) = std::fs::write(&keep, b"") {
+                let keep_bytes: Vec<u8> = match crypto {
+                    Some(c) => c.seal(b""),
+                    None => Vec::new(),
+                };
+                if let Err(e) = std::fs::write(&keep, keep_bytes) {
                     eprintln!(
                         "[{}] disk: erro ao criar .gitkeep em {}: {}",
                         log_ts(),
@@ -680,8 +796,8 @@ fn apply_op_to_disk(repo_path: &Path, op: &SyncOp) {
             println!("[{}] disk: mkdir {}", log_ts(), path);
         }
         SyncOp::Rmdir { path } => {
-            let full = repo_path.join(path);
-            let keep = full.join(".gitkeep");
+            let full = repo_path.join(disk_rel_path(crypto, path));
+            let keep = repo_path.join(disk_rel_path(crypto, &format!("{}/.gitkeep", path)));
             let _ = std::fs::remove_file(&keep);
             match std::fs::remove_dir(&full) {
                 Ok(_) => println!("[{}] disk: rmdir {}", log_ts(), path),
@@ -698,8 +814,12 @@ fn apply_op_to_disk(repo_path: &Path, op: &SyncOp) {
             }
         }
         SyncOp::Rename { from, to } => {
-            let from_full = repo_path.join(from);
-            let to_full = repo_path.join(to);
+            let mut from_full = repo_path.join(disk_rel_path(crypto, from));
+            if crypto.is_some() && !from_full.exists() {
+                // Estado misto: origem pode ainda estar com nome claro.
+                from_full = repo_path.join(from);
+            }
+            let to_full = repo_path.join(disk_rel_path(crypto, to));
             if let Some(parent) = to_full.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
@@ -715,14 +835,15 @@ fn apply_op_to_disk(repo_path: &Path, op: &SyncOp) {
             }
         }
         SyncOp::Symlink { path, target } => {
-            let full = repo_path.join(path);
+            let full = repo_path.join(disk_rel_path(crypto, path));
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
+            let disk_target = disk_rel_path(crypto, target);
             // symlink(2) falha com EEXIST se o path existe — remover antes
             // reproduz a semântica da fila (o estado final é o symlink).
             let _ = std::fs::remove_file(&full);
-            match std::os::unix::fs::symlink(target, &full) {
+            match std::os::unix::fs::symlink(&disk_target, &full) {
                 Ok(_) => println!("[{}] disk: symlink {} -> {}", log_ts(), path, target),
                 Err(e) => eprintln!(
                     "[{}] disk: erro ao criar symlink {} -> {}: {}",
@@ -918,7 +1039,12 @@ fn build_commit_message(ops: &[&SyncOp]) -> String {
 /// Varre o working tree e converte em manifest + chunks todo arquivo regular
 /// acima de `threshold` que não seja ignorado nem já manifest. Pula `.git`
 /// (em qualquer nível) e `.chunks`. Streaming: RAM limitada a um chunk.
-fn convert_oversized_worktree_files(repo_path: &Path, threshold: u64, chunk_size: u64) -> usize {
+fn convert_oversized_worktree_files(
+    repo_path: &Path,
+    threshold: u64,
+    chunk_size: u64,
+    crypto: Option<&crate::crypt::Crypto>,
+) -> usize {
     let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
         Ok(r) => r,
         Err(e) => {
@@ -932,14 +1058,25 @@ fn convert_oversized_worktree_files(repo_path: &Path, threshold: u64, chunk_size
         if !meta.is_file() || meta.len() <= threshold {
             continue;
         }
-        // Ignorados são local-only: nunca commitam, chunkar quebraria a leitura.
-        if repo.is_path_ignored(&rel).unwrap_or(false) {
+        // Ignorados são local-only: nunca commitam, chunkar quebraria a
+        // leitura. No modo cifrado a semântica de ignore está desativada.
+        if crypto.is_none() && repo.is_path_ignored(&rel).unwrap_or(false) {
             continue;
         }
         if file_starts_with_manifest_magic(&full) {
             continue;
         }
-        match convert_file_to_chunks(repo_path, &full, chunk_size) {
+        if file_starts_with_encrypted_magic(&full) {
+            // Selado inteiro acima do limiar: legado que o fluxo atual não
+            // produz (writes grandes chegam plaintext para esta varredura).
+            eprintln!(
+                "[{}] chunk: {} selado acima do limiar — pulado (re-salve o arquivo)",
+                log_ts(),
+                rel
+            );
+            continue;
+        }
+        match convert_file_to_chunks(repo_path, &full, chunk_size, crypto) {
             Ok(manifest) => {
                 converted += 1;
                 println!(
@@ -962,18 +1099,233 @@ fn convert_file_to_chunks(
     repo_root: &Path,
     full: &Path,
     chunk_size: u64,
+    crypto: Option<&crate::crypt::Crypto>,
 ) -> std::io::Result<crate::chunk::Manifest> {
     let mut reader = std::fs::File::open(full)?;
-    let manifest = crate::chunk::chunk_reader_into_repo(&mut reader, chunk_size, repo_root)?;
+    let seal_transform = crypto.map(|c| move |plain: &[u8]| c.seal(plain));
+    let manifest = crate::chunk::chunk_reader_into_repo_with(
+        &mut reader,
+        chunk_size,
+        repo_root,
+        seal_transform
+            .as_ref()
+            .map(|f| f as &dyn Fn(&[u8]) -> Vec<u8>),
+    )?;
+    // Manifest fica plaintext aqui; a migração de estado (logo em seguida no
+    // mesmo drain) sela e move para o nome cifrado quando a cripto está ativa.
     let tmp = full.with_extension("drive-sync-manifest.tmp");
     std::fs::write(&tmp, manifest.serialize())?;
     std::fs::rename(&tmp, full)?;
     Ok(manifest)
 }
 
+/// `true` se o arquivo começa com a magic de conteúdo cifrado.
+fn file_starts_with_encrypted_magic(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 32];
+    let Ok(len) = f.read(&mut buf) else { return false };
+    crate::crypt::Crypto::is_encrypted_bytes(&buf[..len])
+}
+
+/// Migração `claro -> cifrado`: conforma cada arquivo/symlink do working tree
+/// ao estado cifrado (nome E conteúdo). Idempotente — arquivo já conforme é
+/// pulado. Retorna quantos itens foram convertidos.
+fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> usize {
+    let mut converted = 0usize;
+    for (full, rel) in walk_worktree_files(repo_path) {
+        let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
+        let name_ok = rel
+            .split('/')
+            .all(|comp| c.dec_component(comp).is_some());
+        if meta.file_type().is_symlink() {
+            let Ok(target) = std::fs::read_link(&full) else { continue };
+            let target_str = target.to_string_lossy().into_owned();
+            let target_ok = target_str
+                .split('/')
+                .all(|comp| matches!(comp, "" | "." | "..") || c.dec_component(comp).is_some());
+            if name_ok && target_ok {
+                continue;
+            }
+            let clear_rel = c.dec_path(&rel);
+            let clear_target = c.dec_path(&target_str);
+            let (Ok(new_rel), Ok(new_target)) =
+                (c.enc_path(&clear_rel), c.enc_path(&clear_target))
+            else {
+                eprintln!("[{}] crypto: nome longo demais em {:?} — pulado", log_ts(), clear_rel);
+                continue;
+            };
+            let new_full = repo_path.join(&new_rel);
+            if let Some(parent) = new_full.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::remove_file(&full);
+            let _ = std::fs::remove_file(&new_full);
+            if std::os::unix::fs::symlink(&new_target, &new_full).is_ok() {
+                converted += 1;
+            }
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        let sealed = file_starts_with_encrypted_magic(&full);
+        if name_ok && sealed {
+            continue;
+        }
+        let clear_rel = c.dec_path(&rel);
+        let Ok(new_rel) = c.enc_path(&clear_rel) else {
+            eprintln!("[{}] crypto: nome longo demais em {:?} — pulado", log_ts(), clear_rel);
+            continue;
+        };
+        let new_full = repo_path.join(&new_rel);
+        if let Some(parent) = new_full.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if sealed {
+            // Conteúdo ok, só o nome precisa migrar.
+            if new_full != full && std::fs::rename(&full, &new_full).is_ok() {
+                converted += 1;
+            }
+            continue;
+        }
+        let Ok(plain) = std::fs::read(&full) else { continue };
+        let tmp = new_full.with_extension("drive-sync-crypt.tmp");
+        if std::fs::write(&tmp, c.seal(&plain)).is_ok()
+            && std::fs::rename(&tmp, &new_full).is_ok()
+        {
+            if new_full != full {
+                let _ = std::fs::remove_file(&full);
+            }
+            converted += 1;
+        }
+    }
+    prune_empty_dirs(repo_path);
+    converted
+}
+
+/// Migração `cifrado -> claro`: decifra nomes e conteúdo; manifests selados
+/// são expandidos de volta ao arquivo inteiro (o chunk sweep re-chunka em
+/// claro na sequência, se ainda for grande).
+fn migrate_worktree_to_clear(repo_path: &Path, mk: &crate::crypt::Crypto) -> usize {
+    let mut converted = 0usize;
+    for (full, rel) in walk_worktree_files(repo_path) {
+        let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
+        let clear_rel = mk.dec_path(&rel);
+        let name_cipher = clear_rel != rel;
+        if meta.file_type().is_symlink() {
+            let Ok(target) = std::fs::read_link(&full) else { continue };
+            let clear_target = mk.dec_path(&target.to_string_lossy());
+            let target_cipher = clear_target != target.to_string_lossy();
+            if !name_cipher && !target_cipher {
+                continue;
+            }
+            let new_full = repo_path.join(&clear_rel);
+            if let Some(parent) = new_full.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::remove_file(&full);
+            let _ = std::fs::remove_file(&new_full);
+            if std::os::unix::fs::symlink(&clear_target, &new_full).is_ok() {
+                converted += 1;
+            }
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        let sealed = file_starts_with_encrypted_magic(&full);
+        if !sealed && !name_cipher {
+            continue;
+        }
+        let new_full = repo_path.join(&clear_rel);
+        if let Some(parent) = new_full.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if !sealed {
+            // Só o nome está cifrado.
+            if std::fs::rename(&full, &new_full).is_ok() {
+                converted += 1;
+            }
+            continue;
+        }
+        let Ok(sealed_bytes) = std::fs::read(&full) else { continue };
+        let Ok(plain) = mk.open(&sealed_bytes) else {
+            eprintln!(
+                "[{}] crypto: falha ao decifrar {:?} na migração — pulado",
+                log_ts(),
+                rel
+            );
+            continue;
+        };
+        if crate::chunk::Manifest::is_manifest_bytes(&plain) {
+            // Expandir: remonta o arquivo inteiro decifrando chunk a chunk
+            // (streaming em disco; RAM limitada a um chunk).
+            let Ok(manifest) = crate::chunk::Manifest::parse(&plain) else { continue };
+            let tmp = new_full.with_extension("drive-sync-expand.tmp");
+            let ok = (|| -> std::io::Result<()> {
+                use std::io::Write;
+                let mut out = std::fs::File::create(&tmp)?;
+                for h in &manifest.hashes {
+                    let sealed_chunk =
+                        std::fs::read(repo_path.join(crate::chunk::shard_rel_path(h)))?;
+                    let plain_chunk = mk
+                        .open(&sealed_chunk)
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    out.write_all(&plain_chunk)?;
+                }
+                Ok(())
+            })();
+            if ok.is_ok() && std::fs::rename(&tmp, &new_full).is_ok() {
+                let _ = std::fs::remove_file(&full);
+                converted += 1;
+            } else {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            continue;
+        }
+        let tmp = new_full.with_extension("drive-sync-crypt.tmp");
+        if std::fs::write(&tmp, &plain).is_ok() && std::fs::rename(&tmp, &new_full).is_ok() {
+            if new_full != full {
+                let _ = std::fs::remove_file(&full);
+            }
+            converted += 1;
+        }
+    }
+    prune_empty_dirs(repo_path);
+    converted
+}
+
+/// Remove diretórios vazios deixados pelas migrações de nome (bottom-up).
+/// `.git` e `.chunks` ficam intocados.
+fn prune_empty_dirs(repo_path: &Path) {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut stack = vec![repo_path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let name = entry.file_name();
+            if name == ".git" || (dir == repo_path && name == crate::chunk::CHUNKS_DIR) {
+                continue;
+            }
+            if p.is_dir() {
+                dirs.push(p.clone());
+                stack.push(p);
+            }
+        }
+    }
+    dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    for d in dirs {
+        let _ = std::fs::remove_dir(&d); // só remove se vazio
+    }
+}
+
 /// Remove de `.chunks/` os arquivos que nenhum manifest do working tree
 /// referencia. Barato quando não há chunks (early return).
-fn gc_orphan_chunks(repo_path: &Path) {
+fn gc_orphan_chunks(repo_path: &Path, key: Option<&crate::crypt::Crypto>) {
     let chunks_root = repo_path.join(crate::chunk::CHUNKS_DIR);
     let existing: Vec<std::path::PathBuf> = walk_dir_files(&chunks_root);
     if existing.is_empty() {
@@ -985,7 +1337,22 @@ fn gc_orphan_chunks(repo_path: &Path) {
         if !meta.is_file() || meta.len() > crate::chunk::MANIFEST_MAX_BYTES {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&full) else { continue };
+        let Ok(mut bytes) = std::fs::read(&full) else { continue };
+        if crate::crypt::Crypto::is_encrypted_bytes(&bytes) {
+            let Some(k) = key else {
+                // Manifests selados sem chave: impossível saber as referências
+                // — NUNCA coletar às cegas (removeria chunks vivos).
+                eprintln!(
+                    "[{}] chunk: gc pulado — worktree cifrado sem chave disponível",
+                    log_ts()
+                );
+                return;
+            };
+            match k.open(&bytes) {
+                Ok(plain) => bytes = plain,
+                Err(_) => continue,
+            }
+        }
         if crate::chunk::Manifest::is_manifest_bytes(&bytes) {
             if let Ok(m) = crate::chunk::Manifest::parse(&bytes) {
                 referenced.extend(m.hashes);

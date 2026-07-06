@@ -158,11 +158,16 @@ impl Crypto {
         String::from_utf8(plain).ok()
     }
 
-    /// Cifra um path relativo componente a componente.
+    /// Cifra um path (ou alvo de symlink) componente a componente.
+    /// Componentes de navegação (``, `.`, `..`) ficam literais — um alvo
+    /// relativo `../x` continua funcionando dentro da árvore cifrada.
     pub fn enc_path(&self, clear: &str) -> Result<String, CryptError> {
         let parts: Result<Vec<String>, CryptError> = clear
             .split('/')
-            .map(|c| self.enc_component(c))
+            .map(|c| match c {
+                "" | "." | ".." => Ok(c.to_string()),
+                other => self.enc_component(other),
+            })
             .collect();
         Ok(parts?.join("/"))
     }
@@ -399,6 +404,17 @@ mod tests {
         // E o limite prático (~119 bytes) passa
         let ok = "b".repeat(110);
         assert!(c.enc_component(&ok).is_ok());
+    }
+
+    #[test]
+    fn enc_path_keeps_navigation_components_literal() {
+        let c = crypto();
+        let enc = c.enc_path("../docs/nota.txt").unwrap();
+        assert!(enc.starts_with("../"));
+        assert_eq!(c.dec_path(&enc), "../docs/nota.txt");
+        let abs = c.enc_path("/tmp/x").unwrap();
+        assert!(abs.starts_with('/'));
+        assert_eq!(c.dec_path(&abs), "/tmp/x");
     }
 
     #[test]

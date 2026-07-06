@@ -287,6 +287,24 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
             drive_sync::crypt::Crypto::from_master_key(&master),
         ))
     } else {
+        // Desligado no config: se a chave existir, fica disponível SÓ para a
+        // migração de volta ao claro (worktree pode ainda estar cifrado).
+        let key_path = config
+            .encryption_key_file
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(drive_sync::paths::standard_key_path);
+        if key_path.exists() {
+            if let Ok(master) = drive_sync::crypt::load_key_file(&key_path) {
+                sync.set_migration_crypto(Some(std::sync::Arc::new(
+                    drive_sync::crypt::Crypto::from_master_key(&master),
+                )));
+                println!(
+                    "[{}] boot: criptografia desligada; chave presente — migração para claro ativa",
+                    log_ts()
+                );
+            }
+        }
         None
     };
     sync.set_crypto(crypto.clone());
