@@ -273,6 +273,8 @@ pub struct GitDriveFS {
     read_repo: Option<git2::Repository>,
     /// Contador de aberturas reais do handle (introspecção para testes).
     read_repo_opens: u64,
+    /// Criptografia em repouso (Fase 2.7): `Some` = repo cifrado, visão clara.
+    crypto: Option<Arc<crate::crypt::Crypto>>,
     uid: u32,
     gid: u32,
     mode_overrides: Arc<parking_lot::Mutex<HashMap<u64, u16>>>,
@@ -326,6 +328,24 @@ impl GitDriveFS {
         sync: SyncManager,
         read_cache_bytes: u64,
         spool_threshold_bytes: u64,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_options_crypto(
+            repo_path,
+            branch,
+            sync,
+            read_cache_bytes,
+            spool_threshold_bytes,
+            None,
+        )
+    }
+
+    pub fn new_with_options_crypto(
+        repo_path: &str,
+        branch: String,
+        sync: SyncManager,
+        read_cache_bytes: u64,
+        spool_threshold_bytes: u64,
+        crypto: Option<Arc<crate::crypt::Crypto>>,
     ) -> anyhow::Result<Self> {
         let repo = git::open_repo(repo_path)?;
         let commit = git::get_commit(&repo, "HEAD")?;
@@ -435,6 +455,7 @@ impl GitDriveFS {
             read_cache: BlobCache::new(read_cache_bytes),
             read_repo: None,
             read_repo_opens: 0,
+            crypto,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             mode_overrides: Arc::new(parking_lot::Mutex::new(HashMap::new())),

@@ -28,6 +28,10 @@ fn default_chunk_size_mb() -> u64 {
     80
 }
 
+fn default_encryption_enabled() -> bool {
+    false
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default = "default_write_debounce_secs")]
@@ -49,6 +53,15 @@ pub struct Config {
     /// Tamanho máximo de cada chunk, em MiB.
     #[serde(default = "default_chunk_size_mb")]
     pub chunk_size_mb: u64,
+    /// Criptografia em repouso (Fase 2.7): conteúdo e nomes cifrados no repo.
+    /// Habilitar/desabilitar dispara migração automática no próximo drain.
+    /// ATENÇÃO: a história Git anterior à habilitação permanece em claro.
+    #[serde(default = "default_encryption_enabled")]
+    pub encryption_enabled: bool,
+    /// Arquivo com a chave-mestre (64 hex, permissão 0600). Ausente = path
+    /// padrão da plataforma. Gere com `drive-sync key generate`.
+    #[serde(default)]
+    pub encryption_key_file: Option<String>,
     #[serde(default)]
     pub user_name: Option<String>,
     #[serde(default)]
@@ -66,6 +79,8 @@ impl Default for Config {
             large_file_threshold_mb: default_large_file_threshold_mb(),
             chunk_threshold_mb: default_chunk_threshold_mb(),
             chunk_size_mb: default_chunk_size_mb(),
+            encryption_enabled: false,
+            encryption_key_file: None,
             user_name: None,
             user_email: None,
             remote_token: None,
@@ -138,6 +153,23 @@ mod tests {
         assert!(cfg.user_name.is_none());
         assert!(cfg.user_email.is_none());
         assert!(cfg.remote_token.is_none());
+    }
+
+    #[test]
+    fn load_from_encryption_defaults_off() {
+        let (_dir, path) = write_config("{}");
+        let cfg = Config::load_from(&path);
+        assert!(!cfg.encryption_enabled);
+        assert!(cfg.encryption_key_file.is_none());
+    }
+
+    #[test]
+    fn load_from_encryption_overrides() {
+        let (_dir, path) =
+            write_config(r#"{"encryption_enabled": true, "encryption_key_file": "/x/drive.key"}"#);
+        let cfg = Config::load_from(&path);
+        assert!(cfg.encryption_enabled);
+        assert_eq!(cfg.encryption_key_file.as_deref(), Some("/x/drive.key"));
     }
 
     #[test]

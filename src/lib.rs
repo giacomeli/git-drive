@@ -1,5 +1,6 @@
 pub mod chunk;
 pub mod config;
+pub mod crypt;
 pub mod fs;
 pub mod git;
 pub mod launchd;

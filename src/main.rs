@@ -75,6 +75,26 @@ fn cli() -> Command {
         )
         .subcommand(Command::new("uninstall").about("Para o daemon e remove o LaunchAgent"))
         .subcommand(
+            Command::new("key")
+                .about("Gerencia a chave da criptografia em repouso")
+                .subcommand(
+                    Command::new("generate")
+                        .about("Gera um arquivo de chave novo (64 hex, permissão 0600)")
+                        .arg(
+                            Arg::new("out")
+                                .long("out")
+                                .value_name("PATH")
+                                .help("Onde gravar a chave (padrão: ~/Library/Application Support/drive-sync/drive.key)"),
+                        )
+                        .arg(
+                            Arg::new("force")
+                                .long("force")
+                                .help("Sobrescreve chave existente (a antiga será PERDIDA — dados cifrados com ela ficam ilegíveis)")
+                                .action(clap::ArgAction::SetTrue),
+                        ),
+                ),
+        )
+        .subcommand(
             Command::new("tray")
                 .about("Ícone de status na barra de menus (monitor do daemon)")
                 .arg(
@@ -148,6 +168,19 @@ fn main() -> anyhow::Result<()> {
     }
     if matches.subcommand_matches("uninstall").is_some() {
         return drive_sync::launchd::uninstall();
+    }
+    if let Some(sub) = matches.subcommand_matches("key") {
+        if let Some(gen) = sub.subcommand_matches("generate") {
+            let out = gen
+                .get_one::<String>("out")
+                .map(PathBuf::from)
+                .unwrap_or_else(drive_sync::paths::standard_key_path);
+            drive_sync::crypt::generate_key_file(&out, gen.get_flag("force"))?;
+            println!("chave gerada em: {}", out.display());
+            println!("IMPORTANTE: sem esta chave os dados cifrados são IRRECUPERÁVEIS — faça backup dela fora do repo.");
+            return Ok(());
+        }
+        anyhow::bail!("uso: drive-sync key generate [--out <path>] [--force]");
     }
     if let Some(sub) = matches.subcommand_matches("tray") {
         let file =
@@ -231,6 +264,32 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
         config.pull_interval_secs,
     );
     let sync_handle = sync.clone();
+    // Criptografia em repouso (Fase 2.7): habilitada sem chave legível ABORTA
+    // o boot — degradar para claro publicaria plaintext acreditando cifrar.
+    let crypto: Option<std::sync::Arc<drive_sync::crypt::Crypto>> = if config.encryption_enabled {
+        let key_path = config
+            .encryption_key_file
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(drive_sync::paths::standard_key_path);
+        let master = drive_sync::crypt::load_key_file(&key_path).map_err(|e| {
+            anyhow::anyhow!(
+                "criptografia habilitada no config mas a chave não pôde ser carregada: {} — gere com `drive-sync key generate`",
+                e
+            )
+        })?;
+        println!(
+            "[{}] boot: criptografia HABILITADA (chave: {})",
+            log_ts(),
+            key_path.display()
+        );
+        Some(std::sync::Arc::new(
+            drive_sync::crypt::Crypto::from_master_key(&master),
+        ))
+    } else {
+        None
+    };
+    sync.set_crypto(crypto.clone());
     // Chunking de arquivos grandes (Fase 2.6): nenhum blob acima do limiar
     // chega ao commit — vira manifest + .chunks/.
     sync.set_chunking(
@@ -248,12 +307,13 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
             .as_str(),
     );
 
-    let fs = GitDriveFS::new_with_options(
+    let fs = GitDriveFS::new_with_options_crypto(
         &repo_path,
         branch,
         sync,
         config.read_cache_mb * 1024 * 1024,
         config.large_file_threshold_mb * 1024 * 1024,
+        crypto,
     )?;
 
     // Opções macFUSE-específicas:

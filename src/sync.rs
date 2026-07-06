@@ -100,6 +100,8 @@ pub struct SyncManager {
     chunk_threshold_bytes: Arc<AtomicU64>,
     /// Tamanho de cada chunk, em bytes.
     chunk_size_bytes: Arc<AtomicU64>,
+    /// Criptografia em repouso (Fase 2.7): `Some` = repo cifrado.
+    crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
 }
 
 struct Inner {
@@ -195,6 +197,7 @@ impl SyncManager {
             notifier: Arc::new(Notifier::new()),
             chunk_threshold_bytes: Arc::new(AtomicU64::new(95 * 1024 * 1024)),
             chunk_size_bytes: Arc::new(AtomicU64::new(80 * 1024 * 1024)),
+            crypto: Arc::new(Mutex::new(None)),
         };
 
         manager.spawn_watcher();
@@ -227,6 +230,11 @@ impl SyncManager {
         self.status.enable_file(path);
     }
 
+    /// Liga a criptografia em repouso (Fase 2.7). Setter pós-construção.
+    pub fn set_crypto(&self, crypto: Option<Arc<crate::crypt::Crypto>>) {
+        *self.crypto.lock() = crypto;
+    }
+
     /// Configura o chunking de arquivos grandes (Fase 2.6). `threshold_bytes`
     /// 0 desativa. Setter pós-construção para não estender a assinatura já
     /// extensa de `new_full_with_pull`.
@@ -254,6 +262,7 @@ impl SyncManager {
             notifier: self.notifier.clone(),
             chunk_threshold_bytes: self.chunk_threshold_bytes.clone(),
             chunk_size_bytes: self.chunk_size_bytes.clone(),
+            crypto: self.crypto.clone(),
         }
     }
 
@@ -537,6 +546,7 @@ struct DrainCtx {
     notifier: Arc<Notifier>,
     chunk_threshold_bytes: Arc<AtomicU64>,
     chunk_size_bytes: Arc<AtomicU64>,
+    crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
 }
 
 impl DrainCtx {

@@ -36,6 +36,11 @@ pub fn standard_config_path() -> PathBuf {
     app_support_dir().join("config.json")
 }
 
+/// Path padrão do arquivo de chave da criptografia (Fase 2.7).
+pub fn standard_key_path() -> PathBuf {
+    app_support_dir().join("drive.key")
+}
+
 pub fn standard_status_path() -> PathBuf {
     app_support_dir().join("status.json")
 }
