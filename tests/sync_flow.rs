@@ -1298,3 +1298,73 @@ async fn disable_migration_decrypts_everything_back() {
         "tree volta a ter o path claro"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn enable_migration_rechunks_clear_chunked_files_sealing_chunks() {
+    let test = init_repo();
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    sync.set_chunking(64, 32);
+
+    // Estado pré-cripto: arquivo chunkado EM CLARO commitado
+    let payload: Vec<u8> = (0..200u8).collect();
+    sync.queue_write("video.bin", payload.clone());
+    wait_flush().await;
+    let clear_manifest = read_manifest_at(test.dir.path(), "video.bin");
+    assert!(
+        std::fs::read(test.dir.path().join(shard_rel_path(&clear_manifest.hashes[0])))
+            .map(|b| !Crypto::is_encrypted_bytes(&b))
+            .unwrap_or(false),
+        "pré-condição: chunks em claro"
+    );
+
+    // Habilita a criptografia: a migração NÃO pode deixar chunk em claro
+    let crypto = test_crypto();
+    sync.set_crypto(Some(crypto.clone()));
+    sync.queue_write("gatilho.txt", b"x".to_vec());
+    wait_flush().await;
+
+    // Nenhum chunk em claro sobrou no worktree
+    for entry in walkdir_files(test.dir.path().join(".chunks")) {
+        let bytes = std::fs::read(&entry).unwrap();
+        assert!(
+            Crypto::is_encrypted_bytes(&bytes),
+            "chunk em claro sobreviveu à migração: {:?}",
+            entry
+        );
+    }
+    // Manifest selado no path cifrado, com conteúdo íntegro na remontagem
+    let cipher_rel = crypto.enc_path("video.bin").unwrap();
+    let sealed_manifest = std::fs::read(test.dir.path().join(&cipher_rel)).unwrap();
+    let manifest = Manifest::parse(&crypto.open(&sealed_manifest).unwrap()).unwrap();
+    assert_eq!(manifest.total_size, 200);
+    let mut reassembled = Vec::new();
+    for h in &manifest.hashes {
+        let sealed_chunk = std::fs::read(test.dir.path().join(shard_rel_path(h))).unwrap();
+        reassembled.extend_from_slice(&crypto.open(&sealed_chunk).unwrap());
+    }
+    assert_eq!(reassembled, payload);
+    // E o path claro sumiu
+    assert!(!test.dir.path().join("video.bin").exists());
+    assert!(!tree_leaks_plaintext(&test.repo, &["video"]));
+}
+
+fn walkdir_files(root: std::path::PathBuf) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}

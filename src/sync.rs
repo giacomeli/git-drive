@@ -1192,6 +1192,73 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
             continue;
         }
         let Ok(plain) = std::fs::read(&full) else { continue };
+        if crate::chunk::Manifest::is_manifest_bytes(&plain) {
+            // Arquivo chunkado EM CLARO: selar só o manifest deixaria os
+            // chunks antigos em plaintext no repo (vazamento). Expande para
+            // temp (streaming) e re-chunka com selagem; os chunks claros
+            // viram órfãos e o GC (que roda depois, com a chave) os remove.
+            if let Ok(old_manifest) = crate::chunk::Manifest::parse(&plain) {
+                let any_clear_chunk = old_manifest.hashes.iter().any(|h| {
+                    !file_starts_with_encrypted_magic(
+                        &repo_path.join(crate::chunk::shard_rel_path(h)),
+                    )
+                });
+                if !any_clear_chunk {
+                    // Chunks já selados (escrita nova sob cripto): basta selar
+                    // o manifest — cai no caminho comum abaixo.
+                } else {
+                let tmp = new_full.with_extension("drive-sync-rechunk.tmp");
+                let expand = (|| -> std::io::Result<()> {
+                    use std::io::Write;
+                    let mut out = std::fs::File::create(&tmp)?;
+                    for h in &old_manifest.hashes {
+                        let chunk =
+                            std::fs::read(repo_path.join(crate::chunk::shard_rel_path(h)))?;
+                        // Estado misto: chunk selado é aberto; claro passa cru.
+                        let bytes = if crate::crypt::Crypto::is_encrypted_bytes(&chunk) {
+                            c.open(&chunk)
+                                .map_err(|e| std::io::Error::other(e.to_string()))?
+                        } else {
+                            chunk
+                        };
+                        out.write_all(&bytes)?;
+                    }
+                    Ok(())
+                })();
+                if expand.is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                    eprintln!(
+                        "[{}] crypto: falha ao expandir manifest claro {:?} — pulado",
+                        log_ts(),
+                        rel
+                    );
+                    continue;
+                }
+                let seal = |p: &[u8]| c.seal(p);
+                let rechunk = std::fs::File::open(&tmp).and_then(|mut r| {
+                    crate::chunk::chunk_reader_into_repo_with(
+                        &mut r,
+                        old_manifest.chunk_size,
+                        repo_path,
+                        Some(&seal as &dyn Fn(&[u8]) -> Vec<u8>),
+                    )
+                });
+                let _ = std::fs::remove_file(&tmp);
+                if let Ok(new_manifest) = rechunk {
+                    let tmp2 = new_full.with_extension("drive-sync-crypt.tmp");
+                    if std::fs::write(&tmp2, c.seal(&new_manifest.serialize())).is_ok()
+                        && std::fs::rename(&tmp2, &new_full).is_ok()
+                    {
+                        if new_full != full {
+                            let _ = std::fs::remove_file(&full);
+                        }
+                        converted += 1;
+                    }
+                }
+                continue;
+                }
+            }
+        }
         let tmp = new_full.with_extension("drive-sync-crypt.tmp");
         if std::fs::write(&tmp, c.seal(&plain)).is_ok()
             && std::fs::rename(&tmp, &new_full).is_ok()
