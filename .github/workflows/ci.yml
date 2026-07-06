@@ -95,12 +95,11 @@ jobs:
           rustup toolchain install 1.85 --profile minimal
           rustup run 1.85 cargo check --all-targets
 
-  # Fumaca Linux: sinalizacao, nao gate — o port funcional (mount fuse3,
-  # systemd, notificacoes) e fatia futura da Fase 3. Vira job obrigatorio
-  # quando a compilacao Linux for confirmada.
+  # Promovido a gate em 06-07-2026: a suite completa passou no primeiro run
+  # verde. O que resta do port Linux e runtime (mount fuse3, systemd,
+  # notificacoes) — fatia futura da Fase 3.
   test-linux:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
