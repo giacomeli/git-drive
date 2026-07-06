@@ -1463,7 +1463,10 @@ fn walk_worktree_files(repo_path: &Path) -> Vec<(std::path::PathBuf, String)> {
             let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
             if meta.is_dir() {
                 stack.push(full);
-            } else if meta.is_file() {
+            } else if meta.is_file() || meta.file_type().is_symlink() {
+                // Symlinks INCLUÍDOS: a migração de criptografia precisa
+                // visitá-los (nome e alvo). Consumidores que só tratam
+                // arquivo regular checam is_file() por conta própria.
                 let rel = full
                     .strip_prefix(repo_path)
                     .map(|p| p.to_string_lossy().into_owned())

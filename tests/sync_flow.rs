@@ -1368,3 +1368,43 @@ fn walkdir_files(root: std::path::PathBuf) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn enable_migration_encrypts_preexisting_symlinks() {
+    let test = init_repo();
+    commit_file(&test.repo, "real.txt", b"alvo", "add real");
+    // Symlink CLARO commitado antes da criptografia
+    let workdir = test.repo.workdir().unwrap();
+    std::os::unix::fs::symlink("real.txt", workdir.join("atalho.txt")).unwrap();
+    let mut index = test.repo.index().unwrap();
+    index.add_path(std::path::Path::new("atalho.txt")).unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = test.repo.find_tree(tree_id).unwrap();
+    let sig = git2::Signature::now("Test User", "test@example.com").unwrap();
+    let parent = test.repo.head().unwrap().peel_to_commit().unwrap();
+    test.repo
+        .commit(Some("HEAD"), &sig, &sig, "add symlink", &tree, &[&parent])
+        .unwrap();
+
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    let crypto = test_crypto();
+    sync.set_crypto(Some(crypto.clone()));
+    sync.queue_write("gatilho.txt", b"x".to_vec());
+    wait_flush().await;
+
+    assert!(
+        !tree_leaks_plaintext(&test.repo, &["atalho", "real"]),
+        "symlink pré-existente deve ser migrado (nome E alvo cifrados)"
+    );
+    let cipher_link = crypto.enc_path("atalho.txt").unwrap();
+    let meta = std::fs::symlink_metadata(test.dir.path().join(&cipher_link))
+        .expect("symlink migrado no path cifrado");
+    assert!(meta.file_type().is_symlink(), "continua symlink (modo 120000)");
+    let target = std::fs::read_link(test.dir.path().join(&cipher_link)).unwrap();
+    assert_eq!(crypto.dec_path(&target.to_string_lossy()), "real.txt");
+}
