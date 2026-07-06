@@ -14,6 +14,11 @@ pub fn init_repo() -> TestRepo {
     let dir = tempfile::tempdir().expect("tempdir");
     let repo = Repository::init(dir.path()).expect("git init");
 
+    // Branch inicial determinístico: sem isso, o nome vem do ambiente
+    // (init.defaultBranch local = "main"; runners de CI = "master") e os
+    // testes que referenciam "main" quebram fora da máquina do dev.
+    repo.set_head("refs/heads/main").expect("set_head main");
+
     {
         let mut config = repo.config().expect("repo config");
         config.set_str("user.name", "Test User").expect("set user.name");
