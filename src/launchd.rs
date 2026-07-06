@@ -148,6 +148,21 @@ pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
     std::fs::create_dir_all(&app_support)?;
     std::fs::create_dir_all(&log_dir)?;
 
+    // Migração (06-07-2026): config/chave saíram do Application Support para
+    // ~/.config/drive-sync. Se o novo não existe e o legado sim, move.
+    let _ = std::fs::create_dir_all(paths::config_dir());
+    for (legacy, new) in [
+        (paths::legacy_config_path(), paths::standard_config_path()),
+        (paths::legacy_key_path(), paths::standard_key_path()),
+    ] {
+        if !new.exists() && legacy.exists() {
+            match std::fs::rename(&legacy, &new) {
+                Ok(_) => println!("migrado: {} -> {}", legacy.display(), new.display()),
+                Err(e) => eprintln!("aviso: falha ao migrar {}: {}", legacy.display(), e),
+            }
+        }
+    }
+
     // Config: se o padrão não existe e há um ./config.json no CWD (fluxo dev),
     // copia — senão o daemon parte dos defaults (sem identidade = sem commit).
     let config = paths::standard_config_path();

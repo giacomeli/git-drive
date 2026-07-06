@@ -160,7 +160,9 @@ Se o repo é local-only (`git init` sem `git remote add`), ignore esta etapa int
 
 ## 6. Ajustar `config.json`
 
-`config.json` fica na **raiz do projeto drive-sync** (não do repo montado). Ausente → defaults silenciosos; inválido → defaults com log de aviso.
+`config.json` fica em **`~/.config/drive-sync/config.json`** (junto da chave da criptografia; um
+`./config.json` no CWD tem precedência no fluxo dev). Ausente → defaults silenciosos; inválido →
+defaults com log de aviso. Instalações antigas (Application Support) são migradas pelo `install`.
 
 ### 6.1. Template completo comentado
 
@@ -189,7 +191,7 @@ Se o repo é local-only (`git init` sem `git remote add`), ignore esta etapa int
 | `chunk_threshold_mb` | Arquivo acima disso (default `95`) é sincronizado como manifest + chunks de até `chunk_size_mb` em `.chunks/` — abaixo do limite de 100 MB por arquivo do GitHub. `0` desativa (pushes de arquivos grandes voltam a ser rejeitados pelo GitHub). |
 | `chunk_size_mb` | Tamanho máximo de cada chunk (default `80`). |
 | `encryption_enabled` | Criptografia em repouso (ver seção 8.10). Default `false`. |
-| `encryption_key_file` | Path do arquivo de chave. Default: `~/Library/Application Support/drive-sync/drive.key`. |
+| `encryption_key_file` | Path do arquivo de chave. Default: `~/.config/drive-sync/drive.key`. |
 | `user_name` / `user_email` | Se qualquer um for `null`, drive-sync **aplica as mudanças no working tree mas não commita**. Deixe ambos preenchidos para ter histórico. |
 | `remote_token` | PAT para HTTPS. `null` cai para ssh-agent / credential helper. |
 
@@ -384,7 +386,7 @@ drive-sync key generate
 | --- | --- |
 | Migração | Mudar `encryption_enabled` migra o worktree automaticamente no próximo drain, nos dois sentidos. |
 | História antiga | Habilitar depois NÃO protege o passado: commits antigos continuam legíveis no remote. Para repo público, comece de um repo novo. |
-| Multi-máquina | Copie o arquivo de chave (`~/Library/Application Support/drive-sync/drive.key`) para a outra máquina, com permissão 0600. |
+| Multi-máquina | Copie o arquivo de chave (`~/.config/drive-sync/drive.key`) para a outra máquina, com permissão 0600. |
 | Chave perdida | Dados irrecuperáveis — não existe backdoor. |
 | O que continua visível | Tamanhos aproximados, quantidade de arquivos/pastas, profundidade da árvore e cadência de commits. Quem já possui um arquivo idêntico consegue confirmar que ele está no repo (cifra convergente, necessária para o Git). |
 | `.gitignore`/local-only | Desativados no modo cifrado (regras casariam contra nomes cifrados). |

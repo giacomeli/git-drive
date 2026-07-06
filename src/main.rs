@@ -84,7 +84,7 @@ fn cli() -> Command {
                             Arg::new("out")
                                 .long("out")
                                 .value_name("PATH")
-                                .help("Onde gravar a chave (padrão: ~/Library/Application Support/drive-sync/drive.key)"),
+                                .help("Onde gravar a chave (padrão: ~/.config/drive-sync/drive.key)"),
                         )
                         .arg(
                             Arg::new("force")
@@ -131,7 +131,7 @@ fn cli() -> Command {
             Arg::new("config")
                 .long("config")
                 .value_name("PATH")
-                .help("Caminho do config.json (padrão: ./config.json)"),
+                .help("Caminho do config.json (padrão: ./config.json, depois ~/.config/drive-sync/config.json)"),
         )
         .arg(
             Arg::new("log-dir")
@@ -197,11 +197,11 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     let repo_path = matches.get_one::<String>("repo").unwrap().clone();
     let mount_path = matches.get_one::<String>("mount").unwrap().clone();
     let verbose = matches.get_flag("verbose");
-    let config_path = matches
-        .get_one::<String>("config")
-        .map(String::as_str)
-        .unwrap_or("config.json")
-        .to_string();
+    let config_path = drive_sync::paths::resolve_config_for_read(
+        matches.get_one::<String>("config").map(String::as_str),
+    )
+    .to_string_lossy()
+    .into_owned();
     let log_dir = matches
         .get_one::<String>("log-dir")
         .map(PathBuf::from)
@@ -267,11 +267,8 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     // Criptografia em repouso (Fase 2.7): habilitada sem chave legível ABORTA
     // o boot — degradar para claro publicaria plaintext acreditando cifrar.
     let crypto: Option<std::sync::Arc<drive_sync::crypt::Crypto>> = if config.encryption_enabled {
-        let key_path = config
-            .encryption_key_file
-            .clone()
-            .map(PathBuf::from)
-            .unwrap_or_else(drive_sync::paths::standard_key_path);
+        let key_path =
+            drive_sync::paths::resolve_key_for_read(config.encryption_key_file.as_deref());
         let master = drive_sync::crypt::load_key_file(&key_path).map_err(|e| {
             anyhow::anyhow!(
                 "criptografia habilitada no config mas a chave não pôde ser carregada: {} — gere com `drive-sync key generate`",
@@ -289,11 +286,8 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     } else {
         // Desligado no config: se a chave existir, fica disponível SÓ para a
         // migração de volta ao claro (worktree pode ainda estar cifrado).
-        let key_path = config
-            .encryption_key_file
-            .clone()
-            .map(PathBuf::from)
-            .unwrap_or_else(drive_sync::paths::standard_key_path);
+        let key_path =
+            drive_sync::paths::resolve_key_for_read(config.encryption_key_file.as_deref());
         if key_path.exists() {
             if let Ok(master) = drive_sync::crypt::load_key_file(&key_path) {
                 sync.set_migration_crypto(Some(std::sync::Arc::new(
