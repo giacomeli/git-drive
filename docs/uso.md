@@ -60,7 +60,7 @@ Clone e compile uma vez antes do primeiro uso.
 git clone <url-deste-repo> drive-sync
 cd drive-sync
 cargo build                    # primeiro build baixa deps (fuser, git2, tokio...)
-cargo test                     # opcional, valida toolchain (~78 testes)
+cargo test                     # opcional, valida toolchain (~256 testes)
 ```
 
 O binário fica em `target/debug/drive-sync`. Para build otimizada (recomendado após estabilizar seu fluxo):

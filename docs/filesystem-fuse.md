@@ -91,7 +91,7 @@ struct DirEntry {
 
 ## Ciclo de vida do write buffer
 
-Cada inode com escrita pendente tem um `Vec<u8>` em `write_buffers` (o conteúdo INTEIRO do arquivo) e, opcionalmente, uma marca em `dirty`.
+Cada inode com escrita pendente tem um `WriteBuffer` em `write_buffers` — o conteúdo INTEIRO do arquivo, em RAM copy-on-write (`Arc` compartilhado com a fila de sync) abaixo de `large_file_threshold_mb` ou em arquivo de spool acima — e, opcionalmente, uma marca em `dirty`. Para arquivo chunkado, o buffer nasce da remontagem (decifrada, se cifrado) em streaming.
 
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'primaryColor':'#E3F2FD','primaryTextColor':'#0D47A1','primaryBorderColor':'#1976D2','lineColor':'#546E7A'}}}%%
