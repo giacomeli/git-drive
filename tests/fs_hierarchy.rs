@@ -1478,3 +1478,182 @@ async fn chunked_view_survives_refresh() {
     assert_eq!(fs.apply_read(ino, 0, 250).unwrap(), payload);
     assert_eq!(fs.find_inode(".chunks"), None, ".chunks continua invisível pós-refresh");
 }
+
+// ---- Fase 2.7: visão FUSE clara sobre repo cifrado ----
+
+use drive_sync::crypt::Crypto;
+use std::sync::Arc as StdArc;
+
+fn fs_crypto() -> StdArc<Crypto> {
+    StdArc::new(Crypto::from_master_key(&[42u8; 32]))
+}
+
+fn commit_all(repo: &git2::Repository, msg: &str) {
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let sig = git2::Signature::now("Test User", "test@example.com").unwrap();
+    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &[&parent])
+        .unwrap();
+}
+
+/// Materializa um arquivo cifrado (nome + conteúdo) no worktree e commita.
+fn commit_encrypted_file(
+    repo: &git2::Repository,
+    crypto: &Crypto,
+    clear_rel: &str,
+    content: &[u8],
+) {
+    let workdir = repo.workdir().unwrap();
+    let cipher_rel = crypto.enc_path(clear_rel).unwrap();
+    let full = workdir.join(&cipher_rel);
+    std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+    std::fs::write(&full, crypto.seal(content)).unwrap();
+    commit_all(repo, "add encrypted");
+}
+
+fn new_encrypted_fs(repo_path: &str, crypto: StdArc<Crypto>) -> GitDriveFS {
+    let sync = SyncManager::new(repo_path, 5);
+    GitDriveFS::new_with_options_crypto(
+        repo_path,
+        "main".to_string(),
+        sync,
+        64 * 1024 * 1024,
+        64 * 1024 * 1024,
+        Some(crypto),
+    )
+    .expect("GitDriveFS cifrado")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn encrypted_repo_boot_exposes_clear_names_and_content() {
+    let test = init_repo();
+    let crypto = fs_crypto();
+    commit_encrypted_file(&test.repo, &crypto, "docs/Nota Secreta.txt", b"segredo");
+    let mut fs = new_encrypted_fs(test.dir.path().to_str().unwrap(), crypto.clone());
+
+    let ino = fs
+        .find_inode("docs/Nota Secreta.txt")
+        .expect("nome CLARO deve estar no índice");
+    assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"segredo".to_vec());
+    assert_eq!(
+        fs.apply_getattr(ino).unwrap().size,
+        7,
+        "tamanho do PLAINTEXT, não do blob selado"
+    );
+    // Nome cifrado não vaza para a visão
+    let cipher_rel = crypto.enc_path("docs/Nota Secreta.txt").unwrap();
+    assert_eq!(fs.find_inode(&cipher_rel), None);
+    let entries = fs.apply_readdir(1).unwrap();
+    assert!(entries.iter().any(|(_, _, n)| n == "docs"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn encrypted_read_with_wrong_key_is_eio() {
+    let test = init_repo();
+    let crypto = fs_crypto();
+    commit_encrypted_file(&test.repo, &crypto, "dado.bin", b"conteudo");
+    let wrong = StdArc::new(Crypto::from_master_key(&[99u8; 32]));
+    let mut fs = new_encrypted_fs(test.dir.path().to_str().unwrap(), wrong);
+
+    // Nome não decifra com a chave errada -> aparece literal (cifrado)
+    let cipher_rel = crypto.enc_path("dado.bin").unwrap();
+    let ino = fs.find_inode(&cipher_rel).expect("fallback literal do nome");
+    assert_eq!(
+        fs.apply_read(ino, 0, 100),
+        Err(libc::EIO),
+        "chave errada = EIO, nunca conteúdo errado"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn encrypted_symlink_readlink_returns_clear_target() {
+    let test = init_repo();
+    let crypto = fs_crypto();
+    let workdir = test.repo.workdir().unwrap();
+    let link_rel = crypto.enc_path("atalho.txt").unwrap();
+    let target_cipher = crypto.enc_path("docs/alvo real.txt").unwrap();
+    std::os::unix::fs::symlink(&target_cipher, workdir.join(&link_rel)).unwrap();
+    commit_all(&test.repo, "add symlink cifrado");
+
+    let mut fs = new_encrypted_fs(test.dir.path().to_str().unwrap(), crypto);
+    let ino = fs.find_inode("atalho.txt").expect("symlink com nome claro");
+    assert_eq!(fs.apply_getattr(ino).unwrap().kind, FileType::Symlink);
+    assert_eq!(
+        fs.apply_readlink(ino).unwrap(),
+        b"docs/alvo real.txt".to_vec(),
+        "readlink apresenta o alvo CLARO"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn encrypted_chunked_file_reads_reassembled_plaintext() {
+    let test = init_repo();
+    let crypto = fs_crypto();
+    let workdir = test.repo.workdir().unwrap();
+    let payload: Vec<u8> = (0..250u32).map(|i| (i % 251) as u8).collect();
+    let seal = |plain: &[u8]| crypto.seal(plain);
+    let manifest = drive_sync::chunk::chunk_reader_into_repo_with(
+        &mut payload.as_slice(),
+        100,
+        workdir,
+        Some(&seal as &dyn Fn(&[u8]) -> Vec<u8>),
+    )
+    .unwrap();
+    let cipher_rel = crypto.enc_path("grande.bin").unwrap();
+    std::fs::write(workdir.join(&cipher_rel), crypto.seal(&manifest.serialize())).unwrap();
+    commit_all(&test.repo, "add chunked cifrado");
+
+    let mut fs = new_encrypted_fs(test.dir.path().to_str().unwrap(), crypto.clone());
+    let ino = fs.find_inode("grande.bin").expect("chunkado com nome claro");
+    assert_eq!(fs.apply_getattr(ino).unwrap().size, 250, "tamanho real do plaintext");
+    assert_eq!(fs.apply_read(ino, 0, 250).unwrap(), payload);
+    assert_eq!(fs.apply_read(ino, 90, 20).unwrap(), payload[90..110].to_vec());
+
+    // Chunk adulterado: hash do ciphertext detecta antes de decifrar
+    let victim = workdir.join(shard_rel_path(&manifest.hashes[1]));
+    std::fs::write(&victim, b"lixo").unwrap();
+    fs.refresh_if_needed(); // limpa cache de último chunk? leitura direta:
+    let mut fs2 = new_encrypted_fs(test.dir.path().to_str().unwrap(), crypto);
+    let ino2 = fs2.find_inode("grande.bin").unwrap();
+    assert_eq!(fs2.apply_read(ino2, 100, 100), Err(libc::EIO));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn encrypted_mode_disables_local_only_ignore() {
+    let test = init_repo();
+    let crypto = fs_crypto();
+    commit_encrypted_file(&test.repo, &crypto, "base.txt", b"x");
+    // .gitignore claro + arquivo casando a regra, direto no worktree
+    std::fs::write(test.dir.path().join(".gitignore"), b"*.log\n").unwrap();
+    std::fs::write(test.dir.path().join("solto.log"), b"local").unwrap();
+
+    let fs = new_encrypted_fs(test.dir.path().to_str().unwrap(), crypto);
+    assert_eq!(
+        fs.find_inode("solto.log"),
+        None,
+        "modo cifrado desativa a incorporação local-only"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn encrypted_conflicted_copy_shows_clear_prefix() {
+    let test = init_repo();
+    let crypto = fs_crypto();
+    let workdir = test.repo.workdir().unwrap();
+    let cipher = crypto.enc_path("nota.txt").unwrap();
+    let conflicted_rel = format!("{}.conflict-mac-99", cipher);
+    std::fs::write(workdir.join(&conflicted_rel), crypto.seal(b"versao local")).unwrap();
+    commit_all(&test.repo, "conflicted copy");
+
+    let mut fs = new_encrypted_fs(test.dir.path().to_str().unwrap(), crypto);
+    let ino = fs
+        .find_inode("nota.txt.conflict-mac-99")
+        .expect("prefixo decifrado + sufixo claro");
+    assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"versao local".to_vec());
+}

@@ -351,6 +351,7 @@ impl GitDriveFS {
         let commit = git::get_commit(&repo, "HEAD")?;
         let dirs = git::list_dirs_at_commit(&repo, &commit)?;
         let files = git::list_files_at_commit(&repo, &commit)?;
+        let (dirs, files) = decrypt_listing(crypto.as_deref(), dirs, files);
 
         let mut files_by_inode = HashMap::new();
         let mut dirs_by_inode = HashMap::new();
@@ -603,7 +604,8 @@ impl GitDriveFS {
         }
         let repo = git::open_repo(&self.repo_path).ok()?;
         let commit = git::get_commit(&repo, "HEAD").ok()?;
-        git::read_file_at_commit(&repo, &commit, path).ok()
+        let bytes = git::read_file_at_commit(&repo, &commit, &self.disk_path(path)).ok()?;
+        self.maybe_open(bytes).ok()
     }
 
     // ---- funções de lógica pura para testes de integração ----
@@ -716,7 +718,9 @@ impl GitDriveFS {
         let result = candidate.and_then(|path| {
             let repo = git::open_repo(&self.repo_path).ok()?;
             let commit = git::get_commit(&repo, "HEAD").ok()?;
-            let bytes = git::read_file_at_commit(&repo, &commit, &path).ok()?;
+            let bytes =
+                git::read_file_at_commit(&repo, &commit, &self.disk_path(&path)).ok()?;
+            let bytes = self.maybe_open(bytes).ok()?;
             if !crate::chunk::Manifest::is_manifest_bytes(&bytes) {
                 return None;
             }
@@ -755,7 +759,8 @@ impl GitDriveFS {
             );
             return Err(libc::EIO);
         }
-        Ok(data)
+        // Com criptografia, o hash cobre o CIPHERTEXT; decifrar vem depois.
+        self.maybe_open(data)
     }
 
     /// Leitura remontada de arquivo chunkado, com cache do último chunk
@@ -939,12 +944,40 @@ impl GitDriveFS {
             Some(_) => return Err(libc::EINVAL),
             None => return Err(libc::ENOENT),
         }
-        self.apply_read(ino, 0, usize::MAX)
+        let raw = self.apply_read(ino, 0, usize::MAX)?;
+        if let Some(c) = &self.crypto {
+            // Alvo no disco está cifrado por componente; a visão é clara.
+            let s = String::from_utf8_lossy(&raw);
+            return Ok(c.dec_path(&s).into_bytes());
+        }
+        Ok(raw)
+    }
+
+    /// Path como está no DISCO/HEAD: cifrado quando a criptografia está ativa.
+    fn disk_path(&self, clear: &str) -> String {
+        match &self.crypto {
+            Some(c) => c.enc_path(clear).unwrap_or_else(|_| clear.to_string()),
+            None => clear.to_string(),
+        }
+    }
+
+    /// Decifra bytes selados quando a cripto está ativa; conteúdo sem a magic
+    /// passa direto (estado misto). Falha de AEAD = EIO, nunca lixo.
+    fn maybe_open(&self, bytes: Vec<u8>) -> Result<Vec<u8>, i32> {
+        match &self.crypto {
+            Some(c) if crate::crypt::Crypto::is_encrypted_bytes(&bytes) => {
+                c.open(&bytes).map_err(|e| {
+                    eprintln!("[{}] crypto: {} — EIO", log_ts(), e);
+                    libc::EIO
+                })
+            }
+            _ => Ok(bytes),
+        }
     }
 
     /// Blob do HEAD via handle persistente — abre o repo uma vez e reutiliza
     /// nas leituras seguintes. Erro derruba o handle (reabre na próxima
-    /// chamada) e vira EIO.
+    /// chamada) e vira EIO. Com criptografia, busca no path cifrado e decifra.
     fn head_blob_via_persistent_handle(&mut self, path: &str) -> Result<Vec<u8>, i32> {
         if self.read_repo.is_none() {
             self.read_repo = git::open_repo(&self.repo_path).ok();
@@ -952,13 +985,14 @@ impl GitDriveFS {
                 self.read_repo_opens += 1;
             }
         }
+        let disk = self.disk_path(path);
         let Some(repo) = self.read_repo.as_ref() else {
             return Err(libc::EIO);
         };
         let result = git::get_commit(repo, "HEAD")
-            .and_then(|commit| git::read_file_at_commit(repo, &commit, path));
+            .and_then(|commit| git::read_file_at_commit(repo, &commit, &disk));
         match result {
-            Ok(content) => Ok(content),
+            Ok(content) => self.maybe_open(content),
             Err(_) => {
                 // Handle pode ter ficado inválido (repo movido, gc externo):
                 // descarta para reabrir na próxima leitura.
@@ -1277,6 +1311,7 @@ impl GitDriveFS {
                 return;
             }
         };
+        let (dirs, files) = decrypt_listing(self.crypto.as_deref(), dirs, files);
 
         let previous: HashMap<String, u64> = self.inodes_by_path.clone();
 
@@ -1781,6 +1816,11 @@ impl GitDriveFS {
     /// entrada nova (reusando inode de `previous` quando o path existia antes
     /// de um rebuild). Diretórios intermediários fora do HEAD são criados.
     fn incorporate_local_only(&mut self, previous: &HashMap<String, u64>) {
+        // Modo cifrado: a semântica de ignore do repo está desativada (regras
+        // casariam contra nomes cifrados) — nada de local-only.
+        if self.crypto.is_some() {
+            return;
+        }
         let repo = match git::open_repo(&self.repo_path) {
             Ok(r) => r,
             Err(e) => {
@@ -1888,7 +1928,11 @@ impl GitDriveFS {
         };
         self.derived_times.clear();
         for (path, time) in by_path {
-            if let Some(&ino) = self.inodes_by_path.get(&path) {
+            let clear = match &self.crypto {
+                Some(c) => c.dec_path(&path),
+                None => path,
+            };
+            if let Some(&ino) = self.inodes_by_path.get(&clear) {
                 self.derived_times.insert(ino, time);
             }
         }
@@ -2811,6 +2855,34 @@ fn enoattr() -> i32 {
     {
         libc::ENODATA
     }
+}
+
+/// Overhead fixo de um blob selado: magic (24) + nonce (24) + tag AEAD (16).
+const SEALED_OVERHEAD: u64 = 64;
+
+/// Converte a listagem do HEAD (paths cifrados) para a visão clara. Tamanho
+/// de arquivo regular cujo nome decifrou é ajustado para o do plaintext
+/// (blobs conformes são selados por construção do drain).
+fn decrypt_listing(
+    crypto: Option<&crate::crypt::Crypto>,
+    dirs: Vec<String>,
+    files: Vec<git::ListedFile>,
+) -> (Vec<String>, Vec<git::ListedFile>) {
+    let Some(c) = crypto else { return (dirs, files) };
+    let dirs = dirs.into_iter().map(|d| c.dec_path(&d)).collect();
+    let files = files
+        .into_iter()
+        .map(|mut f| {
+            let clear = c.dec_path(&f.path);
+            let decoded = clear != f.path;
+            f.path = clear;
+            if decoded && f.kind == git::FileKind::Regular {
+                f.size = f.size.saturating_sub(SEALED_OVERHEAD);
+            }
+            f
+        })
+        .collect();
+    (dirs, files)
 }
 
 fn leaf_name(path: &str) -> &str {

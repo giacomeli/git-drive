@@ -166,7 +166,16 @@ impl Crypto {
             .split('/')
             .map(|c| match c {
                 "" | "." | ".." => Ok(c.to_string()),
-                other => self.enc_component(other),
+                other => {
+                    // Inverso exato do dec_path: o sufixo de conflicted copy
+                    // fica claro sobre o componente cifrado.
+                    if let Some(idx) = other.find(CONFLICT_MARKER) {
+                        let (prefix, suffix) = other.split_at(idx);
+                        Ok(format!("{}{}", self.enc_component(prefix)?, suffix))
+                    } else {
+                        self.enc_component(other)
+                    }
+                }
             })
             .collect();
         Ok(parts?.join("/"))
