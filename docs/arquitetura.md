@@ -216,6 +216,7 @@ pub struct Config {
 | 7 | `chmod` em memória, `chown` ignorado | uid/gid são os do processo do mount |
 | 8 | Cache de blobs não cobre arquivo maior que o orçamento | miss usa handle de repo persistente (sem reabrir por syscall) |
 | 11 | Arquivos acima de `chunk_threshold_mb` viram manifest + `.chunks/` | transparente no mount; clone puro vê os artefatos (`src/chunk.rs`) |
+| 12 | Criptografia em repouso opcional | conteúdo e nomes cifrados no repo, claro só no mount (`src/crypt.rs`); história pré-migração permanece legível |
 | 9 | Refresh depende de syscalls FUSE | TTL de 1s no kernel pode mascarar mudanças remotas por ~1s |
 | 10 | Sem criptografia | fora do escopo desta etapa; reservado para próxima spec |
 

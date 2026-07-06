@@ -172,6 +172,8 @@ Se o repo é local-only (`git init` sem `git remote add`), ignore esta etapa int
   "large_file_threshold_mb": 64,
   "chunk_threshold_mb": 95,
   "chunk_size_mb": 80,
+  "encryption_enabled": false,
+  "encryption_key_file": null,
   "user_name": "Juliano",
   "user_email": "juliano@example.com",
   "remote_token": null
@@ -186,6 +188,8 @@ Se o repo é local-only (`git init` sem `git remote add`), ignore esta etapa int
 | `large_file_threshold_mb` | Limiar em MiB acima do qual buffers de escrita vão para arquivo de spool em disco em vez de RAM (default `64`). Copiar um vídeo de 4 GiB para o drive não exige 4 GiB de RAM. `0` desativa o spool. |
 | `chunk_threshold_mb` | Arquivo acima disso (default `95`) é sincronizado como manifest + chunks de até `chunk_size_mb` em `.chunks/` — abaixo do limite de 100 MB por arquivo do GitHub. `0` desativa (pushes de arquivos grandes voltam a ser rejeitados pelo GitHub). |
 | `chunk_size_mb` | Tamanho máximo de cada chunk (default `80`). |
+| `encryption_enabled` | Criptografia em repouso (ver seção 8.10). Default `false`. |
+| `encryption_key_file` | Path do arquivo de chave. Default: `~/Library/Application Support/drive-sync/drive.key`. |
 | `user_name` / `user_email` | Se qualquer um for `null`, drive-sync **aplica as mudanças no working tree mas não commita**. Deixe ambos preenchidos para ter histórico. |
 | `remote_token` | PAT para HTTPS. `null` cai para ssh-agent / credential helper. |
 
@@ -358,7 +362,35 @@ grep '^sha256 ' arquivo.zip | awk '{print ".chunks/" substr($2,1,2) "/" $2}' | x
 Não crie conteúdo próprio dentro de `.chunks/` — o diretório é reservado e o GC do drive-sync
 remove o que nenhum manifest referencia.
 
-### 8.10. O que **não** funciona
+### 8.10. Criptografia em repouso (repo público como drive)
+
+Com a criptografia habilitada, o repo — incluindo o working tree local — guarda **tudo cifrado**
+(conteúdo e nomes, XChaCha20-Poly1305); só o drive montado apresenta os arquivos em claro. Dá para
+usar até um repo público do GitHub como drive: sem a chave, ele é só uma árvore de blobs opacos.
+
+Passo a passo:
+
+```bash
+# 1. Gere a chave (uma vez; faça backup DELA fora do repo — sem ela os dados são irrecuperáveis)
+drive-sync key generate
+
+# 2. Habilite no config.json
+#    "encryption_enabled": true
+
+# 3. Reinicie o daemon. O próximo drain migra todo o conteúdo existente para cifrado.
+```
+
+| O que saber | Detalhe |
+| --- | --- |
+| Migração | Mudar `encryption_enabled` migra o worktree automaticamente no próximo drain, nos dois sentidos. |
+| História antiga | Habilitar depois NÃO protege o passado: commits antigos continuam legíveis no remote. Para repo público, comece de um repo novo. |
+| Multi-máquina | Copie o arquivo de chave (`~/Library/Application Support/drive-sync/drive.key`) para a outra máquina, com permissão 0600. |
+| Chave perdida | Dados irrecuperáveis — não existe backdoor. |
+| O que continua visível | Tamanhos aproximados, quantidade de arquivos/pastas, profundidade da árvore e cadência de commits. Quem já possui um arquivo idêntico consegue confirmar que ele está no repo (cifra convergente, necessária para o Git). |
+| `.gitignore`/local-only | Desativados no modo cifrado (regras casariam contra nomes cifrados). |
+| Nomes longos | Componente de nome com mais de ~119 bytes não pode ser criado no modo cifrado (limite de 255 do filesystem após cifrar). |
+
+### 8.11. O que **não** funciona
 
 | Operação | Motivo |
 | --- | --- |
