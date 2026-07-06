@@ -338,10 +338,12 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     let mut options = vec![
         MountOption::FSName("gitdrive".to_string()),
         MountOption::AutoUnmount,
-        MountOption::AllowOther,
     ];
     #[cfg(target_os = "macos")]
     {
+        // AllowOther no Linux exige `user_allow_other` no /etc/fuse.conf
+        // (raramente habilitado) — mount single-user não precisa dele.
+        options.push(MountOption::AllowOther);
         options.push(MountOption::CUSTOM("local".to_string()));
         options.push(MountOption::CUSTOM("volname=drive-sync".to_string()));
         options.push(MountOption::CUSTOM("noappledouble".to_string()));
