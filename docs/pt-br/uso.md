@@ -1,5 +1,7 @@
 # Guia de uso: drive-sync passo a passo
 
+> English version: [../usage.md](../usage.md)
+
 Este guia mostra, na ordem em que você deve executar, como preparar o ambiente, configurar credenciais, montar um repositório Git como filesystem FUSE e usar o drive-sync no dia a dia. Para a visão arquitetural, consulte [arquitetura.md](./arquitetura.md). Para mecânica interna de sincronização, [fluxo-de-sincronizacao.md](./fluxo-de-sincronizacao.md).
 
 ## Sumário
@@ -246,10 +248,10 @@ cargo run -- -r ~/Projects/meu-drive -m /tmp/gitmount
 Saída esperada nos primeiros segundos:
 
 ```text
-🛠️ Debounce: 5s
-🔗 Repositório Git: /Users/voce/Projects/meu-drive
-📂 Montando em: /tmp/gitmount
-🌿 Branch ativo: main
+Debounce: 5s
+Repositório Git: /Users/voce/Projects/meu-drive
+Montando em: /tmp/gitmount
+Branch ativo: main
 ```
 
 O processo fica **em primeiro plano** — a chamada a `fuser::mount2` é bloqueante. Abra outro terminal para interagir com o drive. Ctrl-C no terminal da montagem desliga o filesystem.
@@ -656,14 +658,14 @@ cargo run -- -r ~/drives/compartilhado -m /tmp/compartilhado
 - Se você adicionar uma nova operação FUSE em `src/fs.rs`, liste em [8.1–8.6](#8-usar-o-filesystem-no-dia-a-dia) ou [8.7](#87-o-que-não-funciona-v010) conforme o caso.
 - Se surgir novo campo em `config.json`, atualize a tabela de [6.1](#61-template-completo-comentado) e, quando for relevante, adicione receita em [6.2](#62-receita-rápida-por-cenário).
 - Ao mudar a estratégia de credenciais em `src/git.rs`, revisite [5](#5-configurar-credenciais-do-remote).
-- Ao mudar logs do processo (mensagens, emojis), atualize [9.1](#91-logs-do-processo) para refletir o texto real.
+- Ao mudar logs do processo (mensagens, formato), atualize [9.1](#91-logs-do-processo) para refletir o texto real.
 
 ---
 
 ## Referências
 
-- [README.md](../README.md) — visão geral e quick start
+- [README.md](../../README.md) — visão geral e quick start
 - [arquitetura.md](./arquitetura.md) — camadas, estruturas de dados, limitações
 - [fluxo-de-sincronizacao.md](./fluxo-de-sincronizacao.md) — watchers, debounce, pull
 - [filesystem-fuse.md](./filesystem-fuse.md) — modelo inode e operações FUSE
-- [CLAUDE.md](../CLAUDE.md) — orientações para contribuidores e agentes
+- [AGENTS.md](../../AGENTS.md) — orientações para contribuidores e agentes

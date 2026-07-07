@@ -1,10 +1,13 @@
-# Documentação técnica — drive-sync
+# Technical documentation — drive-sync
 
-Documentação arquitetural do projeto. Para build/run e visão de alto nível, consulte o [README](../README.md) raiz; para orientações ao Claude Code, [CLAUDE.md](../CLAUDE.md).
+Architectural documentation for the project. For build/run and a high-level overview, see the
+root [README](../README.md); for agent/contributor guidance, [AGENTS.md](../AGENTS.md).
 
-## Índice
+## Index
 
-- [uso.md](./uso.md) — Guia passo a passo: pré-requisitos, credenciais, `config.json`, montagem, dia a dia, symlinks, arquivos ignorados, arquivos grandes (chunking), criptografia em repouso e troubleshooting
-- [arquitetura.md](./arquitetura.md) — Visão geral do projeto, camadas (incluindo chunking e criptografia), estruturas de dados e limitações conhecidas
-- [fluxo-de-sincronizacao.md](./fluxo-de-sincronizacao.md) — `SyncManager`, fila causal, drain (chunking, criptografia e migrações), pull watcher e reconcile de push
-- [filesystem-fuse.md](./filesystem-fuse.md) — Mapeamento inode-path, operações FUSE implementadas, buffers (RAM/spool) e fluxos de leitura/escrita
+- [usage.md](./usage.md) — Step-by-step guide: prerequisites, credentials, `config.json`, mounting, day-to-day, symlinks, ignored files, large files (chunking), encryption at rest and troubleshooting
+- [architecture.md](./architecture.md) — Project overview, layers (including chunking and encryption), data structures and known limitations
+- [sync-flow.md](./sync-flow.md) — `SyncManager`, causal queue, drain (chunking, encryption and migrations), pull watcher and push reconcile
+- [fuse-filesystem.md](./fuse-filesystem.md) — Inode-path mapping, implemented FUSE operations, buffers (RAM/spool) and read/write flows
+
+Portuguese versions of all documents live in [pt-br/](./pt-br/).

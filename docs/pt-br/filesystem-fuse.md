@@ -1,5 +1,7 @@
 # Arquitetura: Filesystem FUSE
 
+> English version: [../fuse-filesystem.md](../fuse-filesystem.md)
+
 ## Visão Geral
 
 `GitDriveFS` é a ponte entre o kernel FUSE e o conteúdo versionado do repositório Git. Mantém um modelo hierárquico com `FileEntry` e `DirEntry` ligados por referências de inode, um alocador atômico para novos inodes criados em runtime (`create`/`mkdir`) e lógica extraída em métodos `apply_*` puros que são testáveis sem montar o kernel. Leituras consultam o write buffer do inode (se existir) e caem no blob Git do HEAD; mutações atualizam índices em memória, buffers de escrita e enfileiram `SyncOp`s para o `SyncManager`.

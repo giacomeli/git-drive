@@ -1,5 +1,7 @@
 # Arquitetura: Visão Geral
 
+> English version: [../architecture.md](../architecture.md)
+
 ## Visão Geral
 
 drive-sync é um filesystem FUSE em Rust que monta o conteúdo de um repositório Git (no branch
@@ -40,15 +42,16 @@ flowchart LR
 ```text
 drive-sync/
 ├── Cargo.toml                    # fuser, git2, tokio, clap, serde, sha2, chacha20poly1305, hkdf...
-├── CLAUDE.md                     # invariantes, armadilhas e guia para agentes
+├── AGENTS.md                     # invariantes, armadilhas e guia para agentes
 ├── README.md
-├── .github/workflows/ci.yml     # CI de verificação (espelha os comandos do CLAUDE.md)
+├── .github/workflows/ci.yml     # CI de verificação (espelha os comandos do AGENTS.md)
 ├── docs/
 │   ├── README.md
-│   ├── uso.md                    # guia passo a passo do usuário
-│   ├── arquitetura.md
-│   ├── fluxo-de-sincronizacao.md
-│   └── filesystem-fuse.md
+│   ├── usage.md                  # guia passo a passo do usuário
+│   ├── architecture.md
+│   ├── sync-flow.md
+│   ├── fuse-filesystem.md
+│   └── pt-br/                    # versões em português dos docs
 ├── src/
 │   ├── main.rs                   # CLI, dispatch de subcomandos, lifecycle do mount
 │   ├── lib.rs                    # módulos públicos p/ testes + redirect de logs
@@ -69,8 +72,7 @@ drive-sync/
 │   ├── fs_hierarchy.rs           # modelo hierárquico, buffers, chunking e cripto na visão FUSE
 │   ├── sync_flow.rs              # drain, commit, push, pull, migrações
 │   └── e2e_integration.rs        # cenários ponta-a-ponta
-├── vendor/fuser/                 # fuser 0.14 com patches locais (upstream no roadmap)
-└── specs/                        # roadmap + specs/planos/decisões por fase
+└── vendor/fuser/                 # fuser 0.14 com patches locais (upstream no roadmap)
 ```
 
 O config e a chave de criptografia vivem em `~/.config/drive-sync/` (com fallback de leitura para
@@ -218,7 +220,7 @@ pub struct Config {
 1. Atualizar `Config::default` para espelhar o valor.
 1. Propagar em `src/main.rs` (parâmetro de construtor ou setter pós-construção, padrão
    `set_chunking`/`set_crypto`).
-1. Atualizar as tabelas em `README.md`, `docs/uso.md` e `CLAUDE.md`.
+1. Atualizar as tabelas em `README.md`, `docs/usage.md` (e `./uso.md`) e `AGENTS.md`.
 1. Adicionar teste em `src/config.rs::tests` cobrindo default e override.
 
 ## Como adicionar uma nova operação de mutação
