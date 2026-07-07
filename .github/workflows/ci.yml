@@ -1,8 +1,9 @@
-# CI de verificação (Fase 3, fatia 1).
+# Verification CI (Phase 3, slice 1).
 #
-# Cláusula de desacoplamento: este workflow apenas EXECUTA os mesmos comandos
-# da seção "Comandos de verificação" do CLAUDE.md. Nenhum código do software
-# conhece ou depende do CI — se este arquivo sumir, nada no drive-sync muda.
+# Decoupling clause: this workflow only RUNS the same commands from the
+# "Verification commands" section of CLAUDE.md. No code in the software knows
+# about or depends on the CI — if this file disappears, nothing in drive-sync
+# changes.
 name: ci
 
 on:
@@ -26,9 +27,9 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
-      - name: macFUSE (SDK para o build.rs do vendor/fuser; kext nao carrega em CI)
+      - name: macFUSE (SDK for the vendor/fuser build.rs; the kext does not load in CI)
         run: brew install --cask macfuse
-      - name: Suite completa (mesma do CLAUDE.md)
+      - name: Full suite (same as CLAUDE.md)
         run: cargo test
 
   clippy:
@@ -42,19 +43,19 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('Cargo.lock') }}
-      - name: macFUSE (SDK para o build.rs do vendor/fuser; kext nao carrega em CI)
+      - name: macFUSE (SDK for the vendor/fuser build.rs; the kext does not load in CI)
         run: brew install --cask macfuse
-      # Dois passos de proposito: o primeiro falha o job em erro de compilacao
-      # (um filtro com grep mascarava esse caso — aprendido no primeiro run);
-      # o segundo aplica a regua do projeto (warning fora de vendor/ = falha).
-      - name: Clippy compila
+      # Two steps on purpose: the first fails the job on a compilation error
+      # (a grep filter used to mask that case — learned in the first run);
+      # the second applies the project rule (warning outside vendor/ = failure).
+      - name: Clippy compiles
         run: cargo clippy --all-targets
-      - name: Warnings fora de vendor/ sao regressao
+      - name: Warnings outside vendor/ are a regression
         run: |
           cargo clippy --all-targets --message-format short 2>&1 \
             | grep -E '^(src|tests)/.*(warning|error)' > clippy-projeto.txt || true
           if [ -s clippy-projeto.txt ]; then
-            echo "Warnings novos fora de vendor/:"
+            echo "New warnings outside vendor/:"
             cat clippy-projeto.txt
             exit 1
           fi
@@ -63,17 +64,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Padroes proibidos da Fase 0
+      - name: Phase 0 forbidden patterns
         run: |
           ! grep -rn "op_priority" src/
           ! grep -n "unwrap_or(&self.alloc_inode" src/fs.rs
-      - name: Clausula de desacoplamento (software nao conhece o CI)
+      - name: Decoupling clause (the software does not know about the CI)
         run: |
           ! grep -rnE 'GITHUB_|env!\("CI"\)|var\("CI"\)' src/ tests/
 
-  # MSRV verificada no macOS (plataforma suportada hoje). No Linux, deps
-  # transitivas da arvore GTK exigem edition2024 (cargo 1.85+) — a MSRV Linux
-  # sera definida na fatia do port.
+  # MSRV verified on macOS (the platform supported today). On Linux, transitive
+  # deps of the GTK tree require edition2024 (cargo 1.85+) — the Linux MSRV
+  # will be defined in the port slice.
   msrv:
     runs-on: macos-latest
     steps:
@@ -85,19 +86,20 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('Cargo.lock') }}
-      - name: macFUSE (SDK para o build.rs do vendor/fuser; kext nao carrega em CI)
+      - name: macFUSE (SDK for the vendor/fuser build.rs; the kext does not load in CI)
         run: brew install --cask macfuse
-      # 1.85 e o piso real do lock atual: unicode-segmentation 1.13.3 declara
-      # rust-version 1.85 (litemap/zerofrom pedem 1.81; o formato v4 do lock
-      # ja pedia 1.78). Validado com `rustup run 1.85 cargo check --all-targets`.
-      - name: MSRV 1.85 declarada no projeto
+      # 1.85 is the real floor of the current lock: unicode-segmentation 1.13.3
+      # declares rust-version 1.85 (litemap/zerofrom ask for 1.81; the lock's
+      # v4 format already required 1.78). Validated with
+      # `rustup run 1.85 cargo check --all-targets`.
+      - name: MSRV 1.85 declared by the project
         run: |
           rustup toolchain install 1.85 --profile minimal
           rustup run 1.85 cargo check --all-targets
 
-  # Promovido a gate em 06-07-2026: a suite completa passou no primeiro run
-  # verde. O que resta do port Linux e runtime (mount fuse3, systemd,
-  # notificacoes) — fatia futura da Fase 3.
+  # Promoted to a gate on 2026-07-06: the full suite passed on the first green
+  # run. What remains of the Linux port is runtime (fuse3 mount, systemd,
+  # notifications) — a future slice of Phase 3.
   test-linux:
     runs-on: ubuntu-latest
     steps:
@@ -109,9 +111,9 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
-      - name: Dependencias de sistema (GTK para tray-icon/tao, libfuse3 para o vendor/fuser)
+      - name: System dependencies (GTK for tray-icon/tao, libfuse3 for vendor/fuser)
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libfuse3-dev
-      - name: Suite no Linux (fumaca)
+      - name: Suite on Linux (smoke)
         run: cargo test

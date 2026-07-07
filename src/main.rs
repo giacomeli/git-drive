@@ -8,26 +8,26 @@ use fuser::MountOption;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Instala um panic hook que loga o backtrace completo antes do unwind chegar
-/// no boundary da sessão FUSE e matar o processo. Sem isso, panics em
-/// callbacks FUSE só imprimem `panicked at ...` sem stack — inviabilizando
-/// localizar a origem do `Instant + Duration` overflow que mata o daemon
-/// durante paste de muitos arquivos no Finder.
+/// Installs a panic hook that logs the full backtrace before the unwind
+/// reaches the FUSE session boundary and kills the process. Without it,
+/// panics in FUSE callbacks only print `panicked at ...` with no stack —
+/// making it impossible to locate the origin of the `Instant + Duration`
+/// overflow that kills the daemon while pasting many files in Finder.
 fn install_panic_hook() {
-    // Forçar backtrace mesmo se o usuário não setou RUST_BACKTRACE no env.
+    // Force a backtrace even if the user did not set RUST_BACKTRACE in the env.
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "full") };
     }
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         eprintln!(
-            "[{}] PANIC capturado pelo hook — daemon vai morrer logo em seguida",
+            "[{}] PANIC caught by the hook — the daemon is about to die",
             log_ts()
         );
         eprintln!("[{}] PANIC info: {}", log_ts(), info);
         let bt = std::backtrace::Backtrace::force_capture();
         eprintln!("[{}] PANIC backtrace:\n{}", log_ts(), bt);
-        // Delega pro default hook também (mantém comportamento padrão de print).
+        // Also delegate to the default hook (keeps the standard print behavior).
         default_hook(info);
     }));
 }
@@ -35,28 +35,28 @@ fn install_panic_hook() {
 fn cli() -> Command {
     Command::new("drive-sync")
         .version("0.1.0")
-        .about("Sistema de arquivos versionado com Git")
+        .about("Git-backed versioned filesystem")
         .subcommand_negates_reqs(true)
         .subcommand(
             Command::new("status")
-                .about("Mostra o estado do daemon de sincronização")
+                .about("Show the sync daemon state")
                 .arg(
                     Arg::new("file")
                         .long("file")
                         .value_name("PATH")
-                        .help("Caminho do status.json (padrão: ./logs/status.json, depois o padrão do macOS)"),
+                        .help("Path to status.json (default: ./logs/status.json, then the macOS default)"),
                 ),
         )
         .subcommand(
             Command::new("install")
-                .about("Instala o LaunchAgent: monta o drive automaticamente no login")
+                .about("Install the LaunchAgent: mounts the drive automatically at login")
                 .arg(
                     Arg::new("repo")
                         .short('r')
                         .long("repo")
                         .value_name("REPO_PATH")
                         .required(true)
-                        .help("Repositório Git de armazenamento"),
+                        .help("Storage Git repository"),
                 )
                 .arg(
                     Arg::new("mount")
@@ -64,44 +64,44 @@ fn cli() -> Command {
                         .long("mount")
                         .value_name("MOUNT_PATH")
                         .required(true)
-                        .help("Ponto de montagem do drive"),
+                        .help("Drive mount point"),
                 )
                 .arg(
                     Arg::new("with-tray")
                         .long("with-tray")
-                        .help("Registra também a tray para subir no login")
+                        .help("Also register the tray to start at login")
                         .action(clap::ArgAction::SetTrue),
                 ),
         )
-        .subcommand(Command::new("uninstall").about("Para o daemon e remove o LaunchAgent"))
+        .subcommand(Command::new("uninstall").about("Stop the daemon and remove the LaunchAgent"))
         .subcommand(
             Command::new("key")
-                .about("Gerencia a chave da criptografia em repouso")
+                .about("Manage the at-rest encryption key")
                 .subcommand(
                     Command::new("generate")
-                        .about("Gera um arquivo de chave novo (64 hex, permissão 0600)")
+                        .about("Generate a new key file (64 hex, permission 0600)")
                         .arg(
                             Arg::new("out")
                                 .long("out")
                                 .value_name("PATH")
-                                .help("Onde gravar a chave (padrão: ~/.config/drive-sync/drive.key)"),
+                                .help("Where to write the key (default: ~/.config/drive-sync/drive.key)"),
                         )
                         .arg(
                             Arg::new("force")
                                 .long("force")
-                                .help("Sobrescreve chave existente (a antiga será PERDIDA — dados cifrados com ela ficam ilegíveis)")
+                                .help("Overwrite an existing key (the old one is LOST — data encrypted with it becomes unreadable)")
                                 .action(clap::ArgAction::SetTrue),
                         ),
                 ),
         )
         .subcommand(
             Command::new("tray")
-                .about("Ícone de status na barra de menus (monitor do daemon)")
+                .about("Status icon in the menu bar (daemon monitor)")
                 .arg(
                     Arg::new("file")
                         .long("file")
                         .value_name("PATH")
-                        .help("Caminho do status.json (padrão: ./logs/status.json, depois o padrão do macOS)"),
+                        .help("Path to status.json (default: ./logs/status.json, then the macOS default)"),
                 ),
         )
         .arg(
@@ -110,7 +110,7 @@ fn cli() -> Command {
                 .long("repo")
                 .value_name("REPO_PATH")
                 .required(true)
-                .help("Caminho para o repositório Git"),
+                .help("Path to the Git repository"),
         )
         .arg(
             Arg::new("mount")
@@ -118,39 +118,39 @@ fn cli() -> Command {
                 .long("mount")
                 .value_name("MOUNT_PATH")
                 .required(true)
-                .help("Diretório onde será montado o sistema FUSE"),
+                .help("Directory where the FUSE filesystem will be mounted"),
         )
         .arg(
             Arg::new("verbose")
                 .short('v')
                 .long("verbose")
-                .help("Espelha os logs no terminal além de gravar no log dir")
+                .help("Mirror logs to the terminal in addition to writing to the log dir")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("config")
                 .long("config")
                 .value_name("PATH")
-                .help("Caminho do config.json (padrão: ./config.json, depois ~/.config/drive-sync/config.json)"),
+                .help("Path to config.json (default: ./config.json, then ~/.config/drive-sync/config.json)"),
         )
         .arg(
             Arg::new("log-dir")
                 .long("log-dir")
                 .value_name("DIR")
-                .help("Diretório dos logs da sessão (padrão: ./logs)"),
+                .help("Session log directory (default: ./logs)"),
         )
         .arg(
             Arg::new("status-file")
                 .long("status-file")
                 .value_name("PATH")
-                .help("Onde gravar o status.json (padrão: <log-dir>/status.json)"),
+                .help("Where to write status.json (default: <log-dir>/status.json)"),
         )
 }
 
-/// main síncrono: subcomandos utilitários rodam sem runtime; o modo mount cria
-/// o runtime tokio explicitamente e conduz o lifecycle (mount, sinais, unmount,
-/// drain final). A tray (subcomando futuro) exige a main thread livre de
-/// runtime — este dispatch garante isso.
+/// Synchronous main: utility subcommands run without a runtime; mount mode
+/// creates the tokio runtime explicitly and drives the lifecycle (mount,
+/// signals, unmount, final drain). The tray requires the main thread to be
+/// free of any runtime — this dispatch guarantees that.
 fn main() -> anyhow::Result<()> {
     let matches = cli().get_matches();
 
@@ -176,17 +176,17 @@ fn main() -> anyhow::Result<()> {
                 .map(PathBuf::from)
                 .unwrap_or_else(drive_sync::paths::standard_key_path);
             drive_sync::crypt::generate_key_file(&out, gen.get_flag("force"))?;
-            println!("chave gerada em: {}", out.display());
-            println!("IMPORTANTE: sem esta chave os dados cifrados são IRRECUPERÁVEIS — faça backup dela fora do repo.");
+            println!("key generated at: {}", out.display());
+            println!("IMPORTANT: without this key the encrypted data is UNRECOVERABLE — back it up outside the repo.");
             return Ok(());
         }
-        anyhow::bail!("uso: drive-sync key generate [--out <path>] [--force]");
+        anyhow::bail!("usage: drive-sync key generate [--out <path>] [--force]");
     }
     if let Some(sub) = matches.subcommand_matches("tray") {
         let file =
             drive_sync::paths::resolve_status_for_read(sub.get_one::<String>("file").map(String::as_str));
-        // A tray toma a main thread com o event loop do AppKit — por isso o
-        // dispatch acontece antes de qualquer runtime tokio.
+        // The tray takes over the main thread with the AppKit event loop —
+        // that is why the dispatch happens before any tokio runtime.
         return drive_sync::tray::run(file);
     }
 
@@ -211,22 +211,22 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| log_dir.join("status.json"));
 
-    // Depois do parse dos args (pra `--help`/`--version` ainda saírem no
-    // terminal): redirecionar stdout/stderr pro log da sessão. Isso captura
-    // nossos println!/eprintln! E o output do crate `log` (fuser via
-    // env_logger) num único arquivo. Anuncia o path em `/dev/tty`.
+    // After arg parsing (so `--help`/`--version` still print to the
+    // terminal): redirect stdout/stderr to the session log. This captures
+    // our println!/eprintln! AND the `log` crate output (fuser via
+    // env_logger) in a single file. Announces the path on `/dev/tty`.
     let log_path = drive_sync::redirect_io_to_log_file(verbose, &log_dir).ok();
     if let Some(ref path) = log_path {
         if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
-            let _ = writeln!(tty, "log em: {}", path.display());
+            let _ = writeln!(tty, "log at: {}", path.display());
         }
     }
 
-    // Hook precisa rodar DEPOIS do redirect pra que o stderr caia no arquivo.
+    // The hook must run AFTER the redirect so stderr lands in the file.
     install_panic_hook();
 
-    // env_logger respeita RUST_LOG. Com RUST_LOG=fuser=debug, a gente vê o
-    // opcode cru que macFUSE envia.
+    // env_logger honors RUST_LOG. With RUST_LOG=fuser=debug, we can see the
+    // raw opcode macFUSE sends.
     env_logger::init();
 
     let config = Config::load_from(&config_path);
@@ -247,7 +247,7 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     };
     println!("[{}] boot: branch={}", log_ts(), branch);
 
-    // Runtime explícito: os watchers do SyncManager precisam do contexto tokio.
+    // Explicit runtime: the SyncManager watchers need the tokio context.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -264,19 +264,20 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
         config.pull_interval_secs,
     );
     let sync_handle = sync.clone();
-    // Criptografia em repouso (Fase 2.7): habilitada sem chave legível ABORTA
-    // o boot — degradar para claro publicaria plaintext acreditando cifrar.
+    // At-rest encryption (Phase 2.7): enabled without a readable key ABORTS
+    // the boot — degrading to cleartext would publish plaintext while
+    // believing it encrypts.
     let crypto: Option<std::sync::Arc<drive_sync::crypt::Crypto>> = if config.encryption_enabled {
         let key_path =
             drive_sync::paths::resolve_key_for_read(config.encryption_key_file.as_deref());
         let master = drive_sync::crypt::load_key_file(&key_path).map_err(|e| {
             anyhow::anyhow!(
-                "criptografia habilitada no config mas a chave não pôde ser carregada: {} — gere com `drive-sync key generate`",
+                "encryption enabled in config but the key could not be loaded: {} — generate one with `drive-sync key generate`",
                 e
             )
         })?;
         println!(
-            "[{}] boot: criptografia HABILITADA (chave: {})",
+            "[{}] boot: encryption ENABLED (key: {})",
             log_ts(),
             key_path.display()
         );
@@ -284,8 +285,8 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
             drive_sync::crypt::Crypto::from_master_key(&master),
         ))
     } else {
-        // Desligado no config: se a chave existir, fica disponível SÓ para a
-        // migração de volta ao claro (worktree pode ainda estar cifrado).
+        // Disabled in config: if the key exists, it stays available ONLY for
+        // the migration back to cleartext (the worktree may still be encrypted).
         let key_path =
             drive_sync::paths::resolve_key_for_read(config.encryption_key_file.as_deref());
         if key_path.exists() {
@@ -294,7 +295,7 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
                     drive_sync::crypt::Crypto::from_master_key(&master),
                 )));
                 println!(
-                    "[{}] boot: criptografia desligada; chave presente — migração para claro ativa",
+                    "[{}] boot: encryption disabled; key present — migration to cleartext active",
                     log_ts()
                 );
             }
@@ -302,13 +303,13 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
         None
     };
     sync.set_crypto(crypto.clone());
-    // Chunking de arquivos grandes (Fase 2.6): nenhum blob acima do limiar
-    // chega ao commit — vira manifest + .chunks/.
+    // Large-file chunking (Phase 2.6): no blob above the threshold reaches
+    // the commit — it becomes a manifest + .chunks/.
     sync.set_chunking(
         config.chunk_threshold_mb * 1024 * 1024,
         config.chunk_size_mb * 1024 * 1024,
     );
-    // Status observável (lido por `drive-sync status` e pela tray)
+    // Observable status (read by `drive-sync status` and by the tray)
     sync.enable_status_file(status_file);
     sync.status_state().set_runtime_info(
         &mount_path,
@@ -328,42 +329,42 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
         crypto,
     )?;
 
-    // Opções macFUSE-específicas:
-    // - `local`: trata o volume como disco local em vez de network share. Sem
-    //   isso, Finder cacheia listagem e não reage a mudanças que ele mesmo
-    //   acabou de fazer (bug conhecido com mounts marcados como "remoto").
-    // - `volname=drive-sync`: nome amigável em Finder no lugar de "macFUSE Volume 0".
-    // - `noappledouble`: kernel não gera arquivos `._*` (AppleDouble) no mount.
-    //   Reforça nosso filtro de ephemeral no sync, mas como fallback nativo.
+    // macFUSE-specific options:
+    // - `local`: treats the volume as a local disk instead of a network share.
+    //   Without it, Finder caches listings and does not react to changes it
+    //   just made itself (known bug with mounts flagged as "remote").
+    // - `volname=drive-sync`: friendly name in Finder instead of "macFUSE Volume 0".
+    // - `noappledouble`: the kernel does not generate `._*` (AppleDouble) files
+    //   on the mount. Reinforces our ephemeral filter in sync, as a native fallback.
     #[allow(unused_mut)]
     let mut options = vec![MountOption::FSName("gitdrive".to_string())];
     #[cfg(target_os = "macos")]
     {
-        // AllowOther e AutoUnmount só no macOS: no Linux, o fusermount3
-        // exige `user_allow_other` no /etc/fuse.conf para allow_other — e o
-        // AutoUnmount do fuser INJETA allow_other implicitamente. O shutdown
-        // ordenado já desmonta; zumbi pós-crash é recuperado no boot.
+        // AllowOther and AutoUnmount are macOS-only: on Linux, fusermount3
+        // requires `user_allow_other` in /etc/fuse.conf for allow_other — and
+        // fuser's AutoUnmount implicitly INJECTS allow_other. The ordered
+        // shutdown already unmounts; a post-crash zombie is recovered at boot.
         options.push(MountOption::AutoUnmount);
         options.push(MountOption::AllowOther);
         options.push(MountOption::CUSTOM("local".to_string()));
         options.push(MountOption::CUSTOM("volname=drive-sync".to_string()));
         options.push(MountOption::CUSTOM("noappledouble".to_string()));
-        // daemon_timeout default do macFUSE é 60s. Em paste de pasta com muitas
-        // sub-pastas/arquivos, o ciclo CREATE+WRITE+FLUSH+RELEASE pode exceder
-        // esse tempo se houver pressão de I/O. 300s dá margem.
+        // macFUSE's default daemon_timeout is 60s. When pasting a folder with
+        // many subfolders/files, the CREATE+WRITE+FLUSH+RELEASE cycle can
+        // exceed that under I/O pressure. 300s gives headroom.
         options.push(MountOption::CUSTOM("daemon_timeout=300".to_string()));
     }
 
-    // Recuperação pós-crash: kill -9 (ou panic) não roda o AutoUnmount e
-    // deixa um mount FUSE zumbi que bloqueia o remount — o KeepAlive do
-    // launchd ficaria religando um daemon que falha para sempre. Detecta e
-    // força o unmount antes de montar.
+    // Post-crash recovery: kill -9 (or a panic) does not run AutoUnmount and
+    // leaves a zombie FUSE mount that blocks remounting — launchd's KeepAlive
+    // would keep restarting a daemon that fails forever. Detect and force the
+    // unmount before mounting.
     prepare_mountpoint(&mount_path)?;
 
-    // Sessão em background: o main vira o dono do lifecycle e conduz o
-    // shutdown ordenado (decisões 6 e 7 da Fase 2).
+    // Background session: main owns the lifecycle and drives the ordered
+    // shutdown (decisions 6 and 7 of Phase 2).
     let session = fuser::spawn_mount2(fs, &mount_path, &options)?;
-    println!("[{}] boot: volume montado em {}", log_ts(), mount_path);
+    println!("[{}] boot: volume mounted at {}", log_ts(), mount_path);
     sync_handle.enable_notifications();
     sync_handle
         .notifier()
@@ -371,8 +372,8 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
             mount: mount_path.clone(),
         });
 
-    // Espera por SIGTERM/SIGINT (launchd/Ctrl-C) ou pelo fim externo da
-    // sessão (eject no Finder / umount).
+    // Wait for SIGTERM/SIGINT (launchd/Ctrl-C) or for the session to end
+    // externally (eject in Finder / umount).
     let ejected = runtime.block_on(async {
         use tokio::signal::unix::{signal, SignalKind};
         let mut term = signal(SignalKind::terminate())?;
@@ -380,16 +381,16 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
         loop {
             tokio::select! {
                 _ = term.recv() => {
-                    println!("[{}] shutdown: SIGTERM recebido", log_ts());
+                    println!("[{}] shutdown: SIGTERM received", log_ts());
                     return Ok::<bool, anyhow::Error>(false);
                 }
                 _ = int.recv() => {
-                    println!("[{}] shutdown: SIGINT recebido", log_ts());
+                    println!("[{}] shutdown: SIGINT received", log_ts());
                     return Ok(false);
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                     if session.guard.is_finished() {
-                        println!("[{}] shutdown: volume ejetado externamente", log_ts());
+                        println!("[{}] shutdown: volume ejected externally", log_ts());
                         return Ok(true);
                     }
                 }
@@ -397,11 +398,11 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
         }
     })?;
 
-    // Ordem do shutdown (decisão 7): unmount ANTES do drain final — o unmount
-    // força o kernel a entregar FLUSH/RELEASE de fds abertos, e essas ops
-    // entram na fila a tempo de serem drenadas.
+    // Shutdown order (decision 7): unmount BEFORE the final drain — the
+    // unmount forces the kernel to deliver FLUSH/RELEASE for open fds, and
+    // those ops enter the queue in time to be drained.
     if !ejected {
-        println!("[{}] shutdown: desmontando {}", log_ts(), mount_path);
+        println!("[{}] shutdown: unmounting {}", log_ts(), mount_path);
     }
     session.join();
     sync_handle.drain_now();
@@ -409,15 +410,16 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     sync_handle
         .notifier()
         .notify(drive_sync::notify::NotifyEvent::Stopped);
-    println!("[{}] shutdown: parada limpa concluída", log_ts());
+    println!("[{}] shutdown: clean stop completed", log_ts());
 
     Ok(())
 }
 
-/// Garante que o mountpoint existe e está livre. Se a tabela de mounts já
-/// lista o path: sonda com `read_dir` — mount zumbi (crash anterior) falha e
-/// leva `umount -f`; mount saudável significa outra instância viva e o boot
-/// aborta com erro claro em vez de brigar pelo mountpoint.
+/// Ensures the mountpoint exists and is free. If the mount table already
+/// lists the path: probe with `read_dir` — a zombie mount (previous crash)
+/// fails and gets `umount -f`; a healthy mount means another live instance,
+/// and the boot aborts with a clear error instead of fighting over the
+/// mountpoint.
 fn prepare_mountpoint(mount: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(mount)?;
     let canonical = std::fs::canonicalize(mount)
@@ -435,18 +437,18 @@ fn prepare_mountpoint(mount: &str) -> anyhow::Result<()> {
 
     match std::fs::read_dir(&canonical) {
         Ok(_) => anyhow::bail!(
-            "já existe um volume saudável montado em {} — pare o outro daemon ou desmonte antes",
+            "a healthy volume is already mounted at {} — stop the other daemon or unmount it first",
             canonical
         ),
         Err(e) => {
             println!(
-                "[{}] boot: mount zumbi detectado em {} ({}) — forçando unmount",
+                "[{}] boot: zombie mount detected at {} ({}) — forcing unmount",
                 log_ts(),
                 canonical,
                 e
             );
-            // Linux: mounts FUSE de usuário desmontam via fusermount3 -u;
-            // `umount` direto costuma exigir root.
+            // Linux: user FUSE mounts are unmounted via fusermount3 -u;
+            // plain `umount` usually requires root.
             #[cfg(not(target_os = "macos"))]
             {
                 let _ = std::process::Command::new("fusermount3")
@@ -460,19 +462,19 @@ fn prepare_mountpoint(mount: &str) -> anyhow::Result<()> {
                 .status()?;
             if !status.success() {
                 anyhow::bail!(
-                    "não foi possível desmontar o mount zumbi em {} — rode `umount -f {}` manualmente",
+                    "could not unmount the zombie mount at {} — run `umount -f {}` manually",
                     canonical,
                     canonical
                 );
             }
-            // Dar um instante para o kernel liberar o mountpoint.
+            // Give the kernel a moment to release the mountpoint.
             std::thread::sleep(std::time::Duration::from_millis(300));
             Ok(())
         }
     }
 }
 
-/// `drive-sync status`: lê o status.json gravado pelo daemon e formata.
+/// `drive-sync status`: reads the status.json written by the daemon and formats it.
 fn run_status(file: &Path) -> anyhow::Result<()> {
     use drive_sync::status;
     match status::read_from(file) {
@@ -481,9 +483,9 @@ fn run_status(file: &Path) -> anyhow::Result<()> {
             print!("{}", status::format_status(&s, status::now_unix(), alive));
         }
         Err(e) => {
-            println!("Sem status disponível ({}).", e);
+            println!("No status available ({}).", e);
             println!(
-                "Monte um repositório primeiro: drive-sync -r <repo> -m <mount> — o daemon grava o status.json no log dir (padrão: logs/ do diretório de onde foi lançado). Use --file para apontar outro caminho."
+                "Mount a repository first: drive-sync -r <repo> -m <mount> — the daemon writes status.json to the log dir (default: logs/ of the directory it was launched from). Use --file to point to another path."
             );
         }
     }

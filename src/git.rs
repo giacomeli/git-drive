@@ -19,16 +19,16 @@ pub fn read_file_at_commit(repo: &Repository, commit: &git2::Commit, file_path: 
     Ok(blob.content().to_vec())
 }
 
-/// Tipo de uma entrada de arquivo numa tree do Git. Symlink é um blob com
-/// filemode 120000 cujo conteúdo é o texto do alvo — sem distinguir o
-/// filemode, um symlink seria achatado em arquivo regular.
+/// Kind of a file entry in a Git tree. A symlink is a blob with filemode
+/// 120000 whose content is the target text — without distinguishing the
+/// filemode, a symlink would be flattened into a regular file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
     Regular,
     Symlink,
 }
 
-/// Entrada de arquivo listada de uma tree (blob), com path completo.
+/// File entry listed from a tree (blob), with its full path.
 #[derive(Debug, Clone)]
 pub struct ListedFile {
     pub path: String,
@@ -36,7 +36,7 @@ pub struct ListedFile {
     pub kind: FileKind,
 }
 
-/// Filemode de symlink nas trees do Git (S_IFLNK).
+/// Symlink filemode in Git trees (S_IFLNK).
 const FILEMODE_SYMLINK: i32 = 0o120000;
 
 pub fn list_files_at_commit(
@@ -71,8 +71,8 @@ pub fn list_files_at_commit(
     Ok(files)
 }
 
-/// Lista diretórios (entries do tipo Tree) em profundidade, retornando
-/// paths completos sem barra final (ex: "foo", "foo/bar").
+/// Lists directories (Tree-type entries) depth-first, returning full
+/// paths without a trailing slash (e.g. "foo", "foo/bar").
 pub fn list_dirs_at_commit(
     _repo: &Repository,
     commit: &git2::Commit,
@@ -93,9 +93,9 @@ pub fn list_dirs_at_commit(
     Ok(dirs)
 }
 
-/// Stage todo o working tree (add -A equivalente) e cria um commit no branch
-/// indicado com a identidade fornecida. Retorna `Ok(None)` se não há diferença
-/// entre a tree do working directory e a do HEAD (nada a commitar).
+/// Stages the entire working tree (add -A equivalent) and creates a commit on
+/// the given branch with the provided identity. Returns `Ok(None)` if there is
+/// no difference between the working directory tree and HEAD's (nothing to commit).
 pub fn commit_working_tree(
     repo: &Repository,
     branch: &str,
@@ -104,13 +104,13 @@ pub fn commit_working_tree(
     message: &str,
 ) -> Result<Option<git2::Oid>, Error> {
     let mut index = repo.index()?;
-    // Callback que pula paths nested `.git/` quando o user cola um repositório
-    // git completo dentro do mount (ex.: `athena-docs/` com `.git/objects/...`).
-    // Sem o filtro, libgit2 trata `athena-docs/` como submodule sem registro
-    // em `.gitmodules` e retorna `invalid path: 'athena-docs/'; class=Index (10)`.
-    // O commit inteiro falhava em loop, deixando os arquivos como untracked.
-    // Com o filtro, o conteúdo de `athena-docs/` (Dockerfile, _media/, etc.) é
-    // commitado normalmente; só o subdir `.git/` interno é deixado de fora.
+    // Callback that skips nested `.git/` paths when the user pastes a complete
+    // git repository inside the mount (e.g. `athena-docs/` with `.git/objects/...`).
+    // Without the filter, libgit2 treats `athena-docs/` as a submodule with no
+    // entry in `.gitmodules` and returns `invalid path: 'athena-docs/'; class=Index (10)`.
+    // The whole commit failed in a loop, leaving the files untracked.
+    // With the filter, the contents of `athena-docs/` (Dockerfile, _media/, etc.)
+    // are committed normally; only the inner `.git/` subdir is left out.
     let mut filter = |path: &std::path::Path, _matched: &[u8]| -> i32 {
         let s = path.to_string_lossy();
         if s == ".git"
@@ -146,8 +146,8 @@ pub fn commit_working_tree(
     Ok(Some(oid))
 }
 
-/// Chave SSH em disco para daemons sem ssh-agent (systemd/launchd não têm
-/// SSH_AUTH_SOCK). Preferência: id_ed25519, depois id_rsa.
+/// On-disk SSH key for daemons without an ssh-agent (systemd/launchd have no
+/// SSH_AUTH_SOCK). Preference: id_ed25519, then id_rsa.
 fn discover_ssh_key(home: &Path) -> Option<(std::path::PathBuf, Option<std::path::PathBuf>)> {
     for name in ["id_ed25519", "id_rsa"] {
         let private = home.join(".ssh").join(name);
@@ -159,8 +159,8 @@ fn discover_ssh_key(home: &Path) -> Option<(std::path::PathBuf, Option<std::path
     None
 }
 
-/// Callback de credenciais compartilhado por push e fetch: token HTTPS >
-/// ssh-agent > chave SSH em disco > default.
+/// Credential callback shared by push and fetch: HTTPS token >
+/// ssh-agent > on-disk SSH key > default.
 fn credential_callback(
     token: Option<&str>,
     username_from_url: Option<&str>,
@@ -186,9 +186,9 @@ fn credential_callback(
         .or_else(|_| git2::Cred::default())
 }
 
-/// Dá push de `refs/heads/<branch>:refs/heads/<branch>` para o remote indicado.
-/// Se `token` for Some, usa autenticação HTTPS userpass ("x-access-token").
-/// Caso contrário, delega ao sistema (ssh-agent / credential helper).
+/// Pushes `refs/heads/<branch>:refs/heads/<branch>` to the given remote.
+/// If `token` is Some, uses HTTPS userpass authentication ("x-access-token").
+/// Otherwise, delegates to the system (ssh-agent / credential helper).
 pub fn push_to_remote(
     repo: &Repository,
     branch: &str,
@@ -201,11 +201,11 @@ pub fn push_to_remote(
     callbacks.credentials(move |_url, username_from_url, _allowed| {
         credential_callback(token_owned.as_deref(), username_from_url)
     });
-    // git2 retorna Ok no nível de transporte mesmo quando o servidor REJEITA a
-    // atualização do ref (ex.: GH001 do GitHub para blob > 100 MB) — a rejeição
-    // só chega pelo callback push_update_reference. Sem coletá-la, o drain
-    // logava "push ok" com o remote parado e o retry de reconciliação nunca
-    // disparava (incidente da validação de 03-07-2026).
+    // git2 returns Ok at the transport level even when the server REJECTS the
+    // ref update (e.g. GitHub's GH001 for blobs > 100 MB) — the rejection only
+    // arrives through the push_update_reference callback. Without collecting
+    // it, the drain logged "push ok" with the remote stalled and the reconcile
+    // retry never fired (incident from the 2026-07-03 validation).
     let rejections: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
         std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let rejections_cb = rejections.clone();
@@ -224,15 +224,15 @@ pub fn push_to_remote(
     let rejections = rejections.borrow();
     if !rejections.is_empty() {
         return Err(Error::from_str(&format!(
-            "push rejeitado pelo remote: {}",
+            "push rejected by remote: {}",
             rejections.join("; ")
         )));
     }
     Ok(())
 }
 
-/// Faz `git fetch` do remote indicado (apenas o branch requerido). Reutiliza
-/// a mesma estratégia de credenciais de `push_to_remote`.
+/// Runs `git fetch` against the given remote (only the required branch).
+/// Reuses the same credential strategy as `push_to_remote`.
 pub fn fetch_remote(
     repo: &Repository,
     branch: &str,
@@ -250,12 +250,12 @@ pub fn fetch_remote(
     remote.fetch(&[branch], Some(&mut fetch_opts), None)
 }
 
-/// Tenta aplicar um fast-forward do `origin/<branch>` sobre o HEAD local.
+/// Attempts to fast-forward the local HEAD to `origin/<branch>`.
 ///
-/// - `Ok(true)` se um fast-forward foi aplicado (HEAD e working tree avançaram).
-/// - `Ok(false)` se o local já está na mesma revisão do remote.
-/// - `Err(_)` se os históricos divergiram (merge real necessário) ou em caso
-///   de erro de I/O / referência ausente.
+/// - `Ok(true)` if a fast-forward was applied (HEAD and working tree advanced).
+/// - `Ok(false)` if the local side is already at the remote revision.
+/// - `Err(_)` if the histories diverged (a real merge is needed) or on
+///   I/O errors / missing reference.
 pub fn merge_ff_only(repo: &Repository, branch: &str) -> Result<bool, Error> {
     let remote_ref_name = format!("refs/remotes/origin/{}", branch);
     let remote_ref = repo.find_reference(&remote_ref_name)?;
@@ -267,7 +267,7 @@ pub fn merge_ff_only(repo: &Repository, branch: &str) -> Result<bool, Error> {
     }
     if !analysis.is_fast_forward() {
         return Err(Error::from_str(
-            "merge não-FF: históricos divergiram, resolução manual necessária",
+            "non-fast-forward merge: histories diverged, manual resolution required",
         ));
     }
 
@@ -282,37 +282,37 @@ pub fn merge_ff_only(repo: &Repository, branch: &str) -> Result<bool, Error> {
     Ok(true)
 }
 
-/// Resultado de uma tentativa de pull (fetch + merge).
+/// Outcome of a pull attempt (fetch + merge).
 #[derive(Debug, Clone)]
 pub enum MergeOutcome {
-    /// Remote não tem o branch ou local já está na mesma revisão.
+    /// The remote lacks the branch, or the local side is already at the same revision.
     NoOp,
-    /// Fast-forward aplicado — HEAD e working tree avançaram para `refs/remotes/.../<branch>`.
+    /// Fast-forward applied — HEAD and working tree advanced to `refs/remotes/.../<branch>`.
     FastForwarded,
-    /// Merge 3-way aplicado sem conflitos, com commit de merge criado.
+    /// 3-way merge applied without conflicts, with a merge commit created.
     Merged,
-    /// Merge 3-way com conflitos. Para cada path conflitado, a versão local foi
-    /// preservada em `<path>.<suffix>` e a versão remota foi aceita como canônica.
+    /// 3-way merge with conflicts. For each conflicted path, the local version
+    /// was preserved as `<path>.<suffix>` and the remote version was accepted as canonical.
     Conflicted {
-        /// Paths originais que conflitavam (antes da resolução).
+        /// Original paths that were in conflict (before resolution).
         resolved: Vec<String>,
-        /// Sufixo usado para as conflicted copies (sem o `.` inicial).
+        /// Suffix used for the conflicted copies (without the leading `.`).
         suffix: String,
     },
 }
 
-/// Faz merge do `refs/remotes/<remote>/<branch>` sobre o HEAD local.
+/// Merges `refs/remotes/<remote>/<branch>` into the local HEAD.
 ///
-/// Comportamento:
-/// - Se o remote não tem o branch ou já estamos na mesma revisão → `NoOp`.
-/// - Se pode ser fast-forward → aplica e retorna `FastForwarded`.
-/// - Se é divergência real → tenta merge 3-way.
-///   - Sem conflitos → cria merge commit e retorna `Merged`.
-///   - Com conflitos → para cada arquivo conflitado, salva a versão local
-///     em `<path>.<conflict_suffix>`, aceita a versão remota como canônica,
-///     e cria commit de merge. Retorna `Conflicted`.
+/// Behavior:
+/// - If the remote lacks the branch or we are already at the same revision -> `NoOp`.
+/// - If a fast-forward is possible -> applies it and returns `FastForwarded`.
+/// - If the histories truly diverged -> attempts a 3-way merge.
+///   - No conflicts -> creates a merge commit and returns `Merged`.
+///   - With conflicts -> for each conflicted file, saves the local version
+///     as `<path>.<conflict_suffix>`, accepts the remote version as canonical,
+///     and creates a merge commit. Returns `Conflicted`.
 ///
-/// Requer identidade (`user_name`/`user_email`) para criar merge commits.
+/// Requires an identity (`user_name`/`user_email`) to create merge commits.
 pub fn pull_and_merge(
     repo: &Repository,
     branch: &str,
@@ -343,7 +343,7 @@ pub fn pull_and_merge(
     }
 
     if !analysis.is_normal() {
-        return Err(Error::from_str("merge analysis: estado inesperado"));
+        return Err(Error::from_str("merge analysis: unexpected state"));
     }
 
     repo.merge(&[&fetch_commit], None, None)?;
@@ -353,7 +353,7 @@ pub fn pull_and_merge(
     if index.has_conflicts() {
         let workdir = repo
             .workdir()
-            .ok_or_else(|| Error::from_str("repo sem workdir (bare?) — merge inviável"))?
+            .ok_or_else(|| Error::from_str("repo has no workdir (bare?) - cannot merge"))?
             .to_path_buf();
 
         let conflicts: Vec<(Option<git2::IndexEntry>, Option<git2::IndexEntry>)> = {
@@ -368,9 +368,9 @@ pub fn pull_and_merge(
                 .as_ref()
                 .or(their.as_ref())
                 .map(|e| e.path.clone())
-                .ok_or_else(|| Error::from_str("conflito sem path identificável"))?;
+                .ok_or_else(|| Error::from_str("conflict without an identifiable path"))?;
             let path_str = String::from_utf8(path_bytes)
-                .map_err(|_| Error::from_str("path com bytes inválidos"))?;
+                .map_err(|_| Error::from_str("path contains invalid bytes"))?;
 
             if let Some(our_entry) = &our {
                 let our_blob = repo.find_blob(our_entry.id)?;
@@ -417,7 +417,7 @@ pub fn pull_and_merge(
         format!("drive-sync: merge {}/{}", remote_name, branch)
     } else {
         format!(
-            "drive-sync: merge {}/{} com {} conflito(s) — locais preservados como *.{}",
+            "drive-sync: merge {}/{} with {} conflict(s) - local versions preserved as *.{}",
             remote_name,
             branch,
             conflicted_paths.len(),
@@ -448,7 +448,7 @@ pub fn pull_and_merge(
     }
 }
 
-/// Converte o timestamp de committer de um commit em `SystemTime` (UTC).
+/// Converts a commit's committer timestamp into a `SystemTime` (UTC).
 fn commit_system_time(commit: &git2::Commit) -> std::time::SystemTime {
     let secs = commit.time().seconds();
     if secs >= 0 {
@@ -458,14 +458,14 @@ fn commit_system_time(commit: &git2::Commit) -> std::time::SystemTime {
     }
 }
 
-/// Timestamp do último commit que tocou cada path do HEAD, calculado num
-/// ÚNICO revwalk (não um walk por arquivo). Percorre do HEAD para trás,
-/// diffando cada commit contra o primeiro pai; o primeiro commit (mais
-/// recente) que toca um path define o timestamp dele. Para com teto de
-/// profundidade `depth_cap` ou quando todos os paths foram resolvidos; o
-/// resíduo recebe o timestamp do HEAD (fallback barato e determinístico).
-/// Merge commits são diffados só contra o primeiro pai — arquivos trazidos
-/// pelo merge recebem o timestamp do merge (aproximação documentada).
+/// Timestamp of the last commit that touched each path in HEAD, computed in
+/// a SINGLE revwalk (not one walk per file). Walks backwards from HEAD,
+/// diffing each commit against its first parent; the first (most recent)
+/// commit that touches a path defines its timestamp. Stops at the
+/// `depth_cap` depth limit or once every path is resolved; the remainder
+/// receives the HEAD timestamp (cheap, deterministic fallback).
+/// Merge commits are diffed only against the first parent — files brought in
+/// by the merge receive the merge's timestamp (documented approximation).
 pub fn commit_times_by_path(
     repo: &Repository,
     depth_cap: usize,
@@ -495,7 +495,7 @@ pub fn commit_times_by_path(
         let tree = commit.tree()?;
         let parent_tree = match commit.parent(0) {
             Ok(parent) => Some(parent.tree()?),
-            Err(_) => None, // commit raiz: diff contra tree vazia
+            Err(_) => None, // root commit: diff against the empty tree
         };
         let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
         for delta in diff.deltas() {
@@ -513,14 +513,14 @@ pub fn commit_times_by_path(
     Ok(out)
 }
 
-/// Lista arquivos do working tree que casam com regras de ignore
-/// (`.gitignore`, `info/exclude`, `core.excludesfile`) e NÃO estão no índice.
-/// São os candidatos a "local-only visível": existem no disco, nunca entram
-/// em commit. Symlinks vêm com `FileKind::Symlink` e size = len do alvo.
+/// Lists working tree files that match ignore rules (`.gitignore`,
+/// `info/exclude`, `core.excludesfile`) and are NOT in the index. These are
+/// the "visible local-only" candidates: they exist on disk and never enter a
+/// commit. Symlinks come with `FileKind::Symlink` and size = target length.
 pub fn list_ignored_files(repo: &Repository) -> Result<Vec<ListedFile>, Error> {
     let workdir = repo
         .workdir()
-        .ok_or_else(|| Error::from_str("repo sem workdir (bare?)"))?
+        .ok_or_else(|| Error::from_str("repo has no workdir (bare?)"))?
         .to_path_buf();
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
@@ -555,16 +555,16 @@ pub fn list_ignored_files(repo: &Repository) -> Result<Vec<ListedFile>, Error> {
                 kind: FileKind::Regular,
             });
         }
-        // Diretórios ignorados não entram: os arquivos internos já vêm
-        // individualmente via recurse_ignored_dirs.
+        // Ignored directories are not included: their inner files already
+        // arrive individually via recurse_ignored_dirs.
     }
     Ok(out)
 }
 
-/// `true` se o working tree não tem NENHUMA mudança pendente (staged,
-/// unstaged ou untracked; ignorados ficam de fora). Guarda do pull watcher:
-/// merge/checkout force só podem rodar com tree limpa — senão mudanças locais
-/// não commitadas seriam destruídas (RF6 da Fase 0).
+/// `true` if the working tree has NO pending change at all (staged, unstaged
+/// or untracked; ignored files are excluded). Pull watcher guard:
+/// merge/checkout force may only run on a clean tree — otherwise uncommitted
+/// local changes would be destroyed (RF6 of Phase 0).
 pub fn is_working_tree_clean(repo: &Repository) -> Result<bool, Error> {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
@@ -578,12 +578,12 @@ pub fn current_branch_name(repo: &Repository) -> Result<String, Error> {
     let head = repo.head()?;
     if !head.is_branch() {
         return Err(Error::from_str(
-            "HEAD está detached — drive-sync requer um branch",
+            "HEAD is detached - drive-sync requires a named branch",
         ));
     }
     head.shorthand()
         .map(|s| s.to_string())
-        .ok_or_else(|| Error::from_str("branch sem nome (shorthand vazio)"))
+        .ok_or_else(|| Error::from_str("branch has no name (empty shorthand)"))
 }
 
 #[cfg(test)]
@@ -614,7 +614,7 @@ mod tests {
         let name = current_branch_name(&repo).unwrap();
         assert!(
             name == "main" || name == "master",
-            "esperado main ou master, obtido {}",
+            "expected main or master, got {}",
             name
         );
     }
@@ -656,7 +656,7 @@ mod tests {
             .unwrap();
     }
 
-    /// Cria um symlink real no working tree e o commita (entrada 120000).
+    /// Creates a real symlink in the working tree and commits it (120000 entry).
     fn commit_symlink(repo: &Repository, relpath: &str, target: &str) {
         let workdir = repo.workdir().unwrap();
         let full = workdir.join(relpath);
@@ -689,7 +689,7 @@ mod tests {
         let link = files.iter().find(|f| f.path == "link.txt").unwrap();
         assert_eq!(regular.kind, FileKind::Regular);
         assert_eq!(link.kind, FileKind::Symlink);
-        // O blob de um symlink é o texto do alvo.
+        // A symlink's blob is the target text.
         assert_eq!(link.size, "regular.txt".len() as u64);
     }
 
@@ -788,7 +788,7 @@ mod tests {
             "manual add",
         )
         .unwrap()
-        .expect("deve retornar Some (há mudanças)");
+        .expect("must return Some (there are changes)");
 
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.id(), oid);
@@ -802,7 +802,7 @@ mod tests {
         let branch = current_branch_name(&repo).unwrap();
         let res = commit_working_tree(&repo, &branch, "Alice", "alice@example.com", "noop")
             .unwrap();
-        assert!(res.is_none(), "esperado None quando sem mudanças");
+        assert!(res.is_none(), "expected None when there are no changes");
     }
 
     fn setup_local_with_bare_remote() -> (tempfile::TempDir, Repository, tempfile::TempDir) {
@@ -819,7 +819,7 @@ mod tests {
     #[test]
     fn fetch_remote_brings_new_commits() {
         let (_local_a, repo_a, bare) = setup_local_with_bare_remote();
-        // Outro clone (B) faz mudança e push
+        // Another clone (B) makes a change and pushes
         let dir_b = tempdir().unwrap();
         let repo_b = Repository::clone(
             &format!("file://{}", bare.path().to_str().unwrap()),
@@ -835,7 +835,7 @@ mod tests {
         let branch = current_branch_name(&repo_b).unwrap();
         push_to_remote(&repo_b, &branch, "origin", None).unwrap();
 
-        // A faz fetch
+        // A fetches
         fetch_remote(&repo_a, &branch, "origin", None).unwrap();
         let remote_ref = repo_a
             .find_reference(&format!("refs/remotes/origin/{}", branch))
@@ -864,9 +864,9 @@ mod tests {
 
         fetch_remote(&repo_a, &branch, "origin", None).unwrap();
         let result = merge_ff_only(&repo_a, &branch).unwrap();
-        assert!(result, "esperado Ok(true) para fast-forward aplicado");
+        assert!(result, "expected Ok(true) for an applied fast-forward");
 
-        // Working tree de A agora tem from_b.txt
+        // A's working tree now has from_b.txt
         let workdir = repo_a.workdir().unwrap();
         assert!(workdir.join("from_b.txt").exists());
     }
@@ -877,17 +877,17 @@ mod tests {
         let branch = current_branch_name(&repo).unwrap();
         fetch_remote(&repo, &branch, "origin", None).unwrap();
         let result = merge_ff_only(&repo, &branch).unwrap();
-        assert!(!result, "esperado Ok(false) quando já atualizado");
+        assert!(!result, "expected Ok(false) when already up to date");
     }
 
     #[test]
     fn merge_ff_only_returns_err_on_divergence() {
         let (_local_a, repo_a, bare) = setup_local_with_bare_remote();
 
-        // A faz commit local divergente (não publica)
+        // A makes a divergent local commit (does not publish)
         commit_file(&repo_a, "local_only.txt", b"a");
 
-        // B publica um commit também
+        // B publishes a commit as well
         let dir_b = tempdir().unwrap();
         let repo_b = Repository::clone(
             &format!("file://{}", bare.path().to_str().unwrap()),
@@ -906,7 +906,7 @@ mod tests {
         fetch_remote(&repo_a, &branch, "origin", None).unwrap();
         assert!(
             merge_ff_only(&repo_a, &branch).is_err(),
-            "esperado erro quando divergente"
+            "expected an error on divergence"
         );
     }
 
@@ -977,14 +977,14 @@ mod tests {
         fetch_remote(&repo_a, &branch, "origin", None).unwrap();
         let outcome =
             pull_and_merge(&repo_a, &branch, "origin", "Alice", "a@x.com", "conflict-test").unwrap();
-        assert!(matches!(outcome, MergeOutcome::Merged), "esperado Merged, obtido {:?}", outcome);
+        assert!(matches!(outcome, MergeOutcome::Merged), "expected Merged, got {:?}", outcome);
 
         let wd = repo_a.workdir().unwrap();
-        assert!(wd.join("only_a.txt").exists(), "arquivo local A deve persistir");
-        assert!(wd.join("only_b.txt").exists(), "arquivo remoto B deve chegar");
+        assert!(wd.join("only_a.txt").exists(), "A's local file must persist");
+        assert!(wd.join("only_b.txt").exists(), "B's remote file must arrive");
 
         let head = repo_a.head().unwrap().peel_to_commit().unwrap();
-        assert_eq!(head.parent_count(), 2, "merge commit deve ter 2 pais");
+        assert_eq!(head.parent_count(), 2, "merge commit must have 2 parents");
     }
 
     #[test]
@@ -995,7 +995,7 @@ mod tests {
             cfg.set_str("user.name", "Alice").unwrap();
             cfg.set_str("user.email", "a@x.com").unwrap();
         }
-        // Arquivo "shared.txt" existe em ambos os lados com conteúdo diferente
+        // The file "shared.txt" exists on both sides with different content
         commit_file(&repo_a, "shared.txt", b"local version");
 
         let (_dir_b, repo_b) = clone_of(&bare, "Bob");
@@ -1012,18 +1012,18 @@ mod tests {
                 assert_eq!(resolved, vec!["shared.txt".to_string()]);
                 assert_eq!(suffix, "conflict-xyz");
             }
-            other => panic!("esperado Conflicted, obtido {:?}", other),
+            other => panic!("expected Conflicted, got {:?}", other),
         }
 
         let wd = repo_a.workdir().unwrap();
         let canonical = std::fs::read(wd.join("shared.txt")).unwrap();
-        assert_eq!(canonical, b"remote version", "canônico deve ser a versão remota");
+        assert_eq!(canonical, b"remote version", "canonical must be the remote version");
         let conflict_copy = std::fs::read(wd.join("shared.txt.conflict-xyz")).unwrap();
-        assert_eq!(conflict_copy, b"local version", "cópia de conflito deve ter a versão local");
+        assert_eq!(conflict_copy, b"local version", "conflict copy must hold the local version");
 
         let head = repo_a.head().unwrap().peel_to_commit().unwrap();
-        assert_eq!(head.parent_count(), 2, "merge commit de conflito deve ter 2 pais");
-        // Estado de merge deve estar limpo (sem MERGE_HEAD pendurado)
+        assert_eq!(head.parent_count(), 2, "conflict merge commit must have 2 parents");
+        // Merge state must be clean (no dangling MERGE_HEAD)
         assert!(repo_a.state() == git2::RepositoryState::Clean);
     }
 
@@ -1064,28 +1064,28 @@ mod tests {
         std::fs::write(ssh.join("id_ed25519"), b"k").unwrap();
         std::fs::write(ssh.join("id_ed25519.pub"), b"p").unwrap();
         let (private, public) = discover_ssh_key(dir.path()).unwrap();
-        assert!(private.ends_with(".ssh/id_ed25519"), "ed25519 tem preferência");
+        assert!(private.ends_with(".ssh/id_ed25519"), "ed25519 takes precedence");
         assert!(public.unwrap().ends_with("id_ed25519.pub"));
     }
 
-    // ---- Fase 2.5, Bloco A: política de commit e ignorados ----
+    // ---- Phase 2.5, Block A: commit policy and ignored files ----
 
     #[test]
     fn is_working_tree_clean_true_with_only_ignored_files() {
-        // Pin do comportamento: ignorados não bloqueiam a guarda do pull.
+        // Behavior pin: ignored files do not block the pull guard.
         let (dir, repo) = init_repo_with_commit();
         commit_file(&repo, ".gitignore", b"*.log\n");
         std::fs::write(dir.path().join("app.log"), b"ignorado").unwrap();
         assert!(
             is_working_tree_clean(&repo).unwrap(),
-            "arquivo ignorado não pode sujar a working tree para a guarda do pull"
+            "an ignored file must not dirty the working tree for the pull guard"
         );
     }
 
     #[test]
     fn commit_working_tree_skips_ignored_file() {
-        // Pin do comportamento: IndexAddOption::DEFAULT respeita as regras de
-        // ignore — antes era efeito colateral, agora é especificado.
+        // Behavior pin: IndexAddOption::DEFAULT honors the ignore rules —
+        // previously a side effect, now specified.
         let (dir, repo) = init_repo_with_commit();
         commit_file(&repo, ".gitignore", b"*.log\n");
         std::fs::write(dir.path().join("app.log"), b"ignorado").unwrap();
@@ -1094,13 +1094,13 @@ mod tests {
         let branch = current_branch_name(&repo).unwrap();
         let oid = commit_working_tree(&repo, &branch, "A", "a@x.com", "batch")
             .unwrap()
-            .expect("real.txt deve gerar commit");
+            .expect("real.txt must produce a commit");
         let commit = repo.find_commit(oid).unwrap();
         let tree = commit.tree().unwrap();
         assert!(tree.get_path(Path::new("real.txt")).is_ok());
         assert!(
             tree.get_path(Path::new("app.log")).is_err(),
-            "app.log é ignorado e não pode entrar no commit"
+            "app.log is ignored and must not enter the commit"
         );
     }
 
@@ -1111,7 +1111,7 @@ mod tests {
         std::fs::write(dir.path().join("app.log"), b"12345").unwrap();
         std::fs::create_dir_all(dir.path().join("build")).unwrap();
         std::fs::write(dir.path().join("build/out.bin"), b"123").unwrap();
-        // Untracked NÃO-ignorado fica de fora
+        // A non-ignored untracked file stays out
         std::fs::write(dir.path().join("real.txt"), b"x").unwrap();
 
         let mut files = list_ignored_files(&repo).unwrap();
@@ -1120,7 +1120,7 @@ mod tests {
         assert_eq!(
             paths,
             vec![("app.log", 5), ("build/out.bin", 3)],
-            "só ignorados untracked, com tamanhos do disco"
+            "only untracked ignored files, with on-disk sizes"
         );
         assert!(files.iter().all(|f| f.kind == FileKind::Regular));
     }
@@ -1137,9 +1137,9 @@ mod tests {
         assert_eq!(files[0].size, "alvo.txt".len() as u64);
     }
 
-    // ---- Fase 2.5, Bloco C: mtime derivado do histórico ----
+    // ---- Phase 2.5, Block C: mtime derived from history ----
 
-    /// Commita um arquivo com timestamp de committer explícito (epoch segundos).
+    /// Commits a file with an explicit committer timestamp (epoch seconds).
     fn commit_file_at(repo: &Repository, relpath: &str, content: &[u8], epoch_secs: i64) {
         let workdir = repo.workdir().unwrap();
         let full = workdir.join(relpath);
@@ -1183,14 +1183,14 @@ mod tests {
         commit_file_at(&repo, "antigo.txt", b"x", 1_600_000_000);
         commit_file_at(&repo, "novo.txt", b"y", 1_700_000_000);
 
-        // Cap 1: só o commit do HEAD é diffado; antigo.txt cai no fallback
-        // (timestamp do HEAD), nunca em boot_time/erro.
+        // Cap 1: only the HEAD commit is diffed; antigo.txt falls back to the
+        // HEAD timestamp, never to boot_time/an error.
         let times = commit_times_by_path(&repo, 1).unwrap();
         assert_eq!(times.get("novo.txt"), Some(&epoch(1_700_000_000)));
         assert_eq!(
             times.get("antigo.txt"),
             Some(&epoch(1_700_000_000)),
-            "path fora do teto recebe o timestamp do HEAD"
+            "paths beyond the cap receive the HEAD timestamp"
         );
     }
 
@@ -1204,16 +1204,17 @@ mod tests {
 
     #[test]
     fn push_to_remote_detects_server_side_ref_rejection() {
-        // Reproduz o GH001 do GitHub (arquivo > 100 MB): o servidor aceita a
-        // conexão mas rejeita a atualização do REF. git2 retorna Ok no nível
-        // de transporte — a rejeição só aparece no callback
-        // push_update_reference. Sem tratá-lo, o drive logava "push ok" com o
-        // remote parado (incidente da validação de 03-07-2026).
+        // Reproduces GitHub's GH001 (file > 100 MB): the server accepts the
+        // connection but rejects the REF update. git2 returns Ok at the
+        // transport level — the rejection only shows up in the
+        // push_update_reference callback. Without handling it, the drive
+        // logged "push ok" with the remote stalled (incident from the
+        // 2026-07-03 validation).
         let (_dir, repo, bare) = setup_local_with_bare_remote();
         commit_file(&repo, "novo.txt", b"x");
         let branch = current_branch_name(&repo).unwrap();
 
-        // Lock no ref do bare: a atualização do ref falha server-side.
+        // Lock the ref in the bare repo: the ref update fails server-side.
         let lock = bare
             .path()
             .join(format!("refs/heads/{}.lock", branch));
@@ -1223,10 +1224,10 @@ mod tests {
         let result = push_to_remote(&repo, &branch, "origin", None);
         assert!(
             result.is_err(),
-            "push com ref rejeitado pelo servidor deve retornar Err"
+            "a push with a server-rejected ref must return Err"
         );
 
-        // E o remote de fato não avançou.
+        // And the remote indeed did not advance.
         let bare_repo = Repository::open(bare.path()).unwrap();
         let bare_head = bare_repo
             .find_reference(&format!("refs/heads/{}", branch))
@@ -1234,7 +1235,7 @@ mod tests {
             .peel_to_commit()
             .unwrap();
         let local_head = repo.head().unwrap().peel_to_commit().unwrap();
-        assert_ne!(bare_head.id(), local_head.id(), "ref remoto não pode ter avançado");
+        assert_ne!(bare_head.id(), local_head.id(), "the remote ref must not have advanced");
     }
 
     #[test]

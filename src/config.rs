@@ -38,28 +38,28 @@ pub struct Config {
     pub write_debounce_secs: u64,
     #[serde(default = "default_pull_interval_secs")]
     pub pull_interval_secs: u64,
-    /// Orçamento do cache LRU de blobs de leitura, em MiB. `0` desativa.
+    /// Budget for the read blob LRU cache, in MiB. `0` disables it.
     #[serde(default = "default_read_cache_mb")]
     pub read_cache_mb: u64,
-    /// Limiar em MiB acima do qual write buffers são mantidos em arquivo de
-    /// spool em disco (pico de RAM limitado). `0` desativa o spool.
+    /// Threshold in MiB above which write buffers are kept in an on-disk
+    /// spool file (bounded RAM peak). `0` disables the spool.
     #[serde(default = "default_large_file_threshold_mb")]
     pub large_file_threshold_mb: u64,
-    /// Limiar em MiB acima do qual um arquivo é convertido em manifest +
-    /// chunks (`.chunks/`) no commit — nenhum blob acima disso é stageado.
-    /// Default abaixo do limite de 100 MB por arquivo do GitHub. `0` desativa.
+    /// Threshold in MiB above which a file is converted into a manifest +
+    /// chunks (`.chunks/`) at commit time — no blob above it is staged.
+    /// Default sits below GitHub's 100 MB per-file limit. `0` disables it.
     #[serde(default = "default_chunk_threshold_mb")]
     pub chunk_threshold_mb: u64,
-    /// Tamanho máximo de cada chunk, em MiB.
+    /// Maximum size of each chunk, in MiB.
     #[serde(default = "default_chunk_size_mb")]
     pub chunk_size_mb: u64,
-    /// Criptografia em repouso (Fase 2.7): conteúdo e nomes cifrados no repo.
-    /// Habilitar/desabilitar dispara migração automática no próximo drain.
-    /// ATENÇÃO: a história Git anterior à habilitação permanece em claro.
+    /// At-rest encryption (Phase 2.7): content and names encrypted in the repo.
+    /// Enabling/disabling triggers an automatic migration on the next drain.
+    /// WARNING: Git history from before enabling remains in cleartext.
     #[serde(default = "default_encryption_enabled")]
     pub encryption_enabled: bool,
-    /// Arquivo com a chave-mestre (64 hex, permissão 0600). Ausente = path
-    /// padrão da plataforma. Gere com `drive-sync key generate`.
+    /// File holding the master key (64 hex, permission 0600). Absent = the
+    /// platform's default path. Generate it with `drive-sync key generate`.
     #[serde(default)]
     pub encryption_key_file: Option<String>,
     #[serde(default)]
@@ -92,7 +92,7 @@ impl Config {
     pub fn load_from(path: &str) -> Self {
         if !Path::new(path).exists() {
             println!(
-                "[{}] config: {} não encontrado, usando padrão",
+                "[{}] config: warning: {} not found, using defaults",
                 log_ts(),
                 path
             );
@@ -101,7 +101,7 @@ impl Config {
 
         let content = fs::read_to_string(path).unwrap_or_else(|_| {
             println!(
-                "[{}] config: erro ao ler {}, usando padrão",
+                "[{}] config: warning: failed to read {}, using defaults",
                 log_ts(),
                 path
             );
@@ -110,7 +110,7 @@ impl Config {
 
         serde_json::from_str(&content).unwrap_or_else(|_| {
             println!(
-                "[{}] config: erro ao parsear {}, usando padrão",
+                "[{}] config: warning: failed to parse {}, using defaults",
                 log_ts(),
                 path
             );
@@ -184,7 +184,7 @@ mod tests {
     fn load_from_chunking_overrides_and_disable() {
         let (_dir, path) = write_config(r#"{"chunk_threshold_mb": 0, "chunk_size_mb": 40}"#);
         let cfg = Config::load_from(&path);
-        assert_eq!(cfg.chunk_threshold_mb, 0, "0 desativa o chunking");
+        assert_eq!(cfg.chunk_threshold_mb, 0, "0 disables chunking");
         assert_eq!(cfg.chunk_size_mb, 40);
     }
 

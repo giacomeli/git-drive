@@ -14,9 +14,9 @@ pub fn init_repo() -> TestRepo {
     let dir = tempfile::tempdir().expect("tempdir");
     let repo = Repository::init(dir.path()).expect("git init");
 
-    // Branch inicial determinístico: sem isso, o nome vem do ambiente
-    // (init.defaultBranch local = "main"; runners de CI = "master") e os
-    // testes que referenciam "main" quebram fora da máquina do dev.
+    // Deterministic initial branch: without this, the name comes from the
+    // environment (local init.defaultBranch = "main"; CI runners = "master")
+    // and tests that reference "main" break outside the dev's machine.
     repo.set_head("refs/heads/main").expect("set_head main");
 
     {
@@ -42,9 +42,10 @@ pub fn init_repo() -> TestRepo {
 pub fn init_bare_remote() -> TempDir {
     let dir = tempfile::tempdir().expect("tempdir bare");
     let repo = Repository::init_bare(dir.path()).expect("git init --bare");
-    // Mesmo racional do init_repo: sem HEAD determinístico, um clone deste
-    // bare nasce no branch default do ambiente (master em CI) e os fluxos de
-    // push/pull que referenciam "main" quebram fora da máquina do dev.
+    // Same rationale as init_repo: without a deterministic HEAD, a clone of
+    // this bare repo starts on the environment's default branch (master on
+    // CI) and push/pull flows that reference "main" break outside the dev's
+    // machine.
     repo.set_head("refs/heads/main").expect("set_head main");
     dir
 }
@@ -79,7 +80,7 @@ pub fn commit_file(repo: &Repository, relpath: &str, content: &[u8], msg: &str) 
         .expect("commit")
 }
 
-/// Cria um symlink real no working tree e o commita (entrada 120000 na tree).
+/// Creates a real symlink in the working tree and commits it (120000 tree entry).
 pub fn commit_symlink(repo: &Repository, relpath: &str, target: &str, msg: &str) -> git2::Oid {
     let workdir = repo.workdir().expect("workdir");
     let full = workdir.join(relpath);
@@ -105,7 +106,7 @@ pub fn commit_symlink(repo: &Repository, relpath: &str, target: &str, msg: &str)
         .expect("commit")
 }
 
-/// Commita um arquivo com timestamp de committer explícito (epoch segundos).
+/// Commits a file with an explicit committer timestamp (epoch seconds).
 pub fn commit_file_at(
     repo: &Repository,
     relpath: &str,

@@ -1,35 +1,35 @@
-//! Núcleo puro do chunking de arquivos grandes (Fase 2.6).
+//! Pure core of the large-file chunking (Phase 2.6).
 //!
-//! Arquivo acima do threshold vira um manifest texto no path original e o
-//! conteúdo vai fatiado para `.chunks/<2 hex>/<sha256>` — cada chunk abaixo do
-//! limite por arquivo do remote (GitHub: 100 MB). Ver decisões 1-5 em
-//! `specs/plans/2026-07-03-184557_fase-2.6-chunking-arquivos-grandes/decisoes.md`.
+//! A file above the threshold becomes a text manifest at the original path
+//! and the content is sliced into `.chunks/<2 hex>/<sha256>` — each chunk
+//! below the remote's per-file limit (GitHub: 100 MB). See decisions 1-5 in
+//! the Phase 2.6 planning notes (internal, kept outside the repository).
 
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// Primeira linha de todo manifest. Contém projeto e versão do formato —
-/// versão nova exige parser novo (parse rejeita desconhecidas).
+/// First line of every manifest. Carries the project and format version —
+/// a new version requires a new parser (parse rejects unknown ones).
 pub const MANIFEST_MAGIC: &str = "drive-sync-chunked v1";
 
-/// Diretório reservado dos chunks, na raiz do repo.
+/// Reserved chunks directory, at the repo root.
 pub const CHUNKS_DIR: &str = ".chunks";
 
-/// Teto plausível para o tamanho de um manifest — a detecção lazy só lê blobs
-/// até este limite (cobre arquivos de ~2.8 TB com chunks de 80 MiB).
+/// Plausible ceiling for a manifest's size — lazy detection only reads blobs
+/// up to this limit (covers files of ~2.8 TB with 80 MiB chunks).
 pub const MANIFEST_MAX_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     pub total_size: u64,
     pub chunk_size: u64,
-    /// SHA-256 (hex minúsculo) de cada chunk, na ordem do arquivo.
+    /// SHA-256 (lowercase hex) of each chunk, in file order.
     pub hashes: Vec<String>,
 }
 
 impl Manifest {
-    /// `true` se os bytes começam com a magic line (detecção barata, sem parse).
+    /// `true` if the bytes start with the magic line (cheap detection, no parse).
     pub fn is_manifest_bytes(bytes: &[u8]) -> bool {
         let magic = MANIFEST_MAGIC.as_bytes();
         bytes.len() > magic.len()
@@ -38,17 +38,17 @@ impl Manifest {
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Manifest, String> {
-        let text = std::str::from_utf8(bytes).map_err(|_| "manifest não é UTF-8".to_string())?;
+        let text = std::str::from_utf8(bytes).map_err(|_| "manifest is not UTF-8".to_string())?;
         let mut lines = text.lines();
         match lines.next() {
             Some(l) if l == MANIFEST_MAGIC => {}
-            Some(l) => return Err(format!("magic/versão desconhecida: {:?}", l)),
-            None => return Err("manifest vazio".to_string()),
+            Some(l) => return Err(format!("unknown magic/version: {:?}", l)),
+            None => return Err("empty manifest".to_string()),
         }
         let total_size = parse_field(lines.next(), "size")?;
         let chunk_size = parse_field(lines.next(), "chunk-size")?;
         if chunk_size == 0 {
-            return Err("chunk-size zero".to_string());
+            return Err("chunk-size is zero".to_string());
         }
         let mut hashes = Vec::new();
         for line in lines {
@@ -57,16 +57,16 @@ impl Manifest {
             }
             let hash = line
                 .strip_prefix("sha256 ")
-                .ok_or_else(|| format!("linha inesperada no manifest: {:?}", line))?;
+                .ok_or_else(|| format!("unexpected line in manifest: {:?}", line))?;
             if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(format!("hash malformado: {:?}", hash));
+                return Err(format!("malformed hash: {:?}", hash));
             }
             hashes.push(hash.to_ascii_lowercase());
         }
         let expected = total_size.div_ceil(chunk_size) as usize;
         if hashes.len() != expected {
             return Err(format!(
-                "manifest inconsistente: {} hash(es) para size {} / chunk-size {} (esperado {})",
+                "inconsistent manifest: {} hash(es) for size {} / chunk-size {} (expected {})",
                 hashes.len(),
                 total_size,
                 chunk_size,
@@ -92,8 +92,8 @@ impl Manifest {
         out.into_bytes()
     }
 
-    /// Índices de chunk que cobrem `[offset, offset+size)`. Range vazio se o
-    /// offset está além do fim.
+    /// Chunk indices covering `[offset, offset+size)`. Empty range if the
+    /// offset is past the end.
     pub fn chunks_for_range(&self, offset: u64, size: u64) -> std::ops::Range<usize> {
         if offset >= self.total_size || size == 0 {
             return 0..0;
@@ -106,13 +106,13 @@ impl Manifest {
 }
 
 fn parse_field(line: Option<&str>, name: &str) -> Result<u64, String> {
-    let line = line.ok_or_else(|| format!("campo {} ausente", name))?;
+    let line = line.ok_or_else(|| format!("missing field {}", name))?;
     let value = line
         .strip_prefix(&format!("{} ", name))
-        .ok_or_else(|| format!("esperado campo {}, obtido {:?}", name, line))?;
+        .ok_or_else(|| format!("expected field {}, got {:?}", name, line))?;
     value
         .parse::<u64>()
-        .map_err(|_| format!("valor inválido em {}: {:?}", name, value))
+        .map_err(|_| format!("invalid value in {}: {:?}", name, value))
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -121,19 +121,19 @@ pub fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Path relativo de um chunk dentro do repo: `.chunks/<2 hex>/<hash>`.
+/// Relative path of a chunk inside the repo: `.chunks/<2 hex>/<hash>`.
 pub fn shard_rel_path(hash: &str) -> PathBuf {
     PathBuf::from(CHUNKS_DIR).join(&hash[..2]).join(hash)
 }
 
-/// `true` se o path relativo vive dentro de `.chunks/`.
+/// `true` if the relative path lives inside `.chunks/`.
 pub fn is_chunk_path(rel_path: &str) -> bool {
     rel_path == CHUNKS_DIR || rel_path.starts_with(".chunks/")
 }
 
-/// Fatia `reader` em chunks de `chunk_size`, gravando cada um em
-/// `repo_root/.chunks/<shard>/<hash>` (chunk já existente não é regravado —
-/// dedup por conteúdo) e retorna o manifest. RAM limitada a um chunk.
+/// Slices `reader` into chunks of `chunk_size`, writing each one to
+/// `repo_root/.chunks/<shard>/<hash>` (an existing chunk is not rewritten —
+/// dedup by content) and returns the manifest. RAM bounded to one chunk.
 pub fn chunk_reader_into_repo(
     reader: &mut impl Read,
     chunk_size: u64,
@@ -142,10 +142,11 @@ pub fn chunk_reader_into_repo(
     chunk_reader_into_repo_with(reader, chunk_size, repo_root, None)
 }
 
-/// Variante com transform por chunk (Fase 2.7: selar cada chunk). O hash que
-/// nomeia o chunk é do resultado TRANSFORMADO (ciphertext) — GC e verificação
-/// de integridade funcionam sem a chave. `total_size`/`chunk_size` do manifest
-/// continuam em bytes de PLAINTEXT (a leitura por offset precisa deles).
+/// Variant with a per-chunk transform (Phase 2.7: seal each chunk). The hash
+/// that names the chunk is of the TRANSFORMED result (ciphertext) — GC and
+/// integrity verification work without the key. The manifest's
+/// `total_size`/`chunk_size` remain in PLAINTEXT bytes (offset-based reads
+/// need them).
 pub fn chunk_reader_into_repo_with(
     reader: &mut impl Read,
     chunk_size: u64,
@@ -177,8 +178,8 @@ pub fn chunk_reader_into_repo_with(
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            // Escrita via temp + rename: chunk nunca aparece truncado para a
-            // varredura de GC nem para um leitor concorrente.
+            // Write via temp + rename: a chunk never shows up truncated to
+            // the GC sweep nor to a concurrent reader.
             let tmp = full.with_extension("tmp");
             std::fs::write(&tmp, data)?;
             std::fs::rename(&tmp, &full)?;
@@ -195,7 +196,7 @@ pub fn chunk_reader_into_repo_with(
     })
 }
 
-/// Lê do reader até encher `buf` ou chegar ao EOF. Retorna bytes lidos.
+/// Reads from the reader until `buf` is full or EOF. Returns bytes read.
 fn read_full(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -233,8 +234,8 @@ mod tests {
     #[test]
     fn manifest_serialized_bytes_are_detected() {
         assert!(Manifest::is_manifest_bytes(&sample().serialize()));
-        assert!(!Manifest::is_manifest_bytes(b"conteudo qualquer"));
-        assert!(!Manifest::is_manifest_bytes(b"drive-sync-chunked v1")); // sem \n
+        assert!(!Manifest::is_manifest_bytes(b"arbitrary content"));
+        assert!(!Manifest::is_manifest_bytes(b"drive-sync-chunked v1")); // no \n
         assert!(!Manifest::is_manifest_bytes(b""));
     }
 
@@ -256,7 +257,7 @@ mod tests {
 
     #[test]
     fn manifest_parse_rejects_wrong_hash_count() {
-        // size 250 / chunk 100 = 3 chunks, mas só 1 hash
+        // size 250 / chunk 100 = 3 chunks, but only 1 hash
         let text = format!(
             "{}\nsize 250\nchunk-size 100\nsha256 {}\n",
             MANIFEST_MAGIC,
@@ -267,13 +268,13 @@ mod tests {
 
     #[test]
     fn chunks_for_range_maps_offsets() {
-        let m = sample(); // 250 bytes em chunks de 100
+        let m = sample(); // 250 bytes in chunks of 100
         assert_eq!(m.chunks_for_range(0, 100), 0..1);
         assert_eq!(m.chunks_for_range(0, 101), 0..2);
         assert_eq!(m.chunks_for_range(99, 2), 0..2);
         assert_eq!(m.chunks_for_range(100, 100), 1..2);
         assert_eq!(m.chunks_for_range(200, 1000), 2..3);
-        assert_eq!(m.chunks_for_range(250, 10), 0..0, "além do fim");
+        assert_eq!(m.chunks_for_range(250, 10), 0..0, "past the end");
         assert_eq!(m.chunks_for_range(0, 0), 0..0);
     }
 
@@ -289,7 +290,7 @@ mod tests {
         assert!(is_chunk_path(".chunks"));
         assert!(is_chunk_path(".chunks/ab/cdef"));
         assert!(!is_chunk_path("docs/.chunks.md"));
-        assert!(!is_chunk_path("arquivo.txt"));
+        assert!(!is_chunk_path("regular-file.txt"));
     }
 
     #[test]
@@ -302,7 +303,7 @@ mod tests {
         assert_eq!(m.chunk_size, 100);
         assert_eq!(m.hashes.len(), 3);
 
-        // Chunks no disco, com conteúdo e hash conferindo
+        // Chunks on disk, with content and hash matching
         let mut reassembled = Vec::new();
         for h in &m.hashes {
             let bytes = std::fs::read(dir.path().join(shard_rel_path(h))).unwrap();
@@ -311,7 +312,7 @@ mod tests {
         }
         assert_eq!(reassembled, data);
 
-        // Dedup: re-chunkar o mesmo conteúdo não cria arquivos novos
+        // Dedup: re-chunking the same content creates no new files
         let before: Vec<_> = walk_files(dir.path().join(CHUNKS_DIR));
         let m2 = chunk_reader_into_repo(&mut data.as_slice(), 100, dir.path()).unwrap();
         assert_eq!(m2, m);
@@ -323,7 +324,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data = vec![7u8; 200];
         let m = chunk_reader_into_repo(&mut data.as_slice(), 100, dir.path()).unwrap();
-        assert_eq!(m.hashes.len(), 2, "200/100 = 2 chunks exatos, sem cauda vazia");
+        assert_eq!(m.hashes.len(), 2, "200/100 = 2 exact chunks, no empty tail");
     }
 
     fn walk_files(root: PathBuf) -> Vec<PathBuf> {

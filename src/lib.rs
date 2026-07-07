@@ -20,10 +20,10 @@ fn local_tm(epoch: i64) -> libc::tm {
     tm
 }
 
-/// Timestamp local (HH:MM:SS.mmm) usado como prefixo de logs. Não depende de
-/// crates externos — calcula direto do `SystemTime::now()`. A gente ajusta pro
-/// offset local (de `localtime_r`) ao invés de UTC pra casar com o relógio
-/// que o usuário vê no terminal.
+/// Local timestamp (HH:MM:SS.mmm) used as a log prefix. No external crates
+/// involved — computed straight from `SystemTime::now()`. We adjust to the
+/// local offset (from `localtime_r`) instead of UTC so it matches the clock
+/// the user sees in the terminal.
 pub fn log_ts() -> String {
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -38,7 +38,7 @@ pub fn log_ts() -> String {
     )
 }
 
-/// Timestamp no formato `YYYYMMDD-HHMMSS` para nomes de arquivo.
+/// Timestamp in `YYYYMMDD-HHMMSS` format for file names.
 fn filename_ts() -> String {
     let epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -56,21 +56,22 @@ fn filename_ts() -> String {
     )
 }
 
-/// Redireciona stdout e stderr do processo para um arquivo em `logs/` nomeado
-/// com o timestamp de boot. Retorna o path do arquivo criado (printado na
-/// saída original antes do redirect, pra que o usuário saiba onde olhar).
+/// Redirects the process's stdout and stderr to a file in `logs/` named
+/// after the boot timestamp. Returns the path of the created file (printed
+/// to the original output before the redirect, so the user knows where to
+/// look).
 ///
-/// Quando `verbose` é `true`, faz tee: escreve simultaneamente no arquivo E
-/// no terminal original. Implementado via pipe interno + thread que lê do
-/// read-end e propaga pra ambos os destinos. Em modo não-verbose, faz `dup2`
-/// direto pra arquivo (mais leve, sem thread extra).
+/// When `verbose` is `true`, tees: writes simultaneously to the file AND to
+/// the original terminal. Implemented via an internal pipe + a thread that
+/// reads from the read-end and forwards to both destinations. In non-verbose
+/// mode, does a `dup2` straight to the file (lighter, no extra thread).
 ///
-/// Em ambos os modos, captura tanto `println!`/`eprintln!` nossos quanto o
-/// output do crate `log` (via env_logger) do fuser e outras libs, tudo no
-/// mesmo lugar.
+/// In both modes, this captures both our own `println!`/`eprintln!` and the
+/// output of the `log` crate (via env_logger) from fuser and other libs, all
+/// in the same place.
 ///
-/// `println!` em macOS passa a usar buffer de bloco quando stdout não é tty,
-/// então a gente desativa o buffer do handle de escrita imediatamente.
+/// `println!` on macOS switches to block buffering when stdout is not a tty,
+/// so we disable buffering on the write handle immediately.
 pub fn redirect_io_to_log_file(
     verbose: bool,
     log_dir: &std::path::Path,
@@ -85,8 +86,9 @@ pub fn redirect_io_to_log_file(
         .truncate(true)
         .open(&path)?;
 
-    // Flush antes de mexer com fds — qualquer print pendente vai pro destino
-    // antigo (terminal de boot) em vez de cair no novo redirect parcialmente.
+    // Flush before touching fds — any pending print goes to the old
+    // destination (the boot terminal) instead of partially landing in the
+    // new redirect.
     let _ = std::io::Write::flush(&mut std::io::stdout().lock());
     let _ = std::io::Write::flush(&mut std::io::stderr().lock());
 
@@ -106,9 +108,9 @@ pub fn redirect_io_to_log_file(
         }
     }
 
-    // Em ambos os modos: desliga buffering de bloco em stdout. `setvbuf(_IOLBF)`
-    // faz linha-a-linha — necessário pra `tail -f` e pro tee thread acordar
-    // logo após cada println.
+    // In both modes: turn off block buffering on stdout. `setvbuf(_IOLBF)`
+    // makes it line-by-line — needed for `tail -f` and for the tee thread to
+    // wake up right after each println.
     unsafe {
         let stdout_stream = libc::fdopen(libc::STDOUT_FILENO, c"w".as_ptr());
         if !stdout_stream.is_null() {
@@ -119,9 +121,10 @@ pub fn redirect_io_to_log_file(
     Ok(path)
 }
 
-/// Implementa o tee verbose: cria pipe, dup2 do write-end pra STDOUT/STDERR e
-/// uma thread que lê do read-end e replica no `file` + nos fds originais do
-/// terminal (preservados via `dup` antes do dup2 destrutivo).
+/// Implements the verbose tee: creates a pipe, dup2s the write-end onto
+/// STDOUT/STDERR, and spawns a thread that reads from the read-end and
+/// replicates into `file` + the terminal's original fds (preserved via `dup`
+/// before the destructive dup2).
 fn spawn_tee_redirect(file: std::fs::File) -> std::io::Result<()> {
     let term_stdout = unsafe { libc::dup(libc::STDOUT_FILENO) };
     let term_stderr = unsafe { libc::dup(libc::STDERR_FILENO) };
@@ -149,10 +152,10 @@ fn spawn_tee_redirect(file: std::fs::File) -> std::io::Result<()> {
             let slice = &buf[..n as usize];
             let _ = file.write_all(slice);
             let _ = file.flush();
-            // Escrita direta no fd preservado do terminal — não passa por
-            // STDOUT_FILENO (que agora aponta pro pipe). Erros ignorados;
-            // se o terminal sumir (tty fechado), a thread continua escrevendo
-            // no arquivo.
+            // Write directly to the preserved terminal fd — it does not go
+            // through STDOUT_FILENO (which now points to the pipe). Errors
+            // are ignored; if the terminal goes away (tty closed), the
+            // thread keeps writing to the file.
             unsafe {
                 libc::write(
                     term_stdout,

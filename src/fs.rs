@@ -15,23 +15,23 @@ use crate::sync::SyncManager;
 const TTL: Duration = Duration::from_secs(1);
 const ROOT_INODE: u64 = 1;
 
-/// Flags do `renameatx_np(2)` do macOS, propagadas pelo macFUSE no
-/// `fuse_rename_in` (patch local no vendor/fuser). SWAP = troca atômica de
-/// conteúdo (exchange); EXCL = falhar se o destino existe.
+/// Flags from macOS `renameatx_np(2)`, propagated by macFUSE in
+/// `fuse_rename_in` (local patch in vendor/fuser). SWAP = atomic content
+/// exchange; EXCL = fail if the destination exists.
 const APPLE_RENAME_SWAP: u32 = 0x2;
 const APPLE_RENAME_EXCL: u32 = 0x4;
 
-/// Entradas (inode, path) de uma travessia de subárvore.
+/// (inode, path) entries from a subtree traversal.
 type SubtreeEntries = Vec<(u64, String)>;
 const FILE_MODE: u16 = 0o644;
 const DIR_MODE: u16 = 0o755;
-/// Modo default exposto para symlinks (lrwxr-xr-x, como o macOS cria).
+/// Default mode exposed for symlinks (lrwxr-xr-x, as macOS creates them).
 const SYMLINK_MODE: u16 = 0o755;
 
-/// Cache LRU de blobs de leitura, keyed por inode. Orçamento em bytes; blob
-/// maior que o orçamento inteiro não entra (leitura serve direto do repo).
-/// Escala esperada: dezenas de entradas de um mount pessoal — eviction O(n)
-/// é invisível perto do custo de abrir o repo que cada hit evita.
+/// LRU cache of read blobs, keyed by inode. Budget in bytes; a blob larger
+/// than the whole budget is never admitted (reads are served straight from
+/// the repo). Expected scale: dozens of entries for a personal mount — O(n)
+/// eviction is invisible next to the repo-open cost each hit avoids.
 pub(crate) struct BlobCache {
     entries: HashMap<u64, BlobCacheEntry>,
     budget_bytes: u64,
@@ -126,16 +126,16 @@ impl BlobCache {
     }
 }
 
-/// Buffer de escrita por inode. Abaixo do limiar de spool vive em RAM com
-/// mutação copy-on-write (`Arc` compartilhado com a fila de sync); acima, em
-/// arquivo de spool dentro de `.git/` — pico de RAM limitado ao limiar.
+/// Per-inode write buffer. Below the spool threshold it lives in RAM with
+/// copy-on-write mutation (`Arc` shared with the sync queue); above it, in a
+/// spool file inside `.git/` — peak RAM bounded by the threshold.
 pub(crate) enum WriteBuffer {
     Mem(Arc<Vec<u8>>),
     Spooled(SpooledBuffer),
 }
 
-/// Arquivo de spool com acesso randômico. Removido do disco no drop (gc de
-/// buffers, unlink, shutdown).
+/// Spool file with random access. Removed from disk on drop (buffer gc,
+/// unlink, shutdown).
 pub(crate) struct SpooledBuffer {
     file: std::fs::File,
     path: std::path::PathBuf,
@@ -184,8 +184,8 @@ impl WriteBuffer {
     fn write_at(&mut self, offset: usize, data: &[u8]) {
         match self {
             WriteBuffer::Mem(a) => {
-                // Copy-on-write: se uma op enfileirada ainda segura este Arc,
-                // o make_mut clona antes de mutar — a op preserva o snapshot.
+                // Copy-on-write: if a queued op still holds this Arc,
+                // make_mut clones before mutating — the op keeps its snapshot.
                 let buf = Arc::make_mut(a);
                 if buf.len() < offset + data.len() {
                     buf.resize(offset + data.len(), 0);
@@ -194,8 +194,8 @@ impl WriteBuffer {
             }
             WriteBuffer::Spooled(s) => {
                 use std::os::unix::fs::FileExt;
-                // Escrita além do EOF estende com zeros (hole), a mesma
-                // semântica do resize do caminho em RAM.
+                // Writing past EOF extends with zeros (hole), the same
+                // semantics as the resize on the RAM path.
                 let _ = s.file.write_all_at(data, offset as u64);
                 s.len = s.len.max((offset + data.len()) as u64);
             }
@@ -219,11 +219,11 @@ pub(crate) struct FileEntry {
     pub(crate) path: String,
     pub(crate) parent: u64,
     pub(crate) size: u64,
-    /// Regular ou Symlink (filemode 120000 no Git). Para symlink, o conteúdo
-    /// do blob é o texto do alvo e o attr expõe `FileType::Symlink`.
+    /// Regular or Symlink (filemode 120000 in Git). For a symlink, the blob
+    /// content is the target text and the attr exposes `FileType::Symlink`.
     pub(crate) kind: git::FileKind,
-    /// Arquivo que casa com regras de ignore do repo montado: vive no working
-    /// tree, nunca entra em commit. Leituras vêm do disco, não do HEAD.
+    /// File matching the mounted repo's ignore rules: lives in the working
+    /// tree, never enters a commit. Reads come from disk, not from HEAD.
     pub(crate) local_only: bool,
 }
 
@@ -244,62 +244,63 @@ pub struct GitDriveFS {
     inodes_by_path: HashMap<String, u64>,
     next_inode: Arc<AtomicU64>,
     sync: SyncManager,
-    /// Conteúdo corrente por inode: RAM copy-on-write (compartilhado com a
-    /// fila via `Arc`) abaixo do limiar de spool, arquivo em disco acima.
+    /// Current content per inode: copy-on-write RAM (shared with the queue
+    /// via `Arc`) below the spool threshold, file on disk above it.
     write_buffers: Arc<parking_lot::Mutex<HashMap<u64, WriteBuffer>>>,
-    /// Limiar em bytes para spool de buffers (0 = spool desligado).
+    /// Threshold in bytes for spooling buffers (0 = spool disabled).
     spool_threshold_bytes: u64,
-    /// Diretório dos arquivos de spool (dentro de `.git/` — mesmo volume do
-    /// working tree e invisível para o commit). Limpo no boot.
+    /// Directory for spool files (inside `.git/` — same volume as the
+    /// working tree and invisible to the commit). Cleared at boot.
     spool_dir: std::path::PathBuf,
     spool_counter: AtomicU64,
-    /// Inodes com escrita ainda não enfileirada no sync ("dirty"). O flush só
-    /// gera `SyncOp::Write` para inodes marcados — flush roda em todo close(2),
-    /// inclusive de fds de leitura, e sem a marca re-enfileiraria conteúdo
-    /// antigo (podendo reverter mudanças remotas mergeadas).
+    /// Inodes with writes not yet queued into sync ("dirty"). Flush only
+    /// emits `SyncOp::Write` for marked inodes — flush runs on every close(2),
+    /// including read-only fds, and without the mark it would re-queue stale
+    /// content (potentially reverting merged remote changes).
     dirty: HashSet<u64>,
-    /// Última `commit_generation` do `SyncManager` observada. Quando avança,
-    /// buffers limpos (não-dirty) são descartados — o conteúdo deles já está
-    /// no HEAD e mantê-los esconderia mudanças remotas futuras do `read`.
+    /// Last observed `commit_generation` of the `SyncManager`. When it
+    /// advances, clean (non-dirty) buffers are discarded — their content is
+    /// already in HEAD and keeping them would hide future remote changes
+    /// from `read`.
     last_commit_gen: u64,
-    /// Cache LRU de blobs para leitura. Invalidado por inteiro nos mesmos
-    /// pontos do gc de buffers (HEAD mudou); por inode em unlink/write/
+    /// LRU cache of read blobs. Invalidated wholesale at the same points as
+    /// the buffer gc (HEAD changed); per inode on unlink/write/
     /// truncate/rename.
     read_cache: BlobCache,
-    /// Handle de repo reutilizado no caminho quente de leitura (miss do
-    /// cache). Sem ele, arquivo maior que o orçamento reabria o repo a CADA
-    /// syscall de read. HEAD é re-resolvido a cada uso (refs vêm do disco),
-    /// então o handle nunca serve commit velho.
+    /// Repo handle reused on the hot read path (cache miss). Without it, a
+    /// file larger than the budget reopened the repo on EVERY read syscall.
+    /// HEAD is re-resolved on each use (refs come from disk), so the handle
+    /// never serves a stale commit.
     read_repo: Option<git2::Repository>,
-    /// Contador de aberturas reais do handle (introspecção para testes).
+    /// Counter of actual handle opens (test introspection).
     read_repo_opens: u64,
-    /// Criptografia em repouso (Fase 2.7): `Some` = repo cifrado, visão clara.
+    /// Encryption at rest (Phase 2.7): `Some` = encrypted repo, clear view.
     crypto: Option<Arc<crate::crypt::Crypto>>,
     uid: u32,
     gid: u32,
     mode_overrides: Arc<parking_lot::Mutex<HashMap<u64, u16>>>,
     times: Arc<parking_lot::Mutex<HashMap<u64, SystemTime>>>,
-    /// mtime derivado do último commit que tocou cada path (revwalk único no
-    /// boot/refresh). Consultado depois de `times` (sessão) e antes de
-    /// `boot_time` (resíduo: local-only e diretórios).
+    /// mtime derived from the last commit that touched each path (single
+    /// revwalk at boot/refresh). Consulted after `times` (session) and before
+    /// `boot_time` (residue: local-only and directories).
     derived_times: HashMap<u64, SystemTime>,
-    /// Cache lazy de detecção de manifest por inode (Fase 2.6): `Some` =
-    /// arquivo chunkado (manifest parseado), `None` = checado e não é.
-    /// Limpo junto com o gc de buffers (HEAD mudou).
+    /// Lazy per-inode manifest detection cache (Phase 2.6): `Some` =
+    /// chunked file (parsed manifest), `None` = checked and not chunked.
+    /// Cleared together with the buffer gc (HEAD changed).
     manifests: parking_lot::Mutex<HashMap<u64, Option<Arc<crate::chunk::Manifest>>>>,
-    /// Último chunk verificado servido ao `read` — leitura sequencial de
-    /// arquivo chunkado paga hash+disco uma vez por chunk, não por syscall.
+    /// Last verified chunk served to `read` — sequential reads of a chunked
+    /// file pay hash+disk once per chunk, not per syscall.
     last_chunk: Option<(u64, usize, Vec<u8>)>,
     boot_time: SystemTime,
     xattrs: Arc<parking_lot::Mutex<HashMap<u64, HashMap<OsString, Vec<u8>>>>>,
 }
 
-/// Default do orçamento do cache de leitura quando o caller não especifica
-/// (espelha o default de `read_cache_mb` no config).
+/// Default read cache budget when the caller does not specify one
+/// (mirrors the `read_cache_mb` default in the config).
 const DEFAULT_READ_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Default do limiar de spool de write buffers (espelha o default de
-/// `large_file_threshold_mb` no config).
+/// Default write buffer spool threshold (mirrors the
+/// `large_file_threshold_mb` default in the config).
 const DEFAULT_SPOOL_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 
 impl GitDriveFS {
@@ -368,13 +369,13 @@ impl GitDriveFS {
 
         let next_inode = Arc::new(AtomicU64::new(2));
 
-        // Processar diretórios em ordem crescente de profundidade para garantir
-        // que o pai exista quando o filho for inserido.
+        // Process directories in increasing depth order to guarantee the
+        // parent exists when the child is inserted.
         let mut dirs_sorted = dirs;
         dirs_sorted.sort_by_key(|p| p.matches('/').count());
 
         for dir_path in dirs_sorted {
-            // `.chunks` é artefato interno do chunking (Fase 2.6) — invisível.
+            // `.chunks` is an internal chunking artifact (Phase 2.6) — invisible.
             if crate::chunk::is_chunk_path(&dir_path) {
                 continue;
             }
@@ -385,7 +386,7 @@ impl GitDriveFS {
             };
             let parent_inode = *inodes_by_path
                 .get(&parent_path)
-                .expect("pai deve existir (dirs ordenados por profundidade)");
+                .expect("parent must exist (dirs sorted by depth)");
             let entry = DirEntry {
                 inode,
                 path: dir_path.clone(),
@@ -402,10 +403,11 @@ impl GitDriveFS {
         }
 
         for git::ListedFile { path: file_path, size, kind } in files {
-            // `.gitkeep` é artefato interno da ilusão "Git não rastreia dir
-            // vazio" (decisão 8 da Fase 2): não entra nos índices nem aparece
-            // no readdir — sem isso, o rmdir de pasta "vazia" falhava com
-            // ENOTEMPTY após um refresh (achado da validação de 03-07-2026).
+            // `.gitkeep` is an internal artifact of the "Git does not track
+            // empty dirs" illusion (Phase 2, decision 8): it never enters the
+            // indexes nor shows up in readdir — without this, rmdir of an
+            // "empty" folder failed with ENOTEMPTY after a refresh (finding
+            // from the 2026-07-03 validation).
             if leaf_name(&file_path) == ".gitkeep" || crate::chunk::is_chunk_path(&file_path) {
                 continue;
             }
@@ -416,7 +418,7 @@ impl GitDriveFS {
             };
             let parent_inode = *inodes_by_path
                 .get(&parent_path)
-                .expect("pai de arquivo deve existir");
+                .expect("file parent must exist");
             let entry = FileEntry {
                 inode,
                 path: file_path.clone(),
@@ -434,7 +436,7 @@ impl GitDriveFS {
                 .insert(inode);
         }
 
-        // Spool de buffers grandes: resíduos de um crash anterior são lixo.
+        // Large buffer spool: leftovers from a previous crash are garbage.
         let spool_dir = std::path::Path::new(repo_path).join(".git/drive-sync-spool");
         let _ = std::fs::remove_dir_all(&spool_dir);
         let _ = std::fs::create_dir_all(&spool_dir);
@@ -467,11 +469,11 @@ impl GitDriveFS {
             boot_time: SystemTime::now(),
             xattrs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         };
-        // Arquivos ignorados presentes no working tree entram como local-only
-        // visíveis (Fase 2.5): aparecem no mount, nunca em commit.
+        // Ignored files present in the working tree enter as visible
+        // local-only entries (Phase 2.5): shown in the mount, never committed.
         fs.incorporate_local_only(&HashMap::new());
-        // mtime derivado do histórico: sem isso, todo remount "renovaria" o
-        // mtime de todos os arquivos para o instante do boot.
+        // mtime derived from history: without this, every remount would
+        // "renew" the mtime of every file to the boot instant.
         fs.refresh_derived_times();
         Ok(fs)
     }
@@ -540,13 +542,13 @@ impl GitDriveFS {
         self.inodes_by_path.get(&parent_path).copied()
     }
 
-    // ---- introspecção para testes ----
+    // ---- test introspection ----
     pub fn file_count(&self) -> usize {
         self.files_by_inode.len()
     }
 
     pub fn dir_count(&self) -> usize {
-        // raiz não conta
+        // root does not count
         self.dirs_by_inode.len() - 1
     }
 
@@ -562,7 +564,7 @@ impl GitDriveFS {
         self.resolve_parent_inode(path)
     }
 
-    /// Resolve o inode filho de `parent` pelo nome. `None` se não existir.
+    /// Resolves the child inode of `parent` by name. `None` if absent.
     fn find_child_inode(&self, parent: u64, name: &str) -> Option<u64> {
         let dir = self.dirs_by_inode.get(&parent)?;
         for child in &dir.children {
@@ -579,17 +581,17 @@ impl GitDriveFS {
         None
     }
 
-    /// Lê o conteúdo corrente de um arquivo: primeiro do `write_buffer` (escritas
-    /// ainda não drenadas), depois do blob no HEAD do Git.
+    /// Reads a file's current content: first from the `write_buffer` (writes
+    /// not yet drained), then from the blob at Git HEAD.
     fn current_file_content(&self, ino: u64) -> Option<Vec<u8>> {
         let entry = self.files_by_inode.get(&ino)?;
         let path = entry.path.clone();
         self.content_for_inode_at_path(ino, &path)
     }
 
-    /// Versão explícita: consulta o buffer de escritas (chaveado por inode) e,
-    /// se vazio, lê o blob do HEAD pelo caminho passado. Útil quando `apply_rename`
-    /// já mexeu no path em memória mas ainda precisa do conteúdo antigo.
+    /// Explicit version: consults the write buffer (keyed by inode) and, if
+    /// empty, reads the HEAD blob at the given path. Useful when `apply_rename`
+    /// has already changed the in-memory path but still needs the old content.
     fn content_for_inode_at_path(&self, ino: u64, path: &str) -> Option<Vec<u8>> {
         if let Some(buf) = self.write_buffers.lock().get(&ino) {
             return Some(buf.full_vec());
@@ -608,7 +610,7 @@ impl GitDriveFS {
         self.maybe_open(bytes).ok()
     }
 
-    // ---- funções de lógica pura para testes de integração ----
+    // ---- pure logic functions for integration tests ----
 
     pub fn apply_lookup(&self, parent: u64, name: &str) -> Result<FileAttr, i32> {
         let dir = self.dirs_by_inode.get(&parent).ok_or(libc::ENOENT)?;
@@ -636,8 +638,8 @@ impl GitDriveFS {
         }
     }
 
-    /// Cria um arquivo de spool novo com o conteúdo dado. `None` em erro de
-    /// I/O — o caller degrada para RAM.
+    /// Creates a fresh spool file with the given content. `None` on I/O
+    /// error — the caller degrades to RAM.
     fn spool_from_slice(&self, data: &[u8]) -> Option<SpooledBuffer> {
         let n = self.spool_counter.fetch_add(1, Ordering::SeqCst);
         let path = self.spool_dir.join(format!("buf-{}", n));
@@ -656,7 +658,7 @@ impl GitDriveFS {
         })
     }
 
-    /// Monta um buffer novo: spooled se o conteúdo já nasce acima do limiar.
+    /// Builds a new buffer: spooled if the content is born above the threshold.
     fn make_buffer_from_vec(&self, base: Vec<u8>) -> WriteBuffer {
         if self.spool_threshold_bytes > 0 && base.len() as u64 >= self.spool_threshold_bytes {
             if let Some(sb) = self.spool_from_slice(&base) {
@@ -666,7 +668,7 @@ impl GitDriveFS {
         WriteBuffer::Mem(Arc::new(base))
     }
 
-    /// Migra um buffer em RAM para spool quando cruza o limiar.
+    /// Migrates a RAM buffer to spool when it crosses the threshold.
     fn maybe_spill(&self, buf: &mut WriteBuffer) {
         if self.spool_threshold_bytes == 0 {
             return;
@@ -680,9 +682,9 @@ impl GitDriveFS {
         }
     }
 
-    /// Snapshot imutável do buffer para a fila de sync. RAM: `Arc` clonado
-    /// (zero cópia). Spooled: cópia disco-a-disco para um arquivo de fila —
-    /// escritas posteriores no buffer não podem mutar o snapshot causal.
+    /// Immutable buffer snapshot for the sync queue. RAM: cloned `Arc`
+    /// (zero copy). Spooled: disk-to-disk copy into a queue file — later
+    /// writes to the buffer must not mutate the causal snapshot.
     fn snapshot_buffer_content(&self, buf: &WriteBuffer) -> crate::sync::WriteContent {
         match buf {
             WriteBuffer::Mem(a) => crate::sync::WriteContent::Mem(a.clone()),
@@ -697,9 +699,9 @@ impl GitDriveFS {
         }
     }
 
-    // ---- Fase 2.6: arquivos chunkados (manifest + .chunks) ----
+    // ---- Phase 2.6: chunked files (manifest + .chunks) ----
 
-    /// Manifest do inode, com detecção lazy cacheada (`Some` = chunkado).
+    /// Inode manifest, with cached lazy detection (`Some` = chunked).
     fn manifest_for(&self, ino: u64) -> Option<Arc<crate::chunk::Manifest>> {
         if let Some(cached) = self.manifests.lock().get(&ino) {
             return cached.clone();
@@ -730,8 +732,8 @@ impl GitDriveFS {
         result
     }
 
-    /// Tamanho visível ao userspace: buffer local vence; senão o tamanho real
-    /// do manifest; senão o tamanho cru do índice.
+    /// Size visible to userspace: local buffer wins; otherwise the real size
+    /// from the manifest; otherwise the raw size from the index.
     fn effective_size(&self, ino: u64, raw: u64) -> u64 {
         if self.write_buffers.lock().contains_key(&ino) {
             return raw;
@@ -739,8 +741,8 @@ impl GitDriveFS {
         self.manifest_for(ino).map(|m| m.total_size).unwrap_or(raw)
     }
 
-    /// Lê e verifica um chunk do working tree. Hash divergente = EIO — nunca
-    /// conteúdo silenciosamente errado.
+    /// Reads and verifies a chunk from the working tree. Hash mismatch = EIO —
+    /// never silently wrong content.
     fn read_verified_chunk(
         &self,
         m: &crate::chunk::Manifest,
@@ -752,19 +754,19 @@ impl GitDriveFS {
         let data = std::fs::read(&full).map_err(|_| libc::EIO)?;
         if crate::chunk::sha256_hex(&data) != *hash {
             eprintln!(
-                "[{}] chunk: hash divergente no chunk {} (idx {}) — EIO",
+                "[{}] chunk: hash mismatch on chunk {} (idx {}) — EIO",
                 log_ts(),
                 hash,
                 idx
             );
             return Err(libc::EIO);
         }
-        // Com criptografia, o hash cobre o CIPHERTEXT; decifrar vem depois.
+        // With encryption, the hash covers the CIPHERTEXT; decryption comes after.
         self.maybe_open(data)
     }
 
-    /// Leitura remontada de arquivo chunkado, com cache do último chunk
-    /// (leitura sequencial paga disco+hash uma vez por chunk, não por syscall).
+    /// Reassembled read of a chunked file, caching the last chunk
+    /// (sequential reads pay disk+hash once per chunk, not per syscall).
     fn read_chunked(
         &mut self,
         ino: u64,
@@ -781,7 +783,7 @@ impl GitDriveFS {
                 let data = self.read_verified_chunk(m, idx)?;
                 self.last_chunk = Some((ino, idx, data));
             }
-            let data = &self.last_chunk.as_ref().expect("preenchido acima").2;
+            let data = &self.last_chunk.as_ref().expect("filled above").2;
             let chunk_start = idx as u64 * m.chunk_size;
             let s = (offset as u64).max(chunk_start) - chunk_start;
             let e = end.min(chunk_start + data.len() as u64) - chunk_start;
@@ -790,7 +792,7 @@ impl GitDriveFS {
         Ok(out)
     }
 
-    /// Conteúdo integral remontado (caminhos frios: swap, link, fallback).
+    /// Fully reassembled content (cold paths: swap, link, fallback).
     fn reassemble_chunked(&self, m: &crate::chunk::Manifest) -> Option<Vec<u8>> {
         let mut out = Vec::with_capacity(m.total_size as usize);
         for idx in 0..m.hashes.len() {
@@ -799,8 +801,9 @@ impl GitDriveFS {
         Some(out)
     }
 
-    /// Buffer de escrita para chunkado: remonta chunk a chunk direto no spool
-    /// quando o total excede o limiar — RAM limitada a um chunk.
+    /// Write buffer for a chunked file: reassembles chunk by chunk straight
+    /// into the spool when the total exceeds the threshold — RAM bounded by
+    /// one chunk.
     fn buffer_from_manifest(&self, m: &crate::chunk::Manifest) -> Option<WriteBuffer> {
         if self.spool_threshold_bytes > 0 && m.total_size >= self.spool_threshold_bytes {
             let n = self.spool_counter.fetch_add(1, Ordering::SeqCst);
@@ -825,21 +828,21 @@ impl GitDriveFS {
         }
     }
 
-    /// Garante que o inode tem buffer de escrita, inicializando-o com o
-    /// conteúdo corrente do arquivo (blob no HEAD) na primeira mutação.
-    /// Semântica POSIX: `write`/`truncate` operam sobre o conteúdo existente —
-    /// buffer nascendo vazio zerava tudo que não fosse reescrito (corrupção em
-    /// append, páginas sujas de editor e truncate).
+    /// Ensures the inode has a write buffer, initializing it with the file's
+    /// current content (blob at HEAD) on the first mutation.
+    /// POSIX semantics: `write`/`truncate` operate on the existing content —
+    /// a buffer born empty zeroed out everything not rewritten (corruption on
+    /// append, editor dirty pages and truncate).
     fn ensure_buffer(&self, ino: u64, path: &str) {
         if self.write_buffers.lock().contains_key(&ino) {
             return;
         }
         let buffer = if let Some(m) = self.manifest_for(ino) {
-            // Chunkado: o buffer nasce da REMONTAGEM, nunca do manifest cru —
-            // mesma semântica POSIX do invariante da Fase 0.
+            // Chunked: the buffer is born from the REASSEMBLY, never from the
+            // raw manifest — same POSIX semantics as the Phase 0 invariant.
             self.buffer_from_manifest(&m).unwrap_or_else(|| {
                 eprintln!(
-                    "[{}] chunk: falha ao remontar buffer de escrita — nascendo vazio",
+                    "[{}] chunk: failed to reassemble write buffer — starting empty",
                     log_ts()
                 );
                 WriteBuffer::Mem(Arc::new(Vec::new()))
@@ -851,7 +854,7 @@ impl GitDriveFS {
         self.write_buffers.lock().entry(ino).or_insert(buffer);
     }
 
-    /// Escrita em offset sobre o buffer do inode. Retorna bytes aceitos.
+    /// Write at an offset into the inode's buffer. Returns bytes accepted.
     pub fn apply_write(&mut self, ino: u64, offset: usize, data: &[u8]) -> Result<u32, i32> {
         let path = match self.files_by_inode.get(&ino) {
             Some(f) => f.path.clone(),
@@ -860,7 +863,7 @@ impl GitDriveFS {
         self.ensure_buffer(ino, &path);
         let new_len = {
             let mut buffers = self.write_buffers.lock();
-            let buf = buffers.get_mut(&ino).expect("buffer garantido acima");
+            let buf = buffers.get_mut(&ino).expect("buffer guaranteed above");
             buf.write_at(offset, data);
             self.maybe_spill(buf);
             buf.len()
@@ -869,14 +872,14 @@ impl GitDriveFS {
             f.size = new_len;
         }
         self.dirty.insert(ino);
-        // Buffer passa a ter precedência no read; a entrada do cache só
-        // ocuparia memória (e ficaria stale após o commit).
+        // The buffer now takes precedence on read; the cache entry would
+        // only waste memory (and go stale after the commit).
         self.read_cache.remove(ino);
         Ok(data.len() as u32)
     }
 
-    /// Truncate (setattr com `size`). Materializa a op imediatamente — um
-    /// `truncate(2)` por path pode não ser seguido de flush.
+    /// Truncate (setattr with `size`). Materializes the op immediately — a
+    /// path-based `truncate(2)` may not be followed by a flush.
     pub fn apply_truncate(&mut self, ino: u64, new_size: u64) -> Result<(), i32> {
         let path = match self.files_by_inode.get(&ino) {
             Some(f) => f.path.clone(),
@@ -885,7 +888,7 @@ impl GitDriveFS {
         self.ensure_buffer(ino, &path);
         let content = {
             let mut buffers = self.write_buffers.lock();
-            let buf = buffers.get_mut(&ino).expect("buffer garantido acima");
+            let buf = buffers.get_mut(&ino).expect("buffer guaranteed above");
             buf.set_len(new_size);
             self.maybe_spill(buf);
             self.snapshot_buffer_content(buf)
@@ -894,16 +897,16 @@ impl GitDriveFS {
             f.size = new_size;
         }
         self.sync.queue_write_content(&path, content);
-        // Conteúdo do buffer acabou de ser enfileirado — inode volta a "limpo";
-        // um flush subsequente sem escrita nova não deve duplicar a op.
+        // Buffer content was just queued — the inode is "clean" again; a
+        // subsequent flush without new writes must not duplicate the op.
         self.dirty.remove(&ino);
         self.read_cache.remove(ino);
         Ok(())
     }
 
-    /// Leitura de um intervalo do arquivo. Ordem das fontes: write buffer
-    /// (mutações pendentes), cache de blobs, blob do HEAD (miss popula o
-    /// cache). Erros do git viram EIO.
+    /// Reads a range of the file. Source order: write buffer (pending
+    /// mutations), blob cache, blob at HEAD (a miss populates the cache).
+    /// Git errors become EIO.
     pub fn apply_read(&mut self, ino: u64, offset: usize, size: usize) -> Result<Vec<u8>, i32> {
         fn slice_of(data: &[u8], offset: usize, size: usize) -> Vec<u8> {
             let start = offset.min(data.len());
@@ -918,8 +921,8 @@ impl GitDriveFS {
             Some(f) => (f.path.clone(), f.local_only, f.kind),
             None => return Err(libc::ENOENT),
         };
-        // Chunkado: leitura remontada por chunk (verificação de hash);
-        // o BlobCache nunca guarda nem o manifest cru nem chunks.
+        // Chunked: reassembled per-chunk read (hash verification);
+        // the BlobCache never stores the raw manifest nor chunks.
         if let Some(m) = self.manifest_for(ino) {
             return self.read_chunked(ino, &m, offset, size);
         }
@@ -936,8 +939,8 @@ impl GitDriveFS {
         Ok(out)
     }
 
-    /// Alvo de um symlink (conteúdo do blob = texto do alvo). EINVAL para
-    /// arquivo regular, ENOENT para inode desconhecido.
+    /// Target of a symlink (blob content = target text). EINVAL for a
+    /// regular file, ENOENT for an unknown inode.
     pub fn apply_readlink(&mut self, ino: u64) -> Result<Vec<u8>, i32> {
         match self.files_by_inode.get(&ino) {
             Some(f) if f.kind == git::FileKind::Symlink => {}
@@ -946,14 +949,14 @@ impl GitDriveFS {
         }
         let raw = self.apply_read(ino, 0, usize::MAX)?;
         if let Some(c) = &self.crypto {
-            // Alvo no disco está cifrado por componente; a visão é clara.
+            // The on-disk target is encrypted per component; the view is clear.
             let s = String::from_utf8_lossy(&raw);
             return Ok(c.dec_path(&s).into_bytes());
         }
         Ok(raw)
     }
 
-    /// Path como está no DISCO/HEAD: cifrado quando a criptografia está ativa.
+    /// Path as it exists on DISK/HEAD: encrypted when encryption is active.
     fn disk_path(&self, clear: &str) -> String {
         match &self.crypto {
             Some(c) => c.enc_path(clear).unwrap_or_else(|_| clear.to_string()),
@@ -961,8 +964,8 @@ impl GitDriveFS {
         }
     }
 
-    /// Decifra bytes selados quando a cripto está ativa; conteúdo sem a magic
-    /// passa direto (estado misto). Falha de AEAD = EIO, nunca lixo.
+    /// Decrypts sealed bytes when crypto is active; content without the magic
+    /// passes through (mixed state). AEAD failure = EIO, never garbage.
     fn maybe_open(&self, bytes: Vec<u8>) -> Result<Vec<u8>, i32> {
         match &self.crypto {
             Some(c) if crate::crypt::Crypto::is_encrypted_bytes(&bytes) => {
@@ -975,9 +978,10 @@ impl GitDriveFS {
         }
     }
 
-    /// Blob do HEAD via handle persistente — abre o repo uma vez e reutiliza
-    /// nas leituras seguintes. Erro derruba o handle (reabre na próxima
-    /// chamada) e vira EIO. Com criptografia, busca no path cifrado e decifra.
+    /// HEAD blob via persistent handle — opens the repo once and reuses it
+    /// for subsequent reads. An error drops the handle (reopened on the next
+    /// call) and becomes EIO. With encryption, looks up the encrypted path
+    /// and decrypts.
     fn head_blob_via_persistent_handle(&mut self, path: &str) -> Result<Vec<u8>, i32> {
         if self.read_repo.is_none() {
             self.read_repo = git::open_repo(&self.repo_path).ok();
@@ -994,22 +998,22 @@ impl GitDriveFS {
         match result {
             Ok(content) => self.maybe_open(content),
             Err(_) => {
-                // Handle pode ter ficado inválido (repo movido, gc externo):
-                // descarta para reabrir na próxima leitura.
+                // The handle may have become invalid (repo moved, external
+                // gc): drop it so the next read reopens.
                 self.read_repo = None;
                 Err(libc::EIO)
             }
         }
     }
 
-    /// Aberturas reais do handle persistente de leitura (introspecção).
+    /// Actual opens of the persistent read handle (introspection).
     pub fn read_repo_opens_for_test(&self) -> u64 {
         self.read_repo_opens
     }
 
-    /// Flush de um inode: enfileira o buffer no sync APENAS se houve escrita
-    /// desde o último flush (dirty). Retorna o path enfileirado, ou `None` se
-    /// não havia nada a fazer (ex.: close de fd aberto só para leitura).
+    /// Flush of an inode: queues the buffer into sync ONLY if there was a
+    /// write since the last flush (dirty). Returns the queued path, or `None`
+    /// if there was nothing to do (e.g. close of a read-only fd).
     pub fn apply_flush(&mut self, ino: u64) -> Option<String> {
         if !self.dirty.contains(&ino) {
             return None;
@@ -1026,31 +1030,31 @@ impl GitDriveFS {
         Some(path)
     }
 
-    /// Descarta buffers de inodes sem escrita pendente (não-dirty) e o cache
-    /// de blobs inteiro — os pontos de chamada significam "o HEAD mudou".
-    /// Buffers dirty nunca são tocados — o conteúdo deles ainda não chegou
-    /// ao sync.
+    /// Discards buffers of inodes with no pending writes (non-dirty) and the
+    /// entire blob cache — the call sites mean "HEAD changed".
+    /// Dirty buffers are never touched — their content has not reached
+    /// sync yet.
     fn gc_clean_buffers(&mut self) {
         let dirty = &self.dirty;
         self.write_buffers.lock().retain(|ino, _| dirty.contains(ino));
         self.read_cache.clear();
-        // HEAD mudou: manifests podem ter trocado de conteúdo/estado.
+        // HEAD changed: manifests may have changed content/state.
         self.manifests.lock().clear();
         self.last_chunk = None;
     }
 
-    /// Conteúdo corrente visível para leitura (buffer ou blob do HEAD).
+    /// Current content visible for reading (buffer or blob at HEAD).
     pub fn read_content_for_test(&self, ino: u64) -> Option<Vec<u8>> {
         self.current_file_content(ino)
     }
 
-    /// Quantidade de write buffers vivos (introspecção para testes).
+    /// Number of live write buffers (test introspection).
     pub fn buffered_count_for_test(&self) -> usize {
         self.write_buffers.lock().len()
     }
 
-    /// `Arc` do buffer de um inode (introspecção para testes de
-    /// compartilhamento de conteúdo com a fila).
+    /// `Arc` of an inode's buffer (introspection for tests of content
+    /// sharing with the queue).
     pub fn buffer_arc_for_test(&self, ino: u64) -> Option<Arc<Vec<u8>>> {
         match self.write_buffers.lock().get(&ino) {
             Some(WriteBuffer::Mem(a)) => Some(a.clone()),
@@ -1058,7 +1062,7 @@ impl GitDriveFS {
         }
     }
 
-    /// `true` se o buffer do inode está em arquivo de spool (introspecção).
+    /// `true` if the inode's buffer lives in a spool file (introspection).
     pub fn buffer_is_spooled_for_test(&self, ino: u64) -> bool {
         matches!(
             self.write_buffers.lock().get(&ino),
@@ -1074,7 +1078,7 @@ impl GitDriveFS {
         self.read_cache.len()
     }
 
-    /// (hits, misses) acumulados do cache de leitura.
+    /// Accumulated (hits, misses) of the read cache.
     pub fn read_cache_stats_for_test(&self) -> (u64, u64) {
         self.read_cache.stats()
     }
@@ -1118,10 +1122,10 @@ impl GitDriveFS {
             .children
             .insert(inode);
 
-        // Enfileirar write vazio para materializar no disco (flush posterior pode sobrescrever)
+        // Queue an empty write to materialize on disk (a later flush may overwrite)
         self.sync.queue_write(&full_path, Vec::new());
-        // Buffer vazio (não-dirty) para que reads antes do commit retornem
-        // vazio em vez de EIO — o path novo ainda não existe no HEAD.
+        // Empty (non-dirty) buffer so reads before the commit return empty
+        // instead of EIO — the new path does not exist in HEAD yet.
         self.write_buffers
             .lock()
             .insert(inode, WriteBuffer::Mem(Arc::new(Vec::new())));
@@ -1129,8 +1133,8 @@ impl GitDriveFS {
         Ok((inode, self.file_attr_for(inode, 0)))
     }
 
-    /// Cria um symlink `parent/name -> target`. O alvo é texto opaco (nunca
-    /// resolvido pelo drive-sync); o blob commitado é o próprio texto.
+    /// Creates a symlink `parent/name -> target`. The target is opaque text
+    /// (never resolved by drive-sync); the committed blob is the text itself.
     pub fn apply_symlink(
         &mut self,
         parent: u64,
@@ -1171,8 +1175,8 @@ impl GitDriveFS {
             .children
             .insert(inode);
 
-        // Buffer (não-dirty) com o texto do alvo: readlink funciona antes do
-        // commit — o path ainda não existe no HEAD.
+        // (Non-dirty) buffer with the target text: readlink works before the
+        // commit — the path does not exist in HEAD yet.
         self.write_buffers
             .lock()
             .insert(inode, WriteBuffer::Mem(Arc::new(target.as_bytes().to_vec())));
@@ -1247,67 +1251,67 @@ impl GitDriveFS {
         self.sync.queue_write(path, content);
     }
 
-    /// Se o `SyncManager` sinalizou mudanças vindas do pull watcher,
-    /// reconstrói os índices `files_by_inode`/`dirs_by_inode`/`inodes_by_path`.
-    /// Preserva os inodes de paths ainda existentes e não regride `next_inode`.
+    /// If the `SyncManager` signaled changes coming from the pull watcher,
+    /// rebuilds the `files_by_inode`/`dirs_by_inode`/`inodes_by_path` indexes.
+    /// Preserves inodes of still-existing paths and never regresses `next_inode`.
     pub fn refresh_if_needed(&mut self) {
-        // Guarda crítica: se há ops pendentes no sync buffer (writes/mkdirs/etc
-        // ainda não drenados pelo watcher de debounce), NÃO refresh — o refresh
-        // reconstrói índices a partir do HEAD do git, descartando qualquer
-        // arquivo/dir criado localmente que ainda não chegou ao commit. Sem essa
-        // guarda, paths recém-criados via CREATE/MKDIR sumiam dos índices, e o
-        // próximo rename/unlink/rmdir pelo Finder retornava ENOENT — Finder
-        // mostra "(error code -43)". A flag continua setada (não consumimos
-        // com take_refresh_flag), então o refresh roda no próximo
-        // lookup/getattr/readdir após o drain.
+        // Critical guard: if there are pending ops in the sync buffer
+        // (writes/mkdirs/etc not yet drained by the debounce watcher), do NOT
+        // refresh — the refresh rebuilds indexes from git HEAD, discarding any
+        // locally created file/dir that has not reached a commit yet. Without
+        // this guard, paths just created via CREATE/MKDIR vanished from the
+        // indexes, and the next rename/unlink/rmdir from Finder returned
+        // ENOENT — Finder shows "(error code -43)". The flag stays set (we do
+        // not consume it with take_refresh_flag), so the refresh runs on the
+        // next lookup/getattr/readdir after the drain.
         if self.sync.has_pending_ops() {
             return;
         }
-        // GC de buffers limpos quando um commit local novo aconteceu: com o
-        // sync buffer vazio (checado acima), tudo que foi enfileirado já foi
-        // drenado, e o commit garante que o conteúdo está no HEAD. Descartar
-        // o buffer faz o `read` voltar a enxergar o HEAD — sem isso, mudanças
-        // remotas nesse arquivo ficariam invisíveis para sempre.
+        // GC of clean buffers when a new local commit happened: with the sync
+        // buffer empty (checked above), everything queued has been drained,
+        // and the commit guarantees the content is in HEAD. Discarding the
+        // buffer makes `read` see HEAD again — without this, remote changes
+        // to that file would stay invisible forever.
         let gen = self.sync.commit_generation();
         if gen != self.last_commit_gen {
             self.last_commit_gen = gen;
             self.gc_clean_buffers();
-            // Arquivos ignorados que participaram do lote ficaram fora do
-            // commit — marcá-los local-only redireciona os reads para o
-            // working tree (o buffer que os servia acabou de ser coletado).
+            // Ignored files that took part in the batch stayed out of the
+            // commit — marking them local-only redirects reads to the
+            // working tree (the buffer that served them was just collected).
             self.incorporate_local_only(&HashMap::new());
         }
         if !self.sync.take_refresh_flag() {
             return;
         }
-        // Refresh pós-pull: o HEAD avançou por fetch/merge (que só roda com
-        // working tree limpo). Buffers limpos refletem o HEAD antigo — descartar.
+        // Post-pull refresh: HEAD advanced via fetch/merge (which only runs
+        // with a clean working tree). Clean buffers reflect the old HEAD — discard.
         self.gc_clean_buffers();
         let repo = match git::open_repo(&self.repo_path) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[{}] refresh_if_needed: erro ao abrir repo: {}", log_ts(), e);
+                eprintln!("[{}] refresh_if_needed: error opening repo: {}", log_ts(), e);
                 return;
             }
         };
         let commit = match git::get_commit(&repo, "HEAD") {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[{}] refresh_if_needed: erro ao resolver HEAD: {}", log_ts(), e);
+                eprintln!("[{}] refresh_if_needed: error resolving HEAD: {}", log_ts(), e);
                 return;
             }
         };
         let dirs = match git::list_dirs_at_commit(&repo, &commit) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[{}] refresh_if_needed: list_dirs falhou: {}", log_ts(), e);
+                eprintln!("[{}] refresh_if_needed: list_dirs failed: {}", log_ts(), e);
                 return;
             }
         };
         let files = match git::list_files_at_commit(&repo, &commit) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("[{}] refresh_if_needed: list_files falhou: {}", log_ts(), e);
+                eprintln!("[{}] refresh_if_needed: list_files failed: {}", log_ts(), e);
                 return;
             }
         };
@@ -1335,8 +1339,9 @@ impl GitDriveFS {
             if crate::chunk::is_chunk_path(&dir_path) {
                 continue;
             }
-            // `unwrap_or_else` (lazy): a forma eager com `unwrap_or` avaliava
-            // o alloc sempre, vazando um inode por path existente a cada refresh.
+            // `unwrap_or_else` (lazy): the eager form with `unwrap_or` always
+            // evaluated the alloc, leaking one inode per existing path on
+            // every refresh.
             let inode = previous
                 .get(&dir_path)
                 .copied()
@@ -1359,8 +1364,8 @@ impl GitDriveFS {
         }
 
         for git::ListedFile { path: file_path, size, kind } in files {
-            // Mesma regra da ingestão inicial: `.gitkeep` e `.chunks` ficam
-            // fora dos índices.
+            // Same rule as the initial ingestion: `.gitkeep` and `.chunks`
+            // stay out of the indexes.
             if leaf_name(&file_path) == ".gitkeep" || crate::chunk::is_chunk_path(&file_path) {
                 continue;
             }
@@ -1390,10 +1395,11 @@ impl GitDriveFS {
         self.files_by_inode = files_by_inode;
         self.dirs_by_inode = dirs_by_inode;
         self.inodes_by_path = inodes_by_path;
-        // Local-only não vive no HEAD: reincorpora do working tree, reusando
-        // inodes do índice anterior para não invalidar handles do kernel.
+        // Local-only entries do not live in HEAD: reincorporate them from the
+        // working tree, reusing inodes from the previous index so kernel
+        // handles stay valid.
         self.incorporate_local_only(&previous);
-        // HEAD avançou: paths tocados pelo pull ganham o mtime do commit novo.
+        // HEAD advanced: paths touched by the pull get the new commit's mtime.
         self.refresh_derived_times();
     }
 
@@ -1433,27 +1439,27 @@ impl GitDriveFS {
         Ok((inode, self.dir_attr_for(inode)))
     }
 
-    /// Swap de conteúdo entre o único arquivo-filho de `source_parent` e o
-    /// arquivo de mesmo nome em `target_parent`. Usado quando macFUSE envia
-    /// FUSE_RENAME com nomes vazios como encoding alternativo de exchangedata.
-    /// Semanticamente: após a chamada, ambos os arquivos continuam existindo,
-    /// mas com o conteúdo trocado.
+    /// Content swap between the single file child of `source_parent` and the
+    /// same-named file in `target_parent`. Used when macFUSE sends
+    /// FUSE_RENAME with empty names as an alternate encoding of exchangedata.
+    /// Semantically: after the call, both files still exist, but with their
+    /// contents swapped.
     fn apply_implicit_swap(&mut self, source_parent: u64, target_parent: u64) -> Result<(), i32> {
-        // Quando source_parent == target_parent, RENAME parent/"" -> parent/"" é
-        // um sinal pós-commit do macFUSE (refresh de metadata), não um swap real
-        // do TextEdit. Retorna Ok como no-op antes de tentar pickar arquivo —
-        // sem isso, se o dir não tem arquivos (só dirs), pickar falha e
-        // retornamos ENOENT, que vira -43 no Finder.
+        // When source_parent == target_parent, RENAME parent/"" -> parent/"" is
+        // a post-commit signal from macFUSE (metadata refresh), not a real
+        // TextEdit swap. Return Ok as a no-op before trying to pick a file —
+        // without this, if the dir has no files (only dirs), picking fails and
+        // we return ENOENT, which becomes -43 in Finder.
         if source_parent == target_parent {
             return Ok(());
         }
         let (src_ino, src_name, src_path) = {
             let dir = self.dirs_by_inode.get(&source_parent).ok_or(libc::ENOENT)?;
-            // O encoding do macFUSE não transporta QUAL arquivo trocar — o
-            // contrato do safe-save é um temp dir com UM arquivo. Com zero ou
-            // mais de um, qualquer escolha é chute, e chute errado troca o
-            // conteúdo do arquivo errado (corrupção silenciosa). EXDEV degrada
-            // o app para o fluxo de cópia, que funciona.
+            // The macFUSE encoding does not carry WHICH file to swap — the
+            // safe-save contract is a temp dir with ONE file. With zero or
+            // more than one, any choice is a guess, and a wrong guess swaps
+            // the content of the wrong file (silent corruption). EXDEV
+            // degrades the app to the copy flow, which works.
             let file_children: Vec<u64> = dir
                 .children
                 .iter()
@@ -1462,7 +1468,7 @@ impl GitDriveFS {
                 .collect();
             if file_children.len() != 1 {
                 eprintln!(
-                    "[{}] swap implicit ambíguo: source_parent={} tem {} arquivos (esperado 1) — retornando EXDEV",
+                    "[{}] ambiguous implicit swap: source_parent={} has {} files (expected 1) — returning EXDEV",
                     log_ts(),
                     source_parent,
                     file_children.len()
@@ -1485,15 +1491,16 @@ impl GitDriveFS {
                     }
                 }
             }
-            // Sem par no target: não é um swap (caso típico = "Move to Trash"
-            // do Finder, onde target=.Trashes/<uid> está vazio). EXDEV sinaliza
-            // "operação cross-device" pro caller — preferível a ENOENT (que
-            // vira "-43 items can't be found" no Finder). Idealmente, o MKDIR
-            // de .Trashes já foi rejeitado antes; isso aqui é defesa em
-            // profundidade pra outros encodings de exchangedata ambíguos.
+            // No counterpart in the target: not a swap (typical case =
+            // Finder's "Move to Trash", where target=.Trashes/<uid> is
+            // empty). EXDEV signals "cross-device operation" to the caller —
+            // preferable to ENOENT (which becomes "-43 items can't be found"
+            // in Finder). Ideally the MKDIR of .Trashes was already rejected
+            // earlier; this is defense in depth for other ambiguous
+            // exchangedata encodings.
             let Some(ino) = picked else {
                 eprintln!(
-                    "[{}] swap implicit ambíguo: src={:?} no target_parent={} sem par — retornando EXDEV",
+                    "[{}] ambiguous implicit swap: src={:?} has no counterpart in target_parent={} — returning EXDEV",
                     log_ts(),
                     src_name,
                     target_parent
@@ -1504,9 +1511,9 @@ impl GitDriveFS {
             (ino, entry.path.clone())
         };
 
-        // Guarda: se source e target são o mesmo inode, não há o que trocar.
-        // Acontece quando o Finder emite RENAME 1/"" -> 1/"" em updates de
-        // metadata — não é um save real, retorna Ok silenciosamente.
+        // Guard: if source and target are the same inode, there is nothing to
+        // swap. Happens when Finder emits RENAME 1/"" -> 1/"" on metadata
+        // updates — not a real save, return Ok silently.
         if src_ino == tgt_ino {
             return Ok(());
         }
@@ -1547,9 +1554,9 @@ impl GitDriveFS {
         Ok(())
     }
 
-    /// Troca atômica de conteúdo entre dois arquivos nomeados — semântica do
-    /// exchangedata(2)/renameatx_np(RENAME_SWAP). Usada pelo callback
-    /// `exchange` (FUSE_EXCHANGE) e por `rename` com a flag SWAP.
+    /// Atomic content exchange between two named files — the semantics of
+    /// exchangedata(2)/renameatx_np(RENAME_SWAP). Used by the `exchange`
+    /// callback (FUSE_EXCHANGE) and by `rename` with the SWAP flag.
     pub fn apply_exchange(
         &mut self,
         parent: u64,
@@ -1577,7 +1584,7 @@ impl GitDriveFS {
             return Err(libc::ENOENT);
         };
 
-        // Trocar tamanhos em memória
+        // Swap sizes in memory
         let size_a = content_a.len() as u64;
         let size_b = content_b.len() as u64;
         if let Some(f) = self.files_by_inode.get_mut(&ino_a) {
@@ -1587,7 +1594,7 @@ impl GitDriveFS {
             f.size = size_a;
         }
 
-        // Buffers refletem o conteúdo trocado para reads antes do commit
+        // Buffers reflect the swapped content for reads before the commit
         let shared_b = Arc::new(content_b);
         let shared_a = Arc::new(content_a);
         {
@@ -1617,15 +1624,15 @@ impl GitDriveFS {
         new_parent: u64,
         new_name: &str,
     ) -> Result<(), i32> {
-        // Fallback defensivo: nomes vazios eram artefato do parse desalinhado
-        // do fuse_rename_in no macFUSE (8 bytes de flags/padding lidos como
-        // nomes) — corrigido no vendor/fuser. Se algum encoding ainda chegar
-        // assim, cai na heurística antiga de swap do único arquivo-filho.
+        // Defensive fallback: empty names were an artifact of the misaligned
+        // fuse_rename_in parse in macFUSE (8 bytes of flags/padding read as
+        // names) — fixed in vendor/fuser. If some encoding still arrives like
+        // this, fall back to the old single-file-child swap heuristic.
         if name.is_empty() && new_name.is_empty() {
             return self.apply_implicit_swap(parent, new_parent);
         }
 
-        // 1. Resolver fonte em `parent`
+        // 1. Resolve the source in `parent`
         let src_dir = self.dirs_by_inode.get(&parent).ok_or(libc::ENOENT)?;
         let mut src_ino: Option<u64> = None;
         let mut src_is_dir = false;
@@ -1647,12 +1654,12 @@ impl GitDriveFS {
             return Err(libc::ENOENT);
         };
 
-        // 2. Validar new_parent é diretório
+        // 2. Validate new_parent is a directory
         if !self.dirs_by_inode.contains_key(&new_parent) {
             return Err(libc::ENOTDIR);
         }
 
-        // 3. Checar destino existente
+        // 3. Check for an existing destination
         let mut dest_existing: Option<(u64, bool)> = None;
         {
             let dst_dir = self.dirs_by_inode.get(&new_parent).unwrap();
@@ -1674,11 +1681,11 @@ impl GitDriveFS {
             if src_is_dir || dest_is_dir {
                 return Err(libc::EEXIST);
             }
-            // Arquivo em cima de arquivo: overwrite (unlink implícito do destino)
+            // File over file: overwrite (implicit unlink of the destination)
             self.apply_unlink(new_parent, new_name)?;
         }
 
-        // 4. Montar novo path
+        // 4. Build the new path
         let new_parent_path = self.dirs_by_inode.get(&new_parent).unwrap().path.clone();
         let new_path = if new_parent_path.is_empty() {
             new_name.to_string()
@@ -1686,14 +1693,14 @@ impl GitDriveFS {
             format!("{}/{}", new_parent_path, new_name)
         };
 
-        // 5. Capturar old path
+        // 5. Capture the old path
         let old_path = if src_is_dir {
             self.dirs_by_inode.get(&src).unwrap().path.clone()
         } else {
             self.files_by_inode.get(&src).unwrap().path.clone()
         };
 
-        // 6. Remover do parent antigo, mover para new_parent
+        // 6. Remove from the old parent, move to new_parent
         self.dirs_by_inode
             .get_mut(&parent)
             .unwrap()
@@ -1705,7 +1712,7 @@ impl GitDriveFS {
             .children
             .insert(src);
 
-        // 7. Atualizar path/parent da entrada-fonte e descendentes
+        // 7. Update path/parent of the source entry and its descendants
         if src_is_dir {
             if let Some(d) = self.dirs_by_inode.get_mut(&src) {
                 d.path = new_path.clone();
@@ -1718,19 +1725,19 @@ impl GitDriveFS {
                 f.parent = new_parent;
             }
         }
-        // Re-indexar paths dos dois (src e descendentes já foram feitos acima)
+        // Re-index both paths (src and descendants were handled above)
         self.reindex_paths();
 
         if src_is_dir {
             let src_eph = crate::sync::is_fully_ephemeral_path(&old_path);
             let dest_eph = crate::sync::is_fully_ephemeral_path(&new_path);
             if dest_eph && !src_eph {
-                // Mover dir real para área efêmera (ex.: Trash) = remoção do
-                // repo. O filtro descartaria o Rename inteiro e o disco
-                // divergiria do índice. Expandimos em Delete/Rmdir dos paths
-                // ANTIGOS (reais), bottom-up. Buffers preservam o conteúdo em
-                // memória: reads dentro do Trash continuam funcionando e um
-                // rename de volta rematerializa.
+                // Moving a real dir into an ephemeral area (e.g. Trash) =
+                // removal from the repo. The filter would discard the whole
+                // Rename and the disk would diverge from the index. We expand
+                // it into Delete/Rmdir of the OLD (real) paths, bottom-up.
+                // Buffers keep the content in memory: reads inside the Trash
+                // keep working and a rename back rematerializes.
                 let (mut dirs, files) = self.collect_subtree(src);
                 let to_old = |p: &str| format!("{}{}", old_path, &p[new_path.len()..]);
                 for (ino, path) in &files {
@@ -1750,9 +1757,9 @@ impl GitDriveFS {
                     self.sync.queue_rmdir(&to_old(path));
                 }
             } else if src_eph && !dest_eph {
-                // Dir efêmero virando real = materialização: o conteúdo só
-                // existe em memória (ou no HEAD, se era legado commitado).
-                // Mkdir top-down + Write com conteúdo corrente.
+                // Ephemeral dir becoming real = materialization: the content
+                // only exists in memory (or in HEAD, if it was committed
+                // legacy). Mkdir top-down + Write with current content.
                 let (mut dirs, files) = self.collect_subtree(src);
                 let to_old = |p: &str| format!("{}{}", old_path, &p[new_path.len()..]);
                 dirs.sort_by_key(|(_, p)| p.matches('/').count());
@@ -1768,34 +1775,36 @@ impl GitDriveFS {
                     self.dirty.remove(ino);
                 }
             } else {
-                // Diretório: usamos Rename nativo no disco (mv). Dirs
-                // vazios/cheios transitam tranquilamente. (Efêmero -> efêmero
-                // cai aqui e o filtro do enqueue descarta — memória apenas.)
+                // Directory: we use a native Rename on disk (mv). Empty/full
+                // dirs transition just fine. (Ephemeral -> ephemeral lands
+                // here and the enqueue filter discards it — memory only.)
                 self.sync.queue_rename(&old_path, &new_path);
             }
         } else if self.manifest_for(src).is_some()
             && !self.write_buffers.lock().contains_key(&src)
         {
-            // Chunkado sem edição local: move só o MANIFEST — os chunks são
-            // content-addressed e ficam onde estão (o GC preserva enquanto
-            // houver manifest referenciando).
-            let m = self.manifest_for(src).expect("checado acima");
+            // Chunked with no local edits: move only the MANIFEST — chunks
+            // are content-addressed and stay where they are (the GC preserves
+            // them while any manifest references them).
+            let m = self.manifest_for(src).expect("checked above");
             self.read_cache.remove(src);
             self.sync.queue_write(&new_path, m.serialize());
             self.sync.queue_delete(&old_path);
             self.dirty.remove(&src);
         } else {
-            // Arquivo: traduz rename em Write(dest) + Delete(src). Isso desacopla
-            // da existência do src em disco (que pode ter sido criada em ops que
-            // foram coalescidas no buffer, nunca virando arquivo real). Precisa
-            // ler o conteúdo pelo path ANTIGO, já que o in-memory path foi mudado.
+            // File: translates the rename into Write(dest) + Delete(src). This
+            // decouples it from the src existing on disk (it may have been
+            // created by ops coalesced in the buffer, never becoming a real
+            // file). The content must be read via the OLD path, since the
+            // in-memory path has already changed.
             let content = self
                 .content_for_inode_at_path(src, &old_path)
                 .unwrap_or_default();
-            // Buffer (não-dirty) mantém o conteúdo legível até o commit: o
-            // path NOVO não existe no HEAD ainda — sem isso, read pós-rename
-            // caía no blob inexistente e retornava EIO. O gc descarta após
-            // o commit. A entrada de cache do path antigo fica stale — fora.
+            // A (non-dirty) buffer keeps the content readable until the
+            // commit: the NEW path does not exist in HEAD yet — without this,
+            // a post-rename read hit the nonexistent blob and returned EIO.
+            // The gc discards it after the commit. The old path's cache entry
+            // goes stale — out.
             let shared = Arc::new(content);
             self.write_buffers
                 .lock()
@@ -1804,34 +1813,35 @@ impl GitDriveFS {
             self.sync
                 .queue_write_content(&new_path, crate::sync::WriteContent::Mem(shared));
             self.sync.queue_delete(&old_path);
-            // Conteúdo corrente (incluindo escritas pendentes) foi enfileirado
-            // no destino — inode volta a "limpo".
+            // Current content (including pending writes) was queued at the
+            // destination — the inode is "clean" again.
             self.dirty.remove(&src);
         }
         Ok(())
     }
 
-    /// Incorpora ao índice os arquivos ignorados do working tree (local-only
-    /// visíveis). Paths já presentes são marcados/atualizados; ausentes ganham
-    /// entrada nova (reusando inode de `previous` quando o path existia antes
-    /// de um rebuild). Diretórios intermediários fora do HEAD são criados.
+    /// Incorporates the working tree's ignored files into the index (visible
+    /// local-only entries). Paths already present are marked/updated; absent
+    /// ones get a new entry (reusing the inode from `previous` when the path
+    /// existed before a rebuild). Intermediate directories outside HEAD are
+    /// created.
     fn incorporate_local_only(&mut self, previous: &HashMap<String, u64>) {
-        // Modo cifrado: a semântica de ignore do repo está desativada (regras
-        // casariam contra nomes cifrados) — nada de local-only.
+        // Encrypted mode: the repo's ignore semantics are disabled (rules
+        // would match against encrypted names) — no local-only entries.
         if self.crypto.is_some() {
             return;
         }
         let repo = match git::open_repo(&self.repo_path) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[{}] local-only: erro ao abrir repo: {}", log_ts(), e);
+                eprintln!("[{}] local-only: error opening repo: {}", log_ts(), e);
                 return;
             }
         };
         let ignored = match git::list_ignored_files(&repo) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[{}] local-only: erro ao listar ignorados: {}", log_ts(), e);
+                eprintln!("[{}] local-only: error listing ignored files: {}", log_ts(), e);
                 return;
             }
         };
@@ -1843,7 +1853,7 @@ impl GitDriveFS {
                 if let Some(f) = self.files_by_inode.get_mut(&ino) {
                     f.local_only = true;
                     f.kind = kind;
-                    // Buffer pendente tem precedência sobre o tamanho do disco.
+                    // A pending buffer takes precedence over the on-disk size.
                     if !self.write_buffers.lock().contains_key(&ino) {
                         f.size = size;
                     }
@@ -1874,9 +1884,9 @@ impl GitDriveFS {
         }
     }
 
-    /// Garante que a cadeia de diretórios de `dir_path` existe no índice,
-    /// criando entradas em memória para dirs fora do HEAD (ex.: dir inteiro
-    /// ignorado). Retorna o inode do dir final.
+    /// Ensures the directory chain of `dir_path` exists in the index,
+    /// creating in-memory entries for dirs outside HEAD (e.g. an entirely
+    /// ignored dir). Returns the inode of the final dir.
     fn ensure_dir_chain(&mut self, dir_path: &str, previous: &HashMap<String, u64>) -> u64 {
         if dir_path.is_empty() {
             return ROOT_INODE;
@@ -1905,24 +1915,24 @@ impl GitDriveFS {
         ino
     }
 
-    /// Teto de commits percorridos pelo revwalk de mtime. Histórias mais
-    /// longas caem no fallback (timestamp do HEAD) para não onerar o boot.
+    /// Cap on commits traversed by the mtime revwalk. Longer histories fall
+    /// back (to the HEAD timestamp) so boot stays cheap.
     const MTIME_WALK_DEPTH_CAP: usize = 4096;
 
-    /// Recalcula o mapa de mtimes derivados (inode -> timestamp do último
-    /// commit que tocou o path). Chamado no boot e no refresh pós-pull.
+    /// Recomputes the derived mtime map (inode -> timestamp of the last
+    /// commit that touched the path). Called at boot and on post-pull refresh.
     fn refresh_derived_times(&mut self) {
         let repo = match git::open_repo(&self.repo_path) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[{}] mtime: erro ao abrir repo: {}", log_ts(), e);
+                eprintln!("[{}] mtime: error opening repo: {}", log_ts(), e);
                 return;
             }
         };
         let by_path = match git::commit_times_by_path(&repo, Self::MTIME_WALK_DEPTH_CAP) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("[{}] mtime: revwalk falhou: {}", log_ts(), e);
+                eprintln!("[{}] mtime: revwalk failed: {}", log_ts(), e);
                 return;
             }
         };
@@ -1938,8 +1948,9 @@ impl GitDriveFS {
         }
     }
 
-    /// Conteúdo de um arquivo local-only, lido do working tree. Para symlink,
-    /// o "conteúdo" é o texto do alvo (paridade com o blob 120000 do Git).
+    /// Content of a local-only file, read from the working tree. For a
+    /// symlink, the "content" is the target text (parity with Git's 120000
+    /// blob).
     fn read_local_only_content(&self, kind: git::FileKind, path: &str) -> Option<Vec<u8>> {
         let full = std::path::Path::new(&self.repo_path).join(path);
         match kind {
@@ -1950,8 +1961,8 @@ impl GitDriveFS {
         }
     }
 
-    /// Coleta a subárvore de `root_ino` (inclusive): dirs e arquivos com os
-    /// paths correntes do índice. Travessia local, sem I/O.
+    /// Collects the subtree of `root_ino` (inclusive): dirs and files with
+    /// their current paths from the index. Local traversal, no I/O.
     fn collect_subtree(&self, root_ino: u64) -> (SubtreeEntries, SubtreeEntries) {
         let mut dirs = Vec::new();
         let mut files = Vec::new();
@@ -2044,9 +2055,9 @@ impl GitDriveFS {
             FileType::Directory,
             "..".to_string(),
         ));
-        // Ordenação estável por nome. Sem isso, paginação entre chamadas de readdir
-        // pode embaralhar entries (HashSet tem ordem não-determinística em iterações
-        // separadas após mutações).
+        // Stable ordering by name. Without it, pagination across readdir
+        // calls can shuffle entries (HashSet has non-deterministic order in
+        // separate iterations after mutations).
         let mut children: Vec<(u64, FileType, String)> = dir
             .children
             .iter()
@@ -2076,10 +2087,11 @@ impl Filesystem for GitDriveFS {
         _req: &Request<'_>,
         config: &mut fuser::KernelConfig,
     ) -> Result<(), libc::c_int> {
-        // No macOS, precisa declarar a capability FUSE_EXCHANGE_DATA durante o
-        // handshake pra que o kernel macFUSE encaminhe exchangedata(2) como
-        // FUSE_EXCHANGE. Sem esse bit, TextEdit e apps iWork falham no safe save
-        // com "The file doesn't exist" porque o swap atômico não chega aqui.
+        // On macOS, the FUSE_EXCHANGE_DATA capability must be declared during
+        // the handshake so the macFUSE kernel forwards exchangedata(2) as
+        // FUSE_EXCHANGE. Without this bit, TextEdit and iWork apps fail the
+        // safe save with "The file doesn't exist" because the atomic swap
+        // never reaches us.
         #[cfg(target_os = "macos")]
         {
             let _ = config.add_capabilities(fuser::consts::FUSE_EXCHANGE_DATA);
@@ -2128,10 +2140,10 @@ impl Filesystem for GitDriveFS {
         _lock_owner: u64,
         reply: fuser::ReplyEmpty,
     ) {
-        // O buffer NÃO é drenado aqui: o conteúdo fica disponível para reads
-        // subsequentes (e pro `apply_implicit_swap`, que roda DEPOIS do flush
-        // no ciclo de safe save do TextEdit). O enfileiramento é condicionado
-        // ao dirty flag em `apply_flush` — flush de fd de leitura é no-op.
+        // The buffer is NOT drained here: the content stays available for
+        // subsequent reads (and for `apply_implicit_swap`, which runs AFTER
+        // the flush in TextEdit's safe save cycle). Queueing is gated on the
+        // dirty flag in `apply_flush` — a read-only fd flush is a no-op.
         if let Some(path) = self.apply_flush(ino) {
             println!("[{}] FLUSH inode={} path={}", log_ts(), ino, path);
         }
@@ -2194,8 +2206,8 @@ impl Filesystem for GitDriveFS {
         }
 
         if let Some(new_size) = size {
-            // Erros ignorados de propósito: setattr de size em inode desconhecido
-            // mantém o comportamento anterior (segue para o reply abaixo).
+            // Errors ignored on purpose: a size setattr on an unknown inode
+            // keeps the previous behavior (falls through to the reply below).
             let _ = self.apply_truncate(ino, new_size);
         }
 
@@ -2219,14 +2231,15 @@ impl Filesystem for GitDriveFS {
         }
     }
 
-    /// `link(2)` — cria hardlink. TextEdit e apps iWork usam no "safe save" pra
-    /// manter um backup do arquivo original antes de sobrescrever. Sem isso o
-    /// save falha (mesmo com exchange implementado).
+    /// `link(2)` — creates a hardlink. TextEdit and iWork apps use it in the
+    /// "safe save" to keep a backup of the original file before overwriting.
+    /// Without it the save fails (even with exchange implemented).
     ///
-    /// Nosso modelo interno é 1 inode = 1 path, então hardlink "de verdade" não
-    /// dá. Simulamos via CÓPIA com novo inode + mesmo conteúdo. Funciona pro
-    /// pattern do safe save porque o backup é transiente (deletado logo em
-    /// seguida). Se app mantiver o backup, vai aparecer como um arquivo normal.
+    /// Our internal model is 1 inode = 1 path, so a "real" hardlink is not
+    /// possible. We simulate it via a COPY with a new inode + same content.
+    /// This works for the safe save pattern because the backup is transient
+    /// (deleted right after). If an app keeps the backup, it shows up as a
+    /// normal file.
     fn link(
         &mut self,
         _req: &Request<'_>,
@@ -2292,7 +2305,7 @@ impl Filesystem for GitDriveFS {
             .children
             .insert(new_inode);
 
-        // Popular write_buffer pra que leituras imediatas vejam o conteúdo
+        // Populate the write_buffer so immediate reads see the content
         let shared = Arc::new(content);
         self.write_buffers
             .lock()
@@ -2305,10 +2318,10 @@ impl Filesystem for GitDriveFS {
         reply.entry(&TTL, &attr, 0);
     }
 
-    /// `exchangedata()` no macOS — troca conteúdo de dois arquivos atomicamente.
-    /// TextEdit e apps iWork usam isso no "safe save". Se retornarmos ENOSYS
-    /// (default), o save falha com "The file doesn't exist" mesmo depois de
-    /// escrever o novo conteúdo num temp dir.
+    /// `exchangedata()` on macOS — swaps the content of two files atomically.
+    /// TextEdit and iWork apps use this in the "safe save". If we return
+    /// ENOSYS (the default), the save fails with "The file doesn't exist"
+    /// even after writing the new content to a temp dir.
     #[cfg(target_os = "macos")]
     fn exchange(
         &mut self,
@@ -2346,10 +2359,11 @@ impl Filesystem for GitDriveFS {
         let total_bytes: u64 = self.files_by_inode.values().map(|f| f.size).sum();
         let used_blocks = total_bytes.div_ceil(BSIZE as u64);
 
-        // Volume advertido com ~1 TiB "livre" pra apps macOS não tratarem o mount
-        // como inutilizável ("Zero bytes available" fazia Finder cair em modo de
-        // resumo/categorização em vez de listar arquivos). O limite real vem do
-        // disco que hospeda o repo Git — isso aqui é sinal pro userland, não quota.
+        // Volume advertised with ~1 TiB "free" so macOS apps do not treat the
+        // mount as unusable ("Zero bytes available" made Finder fall into a
+        // summary/categorization mode instead of listing files). The real
+        // limit comes from the disk hosting the Git repo — this is a signal
+        // to userland, not a quota.
         let total_blocks: u64 = 256 * 1024 * 1024;
         let free_blocks = total_blocks.saturating_sub(used_blocks);
 
@@ -2390,8 +2404,9 @@ impl Filesystem for GitDriveFS {
             return;
         }
         if flags & XATTR_REPLACE != 0 && !exists {
-            // macOS usa ENOATTR (93) para "xattr não existe"; ENODATA (96 no macOS,
-            // 61 no Linux) tem significado diferente e confunde o kernel.
+            // macOS uses ENOATTR (93) for "xattr does not exist"; ENODATA (96
+            // on macOS, 61 on Linux) means something different and confuses
+            // the kernel.
             reply.error(enoattr());
             return;
         }
@@ -2462,8 +2477,9 @@ impl Filesystem for GitDriveFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        // Só refresca na primeira página; chamadas de continuação (offset > 0) devem
-        // ver o mesmo snapshot que a primeira, senão pular entries embaralha o iterador.
+        // Only refresh on the first page; continuation calls (offset > 0) must
+        // see the same snapshot as the first, or skipping entries shuffles the
+        // iterator.
         if offset == 0 {
             self.refresh_if_needed();
         }
@@ -2471,9 +2487,10 @@ impl Filesystem for GitDriveFS {
             Ok(entries) => {
                 let start = offset as usize;
                 for (i, (child_ino, kind, name)) in entries.iter().enumerate().skip(start) {
-                    // fuser::ReplyDirectory::add retorna true quando o buffer enche — a
-                    // entry NÃO foi aceita. Paramos e deixamos o kernel chamar de novo
-                    // com offset = i (a próxima não entregue).
+                    // fuser::ReplyDirectory::add returns true when the buffer
+                    // is full — the entry was NOT accepted. We stop and let
+                    // the kernel call again with offset = i (the next
+                    // undelivered one).
                     let full = reply.add(*child_ino, (i + 1) as i64, *kind, name);
                     if full {
                         break;
@@ -2493,9 +2510,10 @@ impl Filesystem for GitDriveFS {
         offset: i64,
         mut reply: ReplyDirectoryPlus,
     ) {
-        // macOS Finder usa `getattrlistbulk`, que o macFUSE traduz pra readdirplus.
-        // Sem essa implementação, o fallback do macFUSE retornava listagem
-        // inconsistente (só diretórios apareciam no Finder).
+        // macOS Finder uses `getattrlistbulk`, which macFUSE translates into
+        // readdirplus. Without this implementation, the macFUSE fallback
+        // returned an inconsistent listing (only directories showed up in
+        // Finder).
         if offset == 0 {
             self.refresh_if_needed();
         }
@@ -2505,8 +2523,8 @@ impl Filesystem for GitDriveFS {
                 for (i, (child_ino, kind, name)) in entries.iter().enumerate().skip(start) {
                     let attr = match kind {
                         FileType::Directory => self.dir_attr_for(*child_ino),
-                        // RegularFile e Symlink: o kind correto sai do índice
-                        // dentro de `file_attr_for`.
+                        // RegularFile and Symlink: the correct kind comes from
+                        // the index inside `file_attr_for`.
                         _ => {
                             let size = self
                                 .files_by_inode
@@ -2602,12 +2620,12 @@ impl Filesystem for GitDriveFS {
             reply.error(libc::EINVAL);
             return;
         };
-        // `.Trashes` é permitido (Lixeira nativa do Finder, Fase 2). O EPERM
-        // que existia aqui era mitigação para o parse quebrado do rename do
-        // macFUSE (nomes vazios + swap ambíguo), corrigido em b8f2647. O dir
-        // é efêmero: existe só em memória, e mover itens para dentro vira
-        // remoção no repo (expansão da Fase 1) com conteúdo recuperável via
-        // buffers até esvaziar a Lixeira ou remontar.
+        // `.Trashes` is allowed (Finder's native Trash, Phase 2). The EPERM
+        // that used to live here was a mitigation for macFUSE's broken rename
+        // parse (empty names + ambiguous swap), fixed in b8f2647. The dir is
+        // ephemeral: it exists only in memory, and moving items into it
+        // becomes a removal from the repo (Phase 1 expansion) with content
+        // recoverable via buffers until the Trash is emptied or remounted.
         println!(
             "[{}] MKDIR parent={} name={:?}",
             log_ts(),
@@ -2672,8 +2690,8 @@ impl Filesystem for GitDriveFS {
             nn,
             flags
         );
-        // renameatx_np(RENAME_SWAP): TextEdit/iWork usam no safe save quando o
-        // FS anuncia suporte. Semântica de exchangedata — troca de conteúdo.
+        // renameatx_np(RENAME_SWAP): TextEdit/iWork use it in the safe save
+        // when the FS advertises support. exchangedata semantics — content swap.
         if flags & APPLE_RENAME_SWAP != 0 {
             match self.apply_exchange(parent, n, new_parent, nn) {
                 Ok(()) => {
@@ -2693,7 +2711,7 @@ impl Filesystem for GitDriveFS {
             }
             return;
         }
-        // renameatx_np(RENAME_EXCL): falha se o destino já existe.
+        // renameatx_np(RENAME_EXCL): fails if the destination already exists.
         if flags & APPLE_RENAME_EXCL != 0 && self.child_exists(new_parent, nn) {
             reply.error(libc::EEXIST);
             return;
@@ -2802,7 +2820,7 @@ fn file_attr(
     FileAttr {
         ino,
         size,
-        // FUSE conta em unidades de 512 bytes, independente do blksize reportado.
+        // FUSE counts in 512-byte units, regardless of the reported blksize.
         blocks: size.div_ceil(512),
         atime: time,
         mtime: time,
@@ -2829,9 +2847,9 @@ fn dir_attr(ino: u64, perm: u16, uid: u32, gid: u32, time: SystemTime) -> FileAt
         ctime: time,
         crtime: time,
         kind: FileType::Directory,
-        // Convenção POSIX: nlink de diretório = 2 (. e seu nome) + subdiretórios.
-        // Simplificamos para 2 — alguns apps macOS checam se é > 1 e interpretam 1
-        // como diretório "órfão"/sendo deletado e escondem da UI.
+        // POSIX convention: directory nlink = 2 (. and its name) + subdirs.
+        // We simplify to 2 — some macOS apps check for > 1 and interpret 1 as
+        // an "orphaned"/being-deleted directory and hide it from the UI.
         nlink: 2,
         perm,
         uid,
@@ -2842,9 +2860,9 @@ fn dir_attr(ino: u64, perm: u16, uid: u32, gid: u32, time: SystemTime) -> FileAt
     }
 }
 
-/// Errno para "extended attribute não existe". macOS usa `ENOATTR` (93); Linux
-/// usa `ENODATA` (61). Se a gente fixar um dos dois, o outro kernel interpreta
-/// como erro completamente diferente e pode degradar o comportamento do FS.
+/// Errno for "extended attribute does not exist". macOS uses `ENOATTR` (93);
+/// Linux uses `ENODATA` (61). If we hardcode one of them, the other kernel
+/// interprets it as a completely different error and may degrade FS behavior.
 #[inline]
 fn enoattr() -> i32 {
     #[cfg(target_os = "macos")]
@@ -2857,12 +2875,12 @@ fn enoattr() -> i32 {
     }
 }
 
-/// Overhead fixo de um blob selado: magic (24) + nonce (24) + tag AEAD (16).
+/// Fixed overhead of a sealed blob: magic (24) + nonce (24) + AEAD tag (16).
 const SEALED_OVERHEAD: u64 = 64;
 
-/// Converte a listagem do HEAD (paths cifrados) para a visão clara. Tamanho
-/// de arquivo regular cujo nome decifrou é ajustado para o do plaintext
-/// (blobs conformes são selados por construção do drain).
+/// Converts the HEAD listing (encrypted paths) to the clear view. The size of
+/// a regular file whose name decrypted is adjusted to the plaintext size
+/// (conforming blobs are sealed by construction of the drain).
 fn decrypt_listing(
     crypto: Option<&crate::crypt::Crypto>,
     dirs: Vec<String>,
@@ -2910,11 +2928,11 @@ mod tests {
         let mut c = BlobCache::new(10);
         c.insert(1, vec![0; 6]);
         c.insert(2, vec![0; 4]);
-        // Acessa 1 para que 2 vire o LRU
+        // Access 1 so that 2 becomes the LRU
         assert!(c.get(1).is_some());
         c.insert(3, vec![0; 4]);
         assert!(c.contains(1));
-        assert!(!c.contains(2), "entrada LRU deve ter sido despejada");
+        assert!(!c.contains(2), "LRU entry should have been evicted");
         assert!(c.contains(3));
         assert_eq!(c.len(), 2);
     }
@@ -2934,7 +2952,7 @@ mod tests {
         c.insert(2, vec![0; 10]);
         c.clear();
         assert_eq!(c.len(), 0);
-        // Espaço liberado: reinsere sem eviction
+        // Space freed: reinsert without eviction
         c.insert(3, vec![0; 90]);
         assert!(c.contains(3));
     }
@@ -2946,7 +2964,7 @@ mod tests {
         c.insert(1, vec![0; 8]);
         assert!(c.contains(1));
         assert_eq!(c.len(), 1);
-        // Se o total tivesse contado 6+8, este insert despejaria o inode 1
+        // If the total had counted 6+8, this insert would evict inode 1
         c.insert(2, vec![0; 2]);
         assert!(c.contains(1));
         assert!(c.contains(2));

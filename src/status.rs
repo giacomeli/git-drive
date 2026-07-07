@@ -1,6 +1,6 @@
-//! Estado observável do daemon, gravado em `logs/status.json` e lido pelo
-//! subcomando `drive-sync status`. Timestamps em segundos unix (u64) — a
-//! formatação humana acontece só no CLI (decisão 10 da Fase 1).
+//! Observable daemon state, written to `logs/status.json` and read by the
+//! `drive-sync status` subcommand. Timestamps are unix seconds (u64) — human
+//! formatting happens only in the CLI (decision 10 of Phase 1).
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -14,21 +14,21 @@ pub struct SyncStatus {
     pub pid: u32,
     pub repo: String,
     pub branch: String,
-    /// Ponto de montagem do volume (para "Abrir no Finder" na tray).
+    /// Volume mount point (for "Open in Finder" in the tray).
     #[serde(default)]
     pub mount: String,
-    /// Log da sessão corrente (para o tail em tempo real na tray).
+    /// Current session log (for the live tail in the tray).
     #[serde(default)]
     pub log_file: String,
     pub started_at: u64,
     pub updated_at: u64,
-    /// Preenchido na parada limpa (SIGTERM/eject com drain final).
+    /// Set on clean shutdown (SIGTERM/eject with final drain).
     #[serde(default)]
     pub stopped_at: Option<u64>,
     pub pending_ops: usize,
     pub last_drain: Option<DrainInfo>,
     pub last_pull: Option<PullInfo>,
-    /// Conflicted copies criadas nesta sessão (paths das cópias `*.conflict-*`).
+    /// Conflicted copies created in this session (paths of the `*.conflict-*` copies).
     pub conflicts: Vec<String>,
 }
 
@@ -37,8 +37,8 @@ pub struct DrainInfo {
     pub at: u64,
     pub ops: usize,
     pub commit: Option<String>,
-    /// `None` = sem remote configurado ou sem commit; `Some(false)` = push
-    /// falhou mesmo após o reconcile.
+    /// `None` = no remote configured or no commit; `Some(false)` = push
+    /// failed even after the reconcile.
     pub pushed: Option<bool>,
 }
 
@@ -55,8 +55,8 @@ pub fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Estado em memória + persistência opcional em arquivo. Sempre presente no
-/// `SyncManager`; o arquivo só é escrito depois de `enable_file`.
+/// In-memory state + optional file persistence. Always present in the
+/// `SyncManager`; the file is only written after `enable_file`.
 pub struct StatusState {
     inner: Mutex<SyncStatus>,
     file: Mutex<Option<PathBuf>>,
@@ -84,21 +84,21 @@ impl StatusState {
         s.branch = branch.to_string();
         s.started_at = now;
         s.updated_at = now;
-        // Sessão nova invalida a parada da anterior (mesmo arquivo de status).
+        // A new session invalidates the previous one's shutdown (same status file).
         s.stopped_at = None;
         let snapshot = s.clone();
         drop(s);
         self.persist(&snapshot);
     }
 
-    /// Liga a persistência e grava o estado corrente imediatamente.
+    /// Turns on persistence and writes the current state immediately.
     pub fn enable_file(&self, path: PathBuf) {
         *self.file.lock() = Some(path);
         let snapshot = self.inner.lock().clone();
         self.persist(&snapshot);
     }
 
-    /// Informa mount point e log da sessão (consumidos pela tray/status).
+    /// Records the mount point and session log (consumed by the tray/status).
     pub fn set_runtime_info(&self, mount: &str, log_file: &str) {
         let mut s = self.inner.lock();
         s.mount = mount.to_string();
@@ -108,7 +108,7 @@ impl StatusState {
         self.persist(&snapshot);
     }
 
-    /// Parada limpa do daemon (pós-unmount + drain final).
+    /// Clean daemon shutdown (post-unmount + final drain).
     pub fn record_stopped(&self) {
         let now = now_unix();
         let mut s = self.inner.lock();
@@ -154,7 +154,7 @@ impl StatusState {
         self.persist(&snapshot);
     }
 
-    /// Registra conflicted copies criadas em merges (pull ou reconcile).
+    /// Records conflicted copies created by merges (pull or reconcile).
     pub fn add_conflicts(&self, copies: Vec<String>) {
         if copies.is_empty() {
             return;
@@ -177,7 +177,7 @@ impl StatusState {
         };
         if let Err(e) = write_atomic(&path, status) {
             eprintln!(
-                "[{}] status: erro ao gravar {}: {}",
+                "[{}] status: failed to write {}: {}",
                 log_ts(),
                 path.display(),
                 e
@@ -186,8 +186,8 @@ impl StatusState {
     }
 }
 
-/// Escrita atômica: serializa num arquivo temporário ao lado do destino e
-/// renomeia por cima — leitores nunca veem JSON pela metade.
+/// Atomic write: serializes to a temporary file next to the destination and
+/// renames over it — readers never see half-written JSON.
 pub fn write_atomic(path: &Path, status: &SyncStatus) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -203,12 +203,12 @@ pub fn write_atomic(path: &Path, status: &SyncStatus) -> std::io::Result<()> {
 
 pub fn read_from(path: &Path) -> Result<SyncStatus, String> {
     let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("não foi possível ler {}: {}", path.display(), e))?;
+        .map_err(|e| format!("could not read {}: {}", path.display(), e))?;
     serde_json::from_str(&content)
-        .map_err(|e| format!("JSON inválido em {}: {}", path.display(), e))
+        .map_err(|e| format!("invalid JSON in {}: {}", path.display(), e))
 }
 
-/// `Some(true/false)` se foi possível checar o processo; `None` se pid inválido.
+/// `Some(true/false)` if the process could be checked; `None` if the pid is invalid.
 pub fn pid_alive(pid: u32) -> Option<bool> {
     if pid == 0 {
         return None;
@@ -218,73 +218,73 @@ pub fn pid_alive(pid: u32) -> Option<bool> {
 
 fn format_ago(now: u64, then: u64) -> String {
     if then == 0 || then > now {
-        return "instante desconhecido".to_string();
+        return "unknown time".to_string();
     }
     let secs = now - then;
     if secs < 60 {
-        format!("há {} s", secs)
+        format!("{} s ago", secs)
     } else if secs < 3600 {
-        format!("há {} min", secs / 60)
+        format!("{} min ago", secs / 60)
     } else {
-        format!("há {} h {} min", secs / 3600, (secs % 3600) / 60)
+        format!("{} h {} min ago", secs / 3600, (secs % 3600) / 60)
     }
 }
 
-/// Formata o status para o terminal (pt-BR). Pura: recebe `now` e o resultado
-/// da checagem de pid para ser testável sem processo real.
+/// Formats the status for the terminal. Pure: takes `now` and the result of
+/// the pid check so it can be tested without a real process.
 pub fn format_status(s: &SyncStatus, now: u64, alive: Option<bool>) -> String {
     let mut out = String::new();
     out.push_str(&format!("drive-sync — branch {}\n", s.branch));
     out.push_str(&format!("  repo: {}\n", s.repo));
     let daemon_line = if let Some(stopped) = s.stopped_at {
-        format!("encerrado de forma limpa {}", format_ago(now, stopped))
+        format!("stopped cleanly {}", format_ago(now, stopped))
     } else {
         match alive {
-            Some(true) => format!("rodando (pid {})", s.pid),
-            Some(false) => format!("POSSIVELMENTE PARADO (pid {} não responde)", s.pid),
-            None => "desconhecido".to_string(),
+            Some(true) => format!("running (pid {})", s.pid),
+            Some(false) => format!("POSSIBLY STOPPED (pid {} not responding)", s.pid),
+            None => "unknown".to_string(),
         }
     };
     out.push_str(&format!("  daemon: {}\n", daemon_line));
     out.push_str(&format!(
-        "  iniciado {} | atualizado {}\n",
+        "  started {} | updated {}\n",
         format_ago(now, s.started_at),
         format_ago(now, s.updated_at)
     ));
     if alive == Some(true) && now.saturating_sub(s.updated_at) > 600 {
-        out.push_str("  atenção: sem atualização há mais de 10 min — verifique os logs\n");
+        out.push_str("  warning: no update in over 10 min — check the logs\n");
     }
-    out.push_str(&format!("  ops pendentes: {}\n", s.pending_ops));
+    out.push_str(&format!("  pending ops: {}\n", s.pending_ops));
     match &s.last_drain {
         Some(d) => {
-            let commit = d.commit.as_deref().unwrap_or("sem commit");
+            let commit = d.commit.as_deref().unwrap_or("none");
             let push = match d.pushed {
                 Some(true) => ", push ok",
-                Some(false) => ", PUSH FALHOU",
+                Some(false) => ", PUSH FAILED",
                 None => "",
             };
             out.push_str(&format!(
-                "  último drain: {} — {} op(s), commit {}{}\n",
+                "  last drain: {} — {} op(s), commit {}{}\n",
                 format_ago(now, d.at),
                 d.ops,
                 &commit[..commit.len().min(8)],
                 push
             ));
         }
-        None => out.push_str("  último drain: ainda não houve\n"),
+        None => out.push_str("  last drain: none yet\n"),
     }
     match &s.last_pull {
         Some(p) => out.push_str(&format!(
-            "  último pull: {} — {}\n",
+            "  last pull: {} — {}\n",
             format_ago(now, p.at),
             p.outcome
         )),
-        None => out.push_str("  último pull: ainda não houve\n"),
+        None => out.push_str("  last pull: none yet\n"),
     }
     if s.conflicts.is_empty() {
-        out.push_str("  conflitos na sessão: nenhum\n");
+        out.push_str("  conflicts this session: none\n");
     } else {
-        out.push_str(&format!("  conflitos na sessão ({}):\n", s.conflicts.len()));
+        out.push_str(&format!("  conflicts this session ({}):\n", s.conflicts.len()));
         for c in &s.conflicts {
             out.push_str(&format!("    - {}\n", c));
         }
@@ -313,7 +313,7 @@ mod tests {
             }),
             last_pull: Some(PullInfo {
                 at: 1_940,
-                outcome: "sem novidades".into(),
+                outcome: "up to date".into(),
             }),
             conflicts: vec![],
             ..Default::default()
@@ -323,12 +323,12 @@ mod tests {
     #[test]
     fn format_status_fresh_daemon() {
         let text = format_status(&sample(), 2_000, Some(true));
-        assert!(text.contains("rodando (pid 42)"), "{}", text);
-        assert!(text.contains("ops pendentes: 2"), "{}", text);
+        assert!(text.contains("running (pid 42)"), "{}", text);
+        assert!(text.contains("pending ops: 2"), "{}", text);
         assert!(text.contains("3 op(s), commit abcdef01, push ok"), "{}", text);
-        assert!(text.contains("último pull: há 60 s — sem novidades") || text.contains("último pull: há 1 min — sem novidades"), "{}", text);
-        assert!(text.contains("conflitos na sessão: nenhum"), "{}", text);
-        assert!(!text.contains("atenção"), "{}", text);
+        assert!(text.contains("last pull: 60 s ago — up to date") || text.contains("last pull: 1 min ago — up to date"), "{}", text);
+        assert!(text.contains("conflicts this session: none"), "{}", text);
+        assert!(!text.contains("warning"), "{}", text);
     }
 
     #[test]
@@ -336,10 +336,10 @@ mod tests {
         let mut s = sample();
         s.updated_at = 100;
         let dead = format_status(&s, 2_000, Some(false));
-        assert!(dead.contains("POSSIVELMENTE PARADO"), "{}", dead);
-        // Staleness só alerta com daemon vivo
+        assert!(dead.contains("POSSIBLY STOPPED"), "{}", dead);
+        // Staleness only warns while the daemon is alive
         let stale_alive = format_status(&s, 2_000, Some(true));
-        assert!(stale_alive.contains("atenção"), "{}", stale_alive);
+        assert!(stale_alive.contains("warning"), "{}", stale_alive);
     }
 
     #[test]
@@ -349,8 +349,8 @@ mod tests {
             ..Default::default()
         };
         let text = format_status(&s, 2_000, None);
-        assert!(text.contains("último drain: ainda não houve"), "{}", text);
-        assert!(text.contains("último pull: ainda não houve"), "{}", text);
+        assert!(text.contains("last drain: none yet"), "{}", text);
+        assert!(text.contains("last pull: none yet"), "{}", text);
     }
 
     #[test]

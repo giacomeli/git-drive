@@ -62,7 +62,7 @@ async fn apply_lookup_root_child_returns_dir() {
     let test = init_repo();
     commit_file(&test.repo, "foo/a.txt", b"x", "add");
     let fs = new_fs(test.dir.path().to_str().unwrap(), "main");
-    let attr = fs.apply_lookup(1, "foo").expect("foo deve existir");
+    let attr = fs.apply_lookup(1, "foo").expect("foo must exist");
     assert_eq!(attr.kind, FileType::Directory);
     assert_eq!(attr.perm, 0o755);
 }
@@ -162,7 +162,7 @@ async fn apply_create_allocates_inode_and_registers() {
     assert!(ino >= 2);
     assert_eq!(attr.kind, fuser::FileType::RegularFile);
     assert_eq!(fs.find_inode("novo.txt"), Some(ino));
-    // deve aparecer no readdir da raiz
+    // must show up in the root readdir
     let names: Vec<_> = fs
         .apply_readdir(1)
         .unwrap()
@@ -205,7 +205,7 @@ async fn apply_create_queues_initial_empty_write() {
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
     fs.apply_create(1, "novo.txt").unwrap();
     let ops = fs.sync_snapshot_for_test();
-    // deve haver um Write { path: "novo.txt", content: [] }
+    // there must be a Write { path: "novo.txt", content: [] }
     assert!(ops.iter().any(|op| matches!(op,
         drive_sync::sync::SyncOp::Write { path, content }
             if path == "novo.txt" && content.is_empty()
@@ -343,7 +343,7 @@ async fn apply_rmdir_queues_rmdir_op() {
     fs.apply_mkdir(1, "pasta").unwrap();
     fs.apply_rmdir(1, "pasta").unwrap();
     let ops = fs.sync_snapshot_for_test();
-    // Após mkdir + rmdir na mesma chave, buffer tem apenas Rmdir (último vence).
+    // After mkdir + rmdir on the same key, the buffer holds only Rmdir (last one wins).
     assert!(ops.iter().any(|op| matches!(op,
         drive_sync::sync::SyncOp::Rmdir { path } if path == "pasta"
     )));
@@ -417,9 +417,9 @@ async fn apply_rename_nonexistent_is_enoent() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn apply_rename_of_file_queues_write_plus_delete() {
-    // Rename de arquivo é traduzido em Write(dest, content) + Delete(src) para
-    // desacoplar de dependências de disco (o src pode nunca ter sido materializado
-    // se operações anteriores foram coalescidas no buffer).
+    // A file rename is translated into Write(dest, content) + Delete(src) to
+    // decouple it from disk dependencies (the src may never have been materialized
+    // if earlier operations were coalesced in the buffer).
     let test = init_repo();
     commit_file(&test.repo, "a.txt", b"hello", "add");
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
@@ -430,14 +430,14 @@ async fn apply_rename_of_file_queues_write_plus_delete() {
             drive_sync::sync::SyncOp::Write { path, content }
                 if path == "b.txt" && content.to_vec() == b"hello"
         )),
-        "esperado Write(b.txt) com conteúdo do original, obtido {:?}",
+        "expected Write(b.txt) with the original content, got {:?}",
         ops
     );
     assert!(
         ops.iter().any(|op| matches!(op,
             drive_sync::sync::SyncOp::Delete { path } if path == "a.txt"
         )),
-        "esperado Delete(a.txt), obtido {:?}",
+        "expected Delete(a.txt), got {:?}",
         ops
     );
 }
@@ -445,10 +445,10 @@ async fn apply_rename_of_file_queues_write_plus_delete() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn refresh_preserves_next_inode_when_paths_unchanged() {
-    // Regressão RF7 (Fase 0): `refresh_if_needed` usava
-    // `previous.get(...).unwrap_or(&self.alloc_inode())`, que avalia
-    // `alloc_inode()` SEMPRE (argumento eager) — o contador de inodes saltava
-    // o total de paths a cada refresh, mesmo sem nenhuma mudança.
+    // Regression RF7 (Phase 0): `refresh_if_needed` used
+    // `previous.get(...).unwrap_or(&self.alloc_inode())`, which evaluates
+    // `alloc_inode()` ALWAYS (eager argument) — the inode counter jumped by
+    // the total number of paths on every refresh, even with no change at all.
     let test = init_repo();
     commit_file(&test.repo, "foo/bar/baz.txt", b"x", "add baz");
     commit_file(&test.repo, "a.txt", b"y", "add a");
@@ -469,19 +469,19 @@ async fn refresh_preserves_next_inode_when_paths_unchanged() {
     assert_eq!(
         after,
         before + 1,
-        "refresh com paths inalterados não deve alocar inodes novos"
+        "refresh with unchanged paths must not allocate new inodes"
     );
-    // Inodes existentes preservados
+    // Existing inodes preserved
     assert_eq!(fs.find_inode("foo"), Some(ino_foo));
     assert_eq!(fs.find_inode("foo/bar/baz.txt"), Some(ino_baz));
 }
 
-// ---- Regressão RF1 (Fase 0): buffer de escrita inicializado com conteúdo corrente ----
+// ---- Regression RF1 (Phase 0): write buffer initialized with current content ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn apply_write_append_preserves_existing_content() {
-    // Antes do fix, o buffer nascia vazio e era zero-preenchido até o offset:
-    // um append (`echo x >> arquivo`) substituía o conteúdo original por zeros.
+    // Before the fix, the buffer was born empty and zero-filled up to the offset:
+    // an append (`echo x >> file`) replaced the original content with zeros.
     let test = init_repo();
     commit_file(&test.repo, "a.txt", b"hello", "add");
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
@@ -523,8 +523,8 @@ async fn apply_write_updates_entry_size() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn apply_truncate_smaller_preserves_prefix() {
-    // Antes do fix, truncate de arquivo sem buffer criava buffer vazio e
-    // resize(N, 0) — o conteúdo virava N bytes de zeros.
+    // Before the fix, truncating a file with no buffer created an empty buffer
+    // plus resize(N, 0) — the content became N bytes of zeros.
     let test = init_repo();
     commit_file(&test.repo, "a.txt", b"hello world", "add");
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
@@ -535,14 +535,14 @@ async fn apply_truncate_smaller_preserves_prefix() {
         fs.read_content_for_test(ino).as_deref(),
         Some(b"hell".as_slice())
     );
-    // O truncate materializa a op imediatamente (pode não haver flush depois)
+    // Truncate materializes the op immediately (there may be no flush afterwards)
     let ops = fs.sync_snapshot_for_test();
     assert!(
         ops.iter().any(|op| matches!(op,
             drive_sync::sync::SyncOp::Write { path, content }
                 if path == "a.txt" && content.to_vec() == b"hell"
         )),
-        "esperado Write(a.txt) truncado, obtido {:?}",
+        "expected truncated Write(a.txt), got {:?}",
         ops
     );
 }
@@ -561,13 +561,13 @@ async fn apply_truncate_larger_zero_fills_suffix_only() {
     );
 }
 
-// ---- Regressão RF2 (Fase 0): flush só enfileira escrita real (dirty flag) ----
+// ---- Regression RF2 (Phase 0): flush only enqueues real writes (dirty flag) ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn flush_without_write_does_not_enqueue() {
-    // flush roda em todo close(2), inclusive de fd aberto só para leitura.
-    // Antes do fix, qualquer buffer existente era re-enfileirado — podendo
-    // reverter mudanças remotas mergeadas com conteúdo antigo.
+    // flush runs on every close(2), including of an fd opened read-only.
+    // Before the fix, any existing buffer was re-enqueued — potentially
+    // reverting merged remote changes with stale content.
     let test = init_repo();
     commit_file(&test.repo, "a.txt", b"hello", "add");
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
@@ -592,17 +592,17 @@ async fn flush_after_write_enqueues_once() {
             drive_sync::sync::SyncOp::Write { path, content }
                 if path == "a.txt" && content.to_vec() == b"hello world"
         )),
-        "esperado Write(a.txt) com conteúdo completo, obtido {:?}",
+        "expected Write(a.txt) with the full content, got {:?}",
         ops
     );
 
-    // Segundo flush sem escrita nova (ex.: close de leitura) não re-enfileira
+    // A second flush with no new write (e.g. a read close) does not re-enqueue
     assert!(fs.apply_flush(ino).is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn truncate_clears_dirty_mark() {
-    // apply_truncate já materializa a op — o flush seguinte não deve duplicar.
+    // apply_truncate already materializes the op — the following flush must not duplicate it.
     let test = init_repo();
     commit_file(&test.repo, "a.txt", b"hello", "add");
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
@@ -615,8 +615,8 @@ async fn truncate_clears_dirty_mark() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn rename_after_write_clears_dirty_mark() {
-    // O rename de arquivo enfileira o conteúdo corrente (Write(dest)+Delete(src));
-    // o flush posterior do mesmo inode não deve enfileirar de novo.
+    // A file rename enqueues the current content (Write(dest)+Delete(src));
+    // a later flush of the same inode must not enqueue again.
     let test = init_repo();
     commit_file(&test.repo, "a.txt", b"hello", "add");
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
@@ -627,7 +627,7 @@ async fn rename_after_write_clears_dirty_mark() {
     assert!(fs.apply_flush(ino).is_none());
 }
 
-// ---- Fase 1 RF1: cache de blobs e leitura sem HEAD-miss ----
+// ---- Phase 1 RF1: blob cache and reads without HEAD misses ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn apply_read_populates_cache_and_hits_on_second_read() {
@@ -640,7 +640,7 @@ async fn apply_read_populates_cache_and_hits_on_second_read() {
     assert!(fs.read_cache_contains_for_test(ino));
     assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"hello");
     let (hits, misses) = fs.read_cache_stats_for_test();
-    assert_eq!((hits, misses), (1, 1), "segunda leitura deve ser hit");
+    assert_eq!((hits, misses), (1, 1), "second read must be a hit");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -669,7 +669,7 @@ async fn read_cache_cleared_on_refresh() {
 
     sync_handle.raise_refresh_flag();
     fs.refresh_if_needed();
-    assert_eq!(fs.read_cache_len_for_test(), 0, "refresh deve limpar o cache");
+    assert_eq!(fs.read_cache_len_for_test(), 0, "refresh must clear the cache");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -682,7 +682,7 @@ async fn read_cache_eviction_respects_budget() {
         test.dir.path().to_str().unwrap(),
         "main".to_string(),
         sync,
-        6, // cabe só um blob de 4 bytes por vez
+        6, // only one 4-byte blob fits at a time
     )
     .expect("GitDriveFS::new_with_cache_budget");
     let ino_a = fs.find_inode("a.txt").unwrap();
@@ -690,14 +690,14 @@ async fn read_cache_eviction_respects_budget() {
 
     fs.apply_read(ino_a, 0, 100).unwrap();
     fs.apply_read(ino_b, 0, 100).unwrap();
-    assert_eq!(fs.read_cache_len_for_test(), 1, "orçamento força eviction");
+    assert_eq!(fs.read_cache_len_for_test(), 1, "budget forces eviction");
     assert!(fs.read_cache_contains_for_test(ino_b));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn apply_read_after_create_returns_empty_not_eio() {
-    // Regressão do gap descoberto na Fase 1: o path recém-criado não existe no
-    // HEAD — sem o buffer vazio, read retornava EIO até o primeiro commit.
+    // Regression for the gap found in Phase 1: the freshly created path does not
+    // exist in HEAD — without the empty buffer, read returned EIO until the first commit.
     let test = init_repo();
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
     let (ino, _) = fs.apply_create(1, "novo.txt").unwrap();
@@ -707,7 +707,7 @@ async fn apply_read_after_create_returns_empty_not_eio() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn apply_read_after_rename_returns_content_not_eio() {
-    // Mesmo gap para rename: o path NOVO não existe no HEAD até o commit.
+    // Same gap for rename: the NEW path does not exist in HEAD until the commit.
     let test = init_repo();
     commit_file(&test.repo, "a.txt", b"hello", "add");
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
@@ -717,13 +717,13 @@ async fn apply_read_after_rename_returns_content_not_eio() {
     assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"hello");
 }
 
-// ---- Fase 1 RF2: validação do swap implícito ----
+// ---- Phase 1 RF2: implicit swap validation ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn implicit_swap_with_two_files_in_source_returns_exdev() {
-    // O contrato do safe-save é um temp dir com UM arquivo. Com dois, escolher
-    // qualquer um é chute — antes o código pegava o primeiro da iteração do
-    // HashSet e podia trocar o conteúdo do arquivo errado.
+    // The safe-save contract is a temp dir with ONE file. With two, picking
+    // either is a guess — the code used to take the first one in HashSet
+    // iteration order and could swap the wrong file's content.
     let test = init_repo();
     commit_file(&test.repo, "tmpdir/a.txt", b"aaa", "add a");
     commit_file(&test.repo, "tmpdir/b.txt", b"bbb", "add b");
@@ -732,21 +732,21 @@ async fn implicit_swap_with_two_files_in_source_returns_exdev() {
     let tmpdir_ino = fs.find_inode("tmpdir").unwrap();
     let root_a = fs.find_inode("a.txt").unwrap();
 
-    // RENAME com nomes vazios = encoding do exchangedata no macFUSE
+    // RENAME with empty names = the exchangedata encoding in macFUSE
     let result = fs.apply_rename(tmpdir_ino, "", 1, "");
     assert_eq!(result, Err(libc::EXDEV));
 
-    // Nenhum conteúdo alterado, nenhuma op enfileirada
+    // No content changed, no op enqueued
     assert_eq!(fs.read_content_for_test(root_a).as_deref(), Some(b"root-a".as_slice()));
     assert!(fs.sync_snapshot_for_test().is_empty());
 }
 
-// ---- Fase 1 RF3: renames envolvendo paths efêmeros ----
+// ---- Phase 1 RF3: renames involving ephemeral paths ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn dir_rename_to_ephemeral_queues_recursive_removal() {
-    // Antes, o filtro descartava o Rename inteiro: o disco mantinha o dir e o
-    // índice em memória dizia que ele tinha virado efêmero — divergência.
+    // Previously, the filter dropped the entire Rename: disk kept the dir while
+    // the in-memory index said it had become ephemeral — divergence.
     let test = init_repo();
     commit_file(&test.repo, "d/f.txt", b"conteudo-f", "add f");
     commit_file(&test.repo, "d/sub/g.txt", b"conteudo-g", "add g");
@@ -759,17 +759,17 @@ async fn dir_rename_to_ephemeral_queues_recursive_removal() {
     use drive_sync::sync::SyncOp;
     assert!(
         !ops.iter().any(|op| matches!(op, SyncOp::Rename { .. })),
-        "não deve haver Rename na fila, obtido {:?}",
+        "there must be no Rename in the queue, got {:?}",
         ops
     );
     assert!(ops.iter().any(|op| matches!(op, SyncOp::Delete { path } if path == "d/f.txt")));
     assert!(ops.iter().any(|op| matches!(op, SyncOp::Delete { path } if path == "d/sub/g.txt")));
     let pos_sub = ops.iter().position(|op| matches!(op, SyncOp::Rmdir { path } if path == "d/sub"));
     let pos_root = ops.iter().position(|op| matches!(op, SyncOp::Rmdir { path } if path == "d"));
-    assert!(pos_sub.is_some() && pos_root.is_some(), "rmdirs esperados, obtido {:?}", ops);
-    assert!(pos_sub < pos_root, "rmdir deve ser bottom-up");
+    assert!(pos_sub.is_some() && pos_root.is_some(), "expected rmdirs, got {:?}", ops);
+    assert!(pos_sub < pos_root, "rmdir must be bottom-up");
 
-    // Conteúdo continua legível dentro da área efêmera (Trash)
+    // Content stays readable inside the ephemeral area (Trash)
     assert_eq!(fs.apply_read(f_ino, 0, 100).unwrap(), b"conteudo-f");
 }
 
@@ -778,12 +778,12 @@ async fn dir_rename_from_ephemeral_materializes_content() {
     let test = init_repo();
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
 
-    // Dir efêmero construído em memória (todas as ops são filtradas da fila)
+    // Ephemeral dir built in memory (all its ops are filtered out of the queue)
     let (dir_ino, _) = fs.apply_mkdir(1, "._hidden").unwrap();
     let (f_ino, _) = fs.apply_create(dir_ino, "f.txt").unwrap();
     fs.apply_write(f_ino, 0, b"segredo").unwrap();
     fs.apply_flush(f_ino);
-    assert!(fs.sync_snapshot_for_test().is_empty(), "ops efêmeras devem ter sido filtradas");
+    assert!(fs.sync_snapshot_for_test().is_empty(), "ephemeral ops must have been filtered out");
 
     fs.apply_rename(1, "._hidden", 1, "visible").unwrap();
 
@@ -792,15 +792,15 @@ async fn dir_rename_from_ephemeral_materializes_content() {
     let pos_mkdir = ops.iter().position(|op| matches!(op, SyncOp::Mkdir { path } if path == "visible"));
     let pos_write = ops.iter().position(|op| matches!(op,
         SyncOp::Write { path, content } if path == "visible/f.txt" && content.to_vec() == b"segredo"));
-    assert!(pos_mkdir.is_some(), "mkdir esperado, obtido {:?}", ops);
-    assert!(pos_write.is_some(), "write com conteúdo esperado, obtido {:?}", ops);
-    assert!(pos_mkdir < pos_write, "mkdir deve preceder o write");
+    assert!(pos_mkdir.is_some(), "expected mkdir, got {:?}", ops);
+    assert!(pos_write.is_some(), "expected write with content, got {:?}", ops);
+    assert!(pos_mkdir < pos_write, "mkdir must precede the write");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn file_rename_to_ephemeral_queues_only_delete() {
-    // Regressão do comportamento atual (correto): Write(destino efêmero) é
-    // filtrado, Delete(origem real) passa — o arquivo some do repo.
+    // Regression test for the current (correct) behavior: Write(ephemeral dest)
+    // is filtered, Delete(real src) goes through — the file leaves the repo.
     let test = init_repo();
     commit_file(&test.repo, "a.txt", b"hello", "add");
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
@@ -809,14 +809,14 @@ async fn file_rename_to_ephemeral_queues_only_delete() {
 
     let ops = fs.sync_snapshot_for_test();
     use drive_sync::sync::SyncOp;
-    assert_eq!(ops.len(), 1, "esperado só o Delete, obtido {:?}", ops);
+    assert_eq!(ops.len(), 1, "expected only the Delete, got {:?}", ops);
     assert!(matches!(&ops[0], SyncOp::Delete { path } if path == "a.txt"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn file_rename_from_ephemeral_materializes_write() {
-    // Regressão do comportamento atual (correto): Write(destino real) passa
-    // com o conteúdo corrente; Delete(origem efêmera) é filtrado.
+    // Regression test for the current (correct) behavior: Write(real dest) goes
+    // through with the current content; Delete(ephemeral src) is filtered.
     let test = init_repo();
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
     let (ino, _) = fs.apply_create(1, "._tmp.txt").unwrap();
@@ -828,17 +828,17 @@ async fn file_rename_from_ephemeral_materializes_write() {
 
     let ops = fs.sync_snapshot_for_test();
     use drive_sync::sync::SyncOp;
-    assert_eq!(ops.len(), 1, "esperado só o Write, obtido {:?}", ops);
+    assert_eq!(ops.len(), 1, "expected only the Write, got {:?}", ops);
     assert!(matches!(&ops[0], SyncOp::Write { path, content }
         if path == "real.txt" && content.to_vec() == b"data"));
 }
 
-// ---- Correção do parse de RENAME do macFUSE: exchange com nomes reais ----
+// ---- macFUSE RENAME parse fix: exchange with real names ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn apply_exchange_swaps_contents_by_name() {
-    // Com o fuse_rename_in corrigido no vendor, o swap do safe save chega com
-    // nomes reais e usa apply_exchange (mesma lógica do FUSE_EXCHANGE).
+    // With fuse_rename_in fixed in vendor, the safe-save swap arrives with
+    // real names and uses apply_exchange (same logic as FUSE_EXCHANGE).
     let test = init_repo();
     commit_file(&test.repo, "a.txt", b"conteudo-a", "add a");
     commit_file(&test.repo, "b.txt", b"conteudo-b", "add b");
@@ -866,12 +866,12 @@ async fn apply_exchange_missing_side_is_enoent() {
     assert_eq!(fs.apply_exchange(1, "a.txt", 1, "nope.txt"), Err(libc::ENOENT));
 }
 
-// ---- Fase 2 RF5/RF6: Lixeira nativa e .gitkeep oculto ----
+// ---- Phase 2 RF5/RF6: native Trash and hidden .gitkeep ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn gitkeep_is_hidden_and_empty_dir_accepts_rmdir_after_refresh() {
-    // Regressão do achado da validação manual: após refresh, o .gitkeep
-    // virava filho visível e o rmdir de pasta "vazia" falhava com ENOTEMPTY.
+    // Regression for the manual validation finding: after refresh, .gitkeep
+    // became a visible child and rmdir of an "empty" folder failed with ENOTEMPTY.
     let test = init_repo();
     commit_file(&test.repo, "vazia/.gitkeep", b"", "add dir vazia");
     let sync = SyncManager::new(test.dir.path().to_str().unwrap(), 5);
@@ -879,32 +879,32 @@ async fn gitkeep_is_hidden_and_empty_dir_accepts_rmdir_after_refresh() {
     let mut fs = GitDriveFS::new(test.dir.path().to_str().unwrap(), "main".to_string(), sync)
         .expect("GitDriveFS::new");
 
-    assert_eq!(fs.file_count(), 0, ".gitkeep não deve entrar nos índices");
+    assert_eq!(fs.file_count(), 0, ".gitkeep must not enter the indexes");
     let dir_ino = fs.find_inode("vazia").unwrap();
     let entries = fs.apply_readdir(dir_ino).unwrap();
-    assert_eq!(entries.len(), 2, "só . e .. — obtido {:?}", entries);
+    assert_eq!(entries.len(), 2, "only . and .. — got {:?}", entries);
 
-    // Após refresh, a regra se mantém
+    // After refresh, the rule still holds
     sync_handle.raise_refresh_flag();
     fs.refresh_if_needed();
     assert_eq!(fs.file_count(), 0);
-    assert_eq!(fs.apply_rmdir(1, "vazia"), Ok(()), "rmdir de dir vazia deve funcionar");
+    assert_eq!(fs.apply_rmdir(1, "vazia"), Ok(()), "rmdir of an empty dir must work");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn mkdir_trashes_at_root_is_allowed_in_memory() {
-    // Fase 2: Lixeira nativa — o EPERM foi removido; o dir é efêmero (não
-    // entra na fila do sync).
+    // Phase 2: native Trash — the EPERM was removed; the dir is ephemeral (it
+    // does not enter the sync queue).
     let test = init_repo();
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
     let (ino, _) = fs.apply_mkdir(1, ".Trashes").unwrap();
     assert!(fs.find_inode(".Trashes").is_some());
-    assert!(fs.sync_snapshot_for_test().is_empty(), "op de dir efêmero é filtrada");
+    assert!(fs.sync_snapshot_for_test().is_empty(), "ephemeral dir op is filtered");
     let (sub, _) = fs.apply_mkdir(ino, "501").unwrap();
     assert!(sub > 0);
 }
 
-// ---- Fase 2.5, Bloco B: symlinks ----
+// ---- Phase 2.5, Block B: symlinks ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn symlink_in_head_appears_with_symlink_kind() {
@@ -913,11 +913,11 @@ async fn symlink_in_head_appears_with_symlink_kind() {
     common::commit_symlink(&test.repo, "alias.txt", "real.txt", "add alias");
     let fs = new_fs(test.dir.path().to_str().unwrap(), "main");
 
-    let ino = fs.find_inode("alias.txt").expect("alias deve estar no índice");
+    let ino = fs.find_inode("alias.txt").expect("alias must be in the index");
     assert_eq!(fs.apply_getattr(ino).unwrap().kind, FileType::Symlink);
     assert_eq!(fs.apply_lookup(1, "alias.txt").unwrap().kind, FileType::Symlink);
 
-    // Arquivo regular não regride
+    // Regular file does not regress
     let rino = fs.find_inode("real.txt").unwrap();
     assert_eq!(fs.apply_getattr(rino).unwrap().kind, FileType::RegularFile);
 }
@@ -968,7 +968,7 @@ async fn symlink_kind_survives_refresh() {
     let ino = fs.find_inode("alias.txt").unwrap();
     sync_handle.raise_refresh_flag();
     fs.refresh_if_needed();
-    assert_eq!(fs.find_inode("alias.txt"), Some(ino), "inode preservado no refresh");
+    assert_eq!(fs.find_inode("alias.txt"), Some(ino), "inode preserved across refresh");
     assert_eq!(fs.apply_getattr(ino).unwrap().kind, FileType::Symlink);
 }
 
@@ -988,7 +988,7 @@ async fn apply_symlink_creates_entry_and_enqueues_op() {
     assert!(
         matches!(&snap[0], drive_sync::sync::SyncOp::Symlink { path, target }
             if path == "alias.txt" && target == "real.txt"),
-        "esperado SyncOp::Symlink, obtido {:?}",
+        "expected SyncOp::Symlink, got {:?}",
         snap
     );
 }
@@ -1014,12 +1014,12 @@ async fn apply_unlink_of_symlink_queues_delete() {
     let snap = fs.sync_snapshot_for_test();
     assert!(
         matches!(&snap[..], [drive_sync::sync::SyncOp::Delete { path }] if path == "alias.txt"),
-        "esperado Delete do symlink, obtido {:?}",
+        "expected Delete of the symlink, got {:?}",
         snap
     );
 }
 
-// ---- Fase 2.5, Bloco A: arquivos ignorados local-only visíveis ----
+// ---- Phase 2.5, Block A: ignored files visible as local-only ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn ignored_file_in_worktree_visible_after_boot() {
@@ -1028,7 +1028,7 @@ async fn ignored_file_in_worktree_visible_after_boot() {
     std::fs::write(test.dir.path().join("app.log"), b"local data").unwrap();
 
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
-    let ino = fs.find_inode("app.log").expect("ignorado deve ser visível no boot");
+    let ino = fs.find_inode("app.log").expect("ignored file must be visible at boot");
     assert_eq!(fs.apply_getattr(ino).unwrap().size, 10);
     assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"local data".to_vec());
 }
@@ -1041,8 +1041,8 @@ async fn ignored_file_inside_ignored_dir_creates_parent_chain() {
     std::fs::write(test.dir.path().join("build/out.bin"), b"bin").unwrap();
 
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
-    let dir_ino = fs.find_inode("build").expect("dir do ignorado deve existir no índice");
-    let ino = fs.find_inode("build/out.bin").expect("arquivo em dir ignorado visível");
+    let dir_ino = fs.find_inode("build").expect("the ignored file's dir must exist in the index");
+    let ino = fs.find_inode("build/out.bin").expect("file inside ignored dir visible");
     let entries = fs.apply_readdir(dir_ino).unwrap();
     assert!(entries.iter().any(|(_, _, n)| n == "out.bin"));
     assert_eq!(fs.apply_read(ino, 0, 10).unwrap(), b"bin".to_vec());
@@ -1058,14 +1058,14 @@ async fn ignored_file_survives_refresh_with_same_inode() {
     let sync_handle = sync.clone();
     let mut fs = GitDriveFS::new(test.dir.path().to_str().unwrap(), "main".to_string(), sync)
         .expect("GitDriveFS::new");
-    let ino = fs.find_inode("app.log").expect("visível no boot");
+    let ino = fs.find_inode("app.log").expect("visible at boot");
 
     sync_handle.raise_refresh_flag();
     fs.refresh_if_needed();
     assert_eq!(
         fs.find_inode("app.log"),
         Some(ino),
-        "local-only sobrevive ao refresh preservando inode"
+        "local-only survives refresh keeping its inode"
     );
     assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"conteudo".to_vec());
 }
@@ -1083,7 +1083,7 @@ async fn ignored_file_delete_removes_and_queues() {
     let snap = fs.sync_snapshot_for_test();
     assert!(
         matches!(&snap[..], [drive_sync::sync::SyncOp::Delete { path }] if path == "app.log"),
-        "delete de local-only vai pela fila normal: {:?}",
+        "a local-only delete goes through the normal queue: {:?}",
         snap
     );
 }
@@ -1095,12 +1095,12 @@ async fn ignored_symlink_in_worktree_visible_with_kind() {
     std::os::unix::fs::symlink("alvo.txt", test.dir.path().join("a.lnk")).unwrap();
 
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
-    let ino = fs.find_inode("a.lnk").expect("symlink ignorado visível");
+    let ino = fs.find_inode("a.lnk").expect("ignored symlink visible");
     assert_eq!(fs.apply_getattr(ino).unwrap().kind, FileType::Symlink);
     assert_eq!(fs.apply_readlink(ino).unwrap(), b"alvo.txt".to_vec());
 }
 
-// ---- Fase 2.5, Bloco C: mtime derivado do último commit por path ----
+// ---- Phase 2.5, Block C: mtime derived from the last commit per path ----
 
 fn epoch_time(secs: u64) -> std::time::SystemTime {
     std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
@@ -1118,7 +1118,7 @@ async fn mtime_after_boot_derives_from_last_commit_per_path() {
     assert_eq!(
         fs.apply_getattr(antigo).unwrap().mtime,
         epoch_time(1_600_000_000),
-        "mtime deve vir do último commit que tocou o path, não do boot"
+        "mtime must come from the last commit that touched the path, not from boot"
     );
     assert_eq!(fs.apply_getattr(novo).unwrap().mtime, epoch_time(1_700_000_000));
 }
@@ -1136,7 +1136,7 @@ async fn mtime_touched_in_session_has_precedence_over_derived() {
     let mtime = fs.apply_getattr(ino).unwrap().mtime;
     assert!(
         mtime > before,
-        "arquivo tocado na sessão usa o relógio corrente, não o derivado"
+        "a file touched in the session uses the current clock, not the derived one"
     );
 }
 
@@ -1152,7 +1152,7 @@ async fn mtime_derived_updates_after_refresh() {
     let ino = fs.find_inode("a.txt").unwrap();
     assert_eq!(fs.apply_getattr(ino).unwrap().mtime, epoch_time(1_600_000_000));
 
-    // Simula mudança remota chegando via pull: commit novo + refresh flag
+    // Simulates a remote change arriving via pull: new commit + refresh flag
     common::commit_file_at(&test.repo, "a.txt", b"v2", 1_700_000_000, "update");
     sync_handle.raise_refresh_flag();
     fs.refresh_if_needed();
@@ -1160,11 +1160,11 @@ async fn mtime_derived_updates_after_refresh() {
     assert_eq!(
         fs.apply_getattr(ino).unwrap().mtime,
         epoch_time(1_700_000_000),
-        "path tocado pelo commit novo atualiza o mtime derivado no refresh"
+        "a path touched by the new commit updates the derived mtime on refresh"
     );
 }
 
-// ---- Fase 2.5, Bloco E: conteúdo compartilhado entre buffer e fila ----
+// ---- Phase 2.5, Block E: content shared between buffer and queue ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn flush_shares_buffer_arc_with_queued_op() {
@@ -1174,15 +1174,15 @@ async fn flush_shares_buffer_arc_with_queued_op() {
     fs.apply_write(ino, 0, b"dados").unwrap();
     fs.apply_flush(ino);
 
-    let buf = fs.buffer_arc_for_test(ino).expect("buffer vivo após flush");
+    let buf = fs.buffer_arc_for_test(ino).expect("buffer alive after flush");
     let snap = fs.sync_snapshot_for_test();
     let shared = snap.iter().any(|op| matches!(op,
         drive_sync::sync::SyncOp::Write { content: drive_sync::sync::WriteContent::Mem(arc), .. }
             if std::sync::Arc::ptr_eq(arc, &buf)));
-    assert!(shared, "op enfileirada deve compartilhar o Arc do buffer: {:?}", snap);
+    assert!(shared, "the enqueued op must share the buffer's Arc: {:?}", snap);
 }
 
-// ---- Fase 2.5, Bloco E: spool de write buffers grandes em disco ----
+// ---- Phase 2.5, Block E: spooling large write buffers to disk ----
 
 fn new_fs_with_spool(repo_path: &str, threshold_bytes: u64) -> GitDriveFS {
     let sync = SyncManager::new(repo_path, 5);
@@ -1205,12 +1205,12 @@ async fn write_buffer_spills_to_disk_above_threshold() {
     fs.apply_write(ino, 0, b"0123456789ABCDEF").unwrap();
     assert!(
         fs.buffer_is_spooled_for_test(ino),
-        "buffer acima do limiar deve estar em disco, não em RAM"
+        "a buffer above the threshold must live on disk, not in RAM"
     );
     assert_eq!(
         fs.apply_read(ino, 0, 100).unwrap(),
         b"0123456789ABCDEF".to_vec(),
-        "leitura do buffer spooled deve ser idêntica"
+        "reading the spooled buffer must be identical"
     );
     assert_eq!(fs.apply_read(ino, 4, 4).unwrap(), b"4567".to_vec());
 }
@@ -1222,22 +1222,22 @@ async fn buffer_crossing_threshold_migrates_without_loss() {
 
     let (ino, _) = fs.apply_create(1, "cresce.bin").unwrap();
     fs.apply_write(ino, 0, b"abcd").unwrap();
-    assert!(!fs.buffer_is_spooled_for_test(ino), "abaixo do limiar fica em RAM");
+    assert!(!fs.buffer_is_spooled_for_test(ino), "below the threshold it stays in RAM");
     fs.apply_write(ino, 4, b"efghijkl").unwrap();
-    assert!(fs.buffer_is_spooled_for_test(ino), "cruzou o limiar: migra para spool");
+    assert!(fs.buffer_is_spooled_for_test(ino), "crossed the threshold: migrates to spool");
     assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"abcdefghijkl".to_vec());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn ensure_buffer_of_large_existing_file_spools_head_copy() {
-    // Invariante da Fase 0 preservado no regime spooled: buffer de arquivo
-    // existente NUNCA nasce vazio — cópia do HEAD, agora em disco.
+    // Phase 0 invariant preserved in the spooled regime: the buffer of an
+    // existing file is NEVER born empty — a copy of HEAD, now on disk.
     let test = init_repo();
     commit_file(&test.repo, "big.txt", b"conteudo-original-grande", "add big");
     let mut fs = new_fs_with_spool(test.dir.path().to_str().unwrap(), 8);
 
     let ino = fs.find_inode("big.txt").unwrap();
-    // Escrita parcial no meio: o resto do arquivo tem que sobreviver
+    // Partial write in the middle: the rest of the file has to survive
     fs.apply_write(ino, 9, b"MUDADO--").unwrap();
     assert!(fs.buffer_is_spooled_for_test(ino));
     assert_eq!(
@@ -1257,14 +1257,14 @@ async fn truncate_on_spooled_buffer_sets_length() {
     assert_eq!(fs.apply_getattr(ino).unwrap().size, 4);
 }
 
-// ---- Fase 2.5, Bloco E: handle de repo persistente no caminho de leitura ----
+// ---- Phase 2.5, Block E: persistent repo handle on the read path ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn read_miss_reuses_persistent_repo_handle() {
     let test = init_repo();
     commit_file(&test.repo, "big.txt", b"0123456789", "add big");
     let sync = SyncManager::new(test.dir.path().to_str().unwrap(), 5);
-    // Cache de leitura DESATIVADO (orçamento 0): todo read é miss e cai no repo
+    // Read cache DISABLED (budget 0): every read is a miss and hits the repo
     let mut fs = GitDriveFS::new_with_options(
         test.dir.path().to_str().unwrap(),
         "main".to_string(),
@@ -1281,7 +1281,7 @@ async fn read_miss_reuses_persistent_repo_handle() {
     assert_eq!(
         fs.read_repo_opens_for_test(),
         1,
-        "o repo deve ser aberto UMA vez para N syscalls de read, não uma por syscall"
+        "the repo must be opened ONCE for N read syscalls, not once per syscall"
     );
 }
 
@@ -1309,15 +1309,15 @@ async fn persistent_read_handle_sees_new_head_after_refresh() {
     assert_eq!(
         fs.apply_read(ino, 0, 100).unwrap(),
         b"versao-2".to_vec(),
-        "handle persistente não pode servir HEAD antigo após refresh"
+        "the persistent handle must not serve the old HEAD after refresh"
     );
 }
 
-// ---- Fase 2.6: leitura transparente de arquivos chunkados ----
+// ---- Phase 2.6: transparent reads of chunked files ----
 
 use drive_sync::chunk::{chunk_reader_into_repo, shard_rel_path, Manifest};
 
-/// Materializa payload como manifest + chunks no working tree e commita tudo.
+/// Materializes the payload as manifest + chunks in the working tree and commits everything.
 fn commit_chunked(repo: &git2::Repository, rel: &str, payload: &[u8], chunk_size: u64) -> Manifest {
     let workdir = repo.workdir().unwrap();
     let m = chunk_reader_into_repo(&mut &payload[..], chunk_size, workdir).unwrap();
@@ -1348,17 +1348,17 @@ async fn chunked_file_exposes_real_size_and_reads_reassembled() {
     commit_chunked(&test.repo, "big.bin", &payload, 100);
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
 
-    let ino = fs.find_inode("big.bin").expect("arquivo chunkado no índice");
+    let ino = fs.find_inode("big.bin").expect("chunked file in the index");
     assert_eq!(
         fs.apply_getattr(ino).unwrap().size,
         250,
-        "getattr deve expor o tamanho REAL, não o do manifest"
+        "getattr must expose the REAL size, not the manifest's"
     );
     assert_eq!(fs.apply_read(ino, 0, 250).unwrap(), payload);
     assert_eq!(
         fs.apply_read(ino, 90, 20).unwrap(),
         payload[90..110].to_vec(),
-        "leitura atravessando fronteira de chunk"
+        "read crossing a chunk boundary"
     );
     assert_eq!(fs.apply_read(ino, 240, 100).unwrap(), payload[240..].to_vec());
 }
@@ -1369,14 +1369,14 @@ async fn chunks_dir_is_invisible_in_mount() {
     commit_chunked(&test.repo, "big.bin", &chunk_payload(), 100);
     let fs = new_fs(test.dir.path().to_str().unwrap(), "main");
 
-    assert_eq!(fs.find_inode(".chunks"), None, ".chunks é artefato interno");
+    assert_eq!(fs.find_inode(".chunks"), None, ".chunks is an internal artifact");
     let entries = fs.apply_readdir(1).unwrap();
     assert!(
         !entries.iter().any(|(_, _, n)| n == ".chunks"),
-        "readdir não pode listar .chunks: {:?}",
+        "readdir must not list .chunks: {:?}",
         entries
     );
-    assert_eq!(fs.file_count(), 1, "só big.bin (chunks fora do índice)");
+    assert_eq!(fs.file_count(), 1, "only big.bin (chunks out of the index)");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1384,17 +1384,17 @@ async fn corrupted_chunk_read_is_eio() {
     let test = init_repo();
     let payload = chunk_payload();
     let m = commit_chunked(&test.repo, "big.bin", &payload, 100);
-    // Corromper o segundo chunk no working tree
+    // Corrupt the second chunk in the working tree
     let victim = test.dir.path().join(shard_rel_path(&m.hashes[1]));
     std::fs::write(&victim, b"corrompido").unwrap();
 
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
     let ino = fs.find_inode("big.bin").unwrap();
-    assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), payload[..100].to_vec(), "chunk íntegro lê normal");
+    assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), payload[..100].to_vec(), "intact chunk reads normally");
     assert_eq!(
         fs.apply_read(ino, 100, 100),
         Err(libc::EIO),
-        "hash mismatch deve virar EIO, nunca conteúdo errado"
+        "a hash mismatch must become EIO, never wrong content"
     );
 }
 
@@ -1406,7 +1406,7 @@ async fn write_to_chunked_file_roundtrip_via_buffer() {
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
     let ino = fs.find_inode("big.bin").unwrap();
 
-    // Escrita parcial: o buffer nasce da REMONTAGEM (nunca do manifest cru)
+    // Partial write: the buffer is born from the REASSEMBLY (never from the raw manifest)
     fs.apply_write(ino, 10, b"XYZ").unwrap();
     let mut expected = payload.clone();
     expected[10..13].copy_from_slice(b"XYZ");
@@ -1423,8 +1423,8 @@ async fn write_to_chunked_file_roundtrip_via_buffer() {
             }
             _ => None,
         })
-        .expect("write de big.bin na fila");
-    assert_eq!(content_len, 250, "fila carrega o conteúdo expandido modificado");
+        .expect("write of big.bin in the queue");
+    assert_eq!(content_len, 250, "the queue carries the modified expanded content");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1433,7 +1433,7 @@ async fn rename_chunked_file_queues_manifest_not_expanded_content() {
     commit_chunked(&test.repo, "big.bin", &chunk_payload(), 100);
     let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
     let ino = fs.find_inode("big.bin").unwrap();
-    // Detecção acontece no primeiro acesso
+    // Detection happens on first access
     let _ = fs.apply_getattr(ino).unwrap();
 
     fs.apply_rename(1, "big.bin", 1, "renomeado.bin").unwrap();
@@ -1446,15 +1446,15 @@ async fn rename_chunked_file_queues_manifest_not_expanded_content() {
             }
             _ => None,
         })
-        .expect("write do novo path na fila");
+        .expect("write of the new path in the queue");
     assert!(
         Manifest::is_manifest_bytes(&write_bytes),
-        "rename de chunkado enfileira o MANIFEST (pequeno), não o conteúdo expandido"
+        "renaming a chunked file enqueues the MANIFEST (small), not the expanded content"
     );
     assert!(snap.iter().any(|op| matches!(op,
         drive_sync::sync::SyncOp::Delete { path } if path == "big.bin")));
 
-    // E o novo path continua legível (chunks intactos)
+    // And the new path stays readable (chunks intact)
     let ino2 = fs.find_inode("renomeado.bin").unwrap();
     assert_eq!(fs.apply_read(ino2, 0, 250).unwrap(), chunk_payload());
 }
@@ -1476,10 +1476,10 @@ async fn chunked_view_survives_refresh() {
     assert_eq!(fs.find_inode("big.bin"), Some(ino));
     assert_eq!(fs.apply_getattr(ino).unwrap().size, 250);
     assert_eq!(fs.apply_read(ino, 0, 250).unwrap(), payload);
-    assert_eq!(fs.find_inode(".chunks"), None, ".chunks continua invisível pós-refresh");
+    assert_eq!(fs.find_inode(".chunks"), None, ".chunks stays invisible after refresh");
 }
 
-// ---- Fase 2.7: visão FUSE clara sobre repo cifrado ----
+// ---- Phase 2.7: cleartext FUSE view over an encrypted repo ----
 
 use drive_sync::crypt::Crypto;
 use std::sync::Arc as StdArc;
@@ -1502,7 +1502,7 @@ fn commit_all(repo: &git2::Repository, msg: &str) {
         .unwrap();
 }
 
-/// Materializa um arquivo cifrado (nome + conteúdo) no worktree e commita.
+/// Materializes an encrypted file (name + content) in the worktree and commits it.
 fn commit_encrypted_file(
     repo: &git2::Repository,
     crypto: &Crypto,
@@ -1527,7 +1527,7 @@ fn new_encrypted_fs(repo_path: &str, crypto: StdArc<Crypto>) -> GitDriveFS {
         64 * 1024 * 1024,
         Some(crypto),
     )
-    .expect("GitDriveFS cifrado")
+    .expect("encrypted GitDriveFS")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1539,14 +1539,14 @@ async fn encrypted_repo_boot_exposes_clear_names_and_content() {
 
     let ino = fs
         .find_inode("docs/Nota Secreta.txt")
-        .expect("nome CLARO deve estar no índice");
+        .expect("the CLEAR name must be in the index");
     assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"segredo".to_vec());
     assert_eq!(
         fs.apply_getattr(ino).unwrap().size,
         7,
-        "tamanho do PLAINTEXT, não do blob selado"
+        "PLAINTEXT size, not the sealed blob's"
     );
-    // Nome cifrado não vaza para a visão
+    // The encrypted name does not leak into the view
     let cipher_rel = crypto.enc_path("docs/Nota Secreta.txt").unwrap();
     assert_eq!(fs.find_inode(&cipher_rel), None);
     let entries = fs.apply_readdir(1).unwrap();
@@ -1561,13 +1561,13 @@ async fn encrypted_read_with_wrong_key_is_eio() {
     let wrong = StdArc::new(Crypto::from_master_key(&[99u8; 32]));
     let mut fs = new_encrypted_fs(test.dir.path().to_str().unwrap(), wrong);
 
-    // Nome não decifra com a chave errada -> aparece literal (cifrado)
+    // The name does not decrypt with the wrong key -> shows up literal (encrypted)
     let cipher_rel = crypto.enc_path("dado.bin").unwrap();
-    let ino = fs.find_inode(&cipher_rel).expect("fallback literal do nome");
+    let ino = fs.find_inode(&cipher_rel).expect("literal name fallback");
     assert_eq!(
         fs.apply_read(ino, 0, 100),
         Err(libc::EIO),
-        "chave errada = EIO, nunca conteúdo errado"
+        "wrong key = EIO, never wrong content"
     );
 }
 
@@ -1582,12 +1582,12 @@ async fn encrypted_symlink_readlink_returns_clear_target() {
     commit_all(&test.repo, "add symlink cifrado");
 
     let mut fs = new_encrypted_fs(test.dir.path().to_str().unwrap(), crypto);
-    let ino = fs.find_inode("atalho.txt").expect("symlink com nome claro");
+    let ino = fs.find_inode("atalho.txt").expect("symlink with clear name");
     assert_eq!(fs.apply_getattr(ino).unwrap().kind, FileType::Symlink);
     assert_eq!(
         fs.apply_readlink(ino).unwrap(),
         b"docs/alvo real.txt".to_vec(),
-        "readlink apresenta o alvo CLARO"
+        "readlink presents the CLEAR target"
     );
 }
 
@@ -1610,15 +1610,15 @@ async fn encrypted_chunked_file_reads_reassembled_plaintext() {
     commit_all(&test.repo, "add chunked cifrado");
 
     let mut fs = new_encrypted_fs(test.dir.path().to_str().unwrap(), crypto.clone());
-    let ino = fs.find_inode("grande.bin").expect("chunkado com nome claro");
-    assert_eq!(fs.apply_getattr(ino).unwrap().size, 250, "tamanho real do plaintext");
+    let ino = fs.find_inode("grande.bin").expect("chunked file with clear name");
+    assert_eq!(fs.apply_getattr(ino).unwrap().size, 250, "real plaintext size");
     assert_eq!(fs.apply_read(ino, 0, 250).unwrap(), payload);
     assert_eq!(fs.apply_read(ino, 90, 20).unwrap(), payload[90..110].to_vec());
 
-    // Chunk adulterado: hash do ciphertext detecta antes de decifrar
+    // Tampered chunk: the ciphertext hash detects it before decrypting
     let victim = workdir.join(shard_rel_path(&manifest.hashes[1]));
     std::fs::write(&victim, b"lixo").unwrap();
-    fs.refresh_if_needed(); // limpa cache de último chunk? leitura direta:
+    fs.refresh_if_needed(); // clears the last-chunk cache? direct read:
     let mut fs2 = new_encrypted_fs(test.dir.path().to_str().unwrap(), crypto);
     let ino2 = fs2.find_inode("grande.bin").unwrap();
     assert_eq!(fs2.apply_read(ino2, 100, 100), Err(libc::EIO));
@@ -1629,7 +1629,7 @@ async fn encrypted_mode_disables_local_only_ignore() {
     let test = init_repo();
     let crypto = fs_crypto();
     commit_encrypted_file(&test.repo, &crypto, "base.txt", b"x");
-    // .gitignore claro + arquivo casando a regra, direto no worktree
+    // clear .gitignore + a file matching the rule, straight in the worktree
     std::fs::write(test.dir.path().join(".gitignore"), b"*.log\n").unwrap();
     std::fs::write(test.dir.path().join("solto.log"), b"local").unwrap();
 
@@ -1637,7 +1637,7 @@ async fn encrypted_mode_disables_local_only_ignore() {
     assert_eq!(
         fs.find_inode("solto.log"),
         None,
-        "modo cifrado desativa a incorporação local-only"
+        "encrypted mode disables local-only incorporation"
     );
 }
 
@@ -1654,6 +1654,6 @@ async fn encrypted_conflicted_copy_shows_clear_prefix() {
     let mut fs = new_encrypted_fs(test.dir.path().to_str().unwrap(), crypto);
     let ino = fs
         .find_inode("nota.txt.conflict-mac-99")
-        .expect("prefixo decifrado + sufixo claro");
+        .expect("decrypted prefix + clear suffix");
     assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"versao local".to_vec());
 }

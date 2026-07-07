@@ -62,7 +62,7 @@ async fn e2e_create_write_flush_commits_and_pushes() {
     .unwrap();
 
     let (_ino, _attr) = fs.apply_create(1, "hello.txt").unwrap();
-    // simular escrita: o apply_create já empilha Write vazio, aqui sobrescrevemos
+    // simulate a write: apply_create already enqueues an empty Write, here we overwrite it
     fs.sync_queue_write_for_test("hello.txt", b"world".to_vec());
     wait_for_batch().await;
 
@@ -156,7 +156,7 @@ async fn e2e_pull_brings_external_changes() {
     .unwrap();
     assert!(fs.find_inode("externo.txt").is_none());
 
-    // clone B empurra novo commit
+    // clone B pushes a new commit
     let dir_b = tempfile::tempdir().unwrap();
     let repo_b = Repository::clone(&bare_url, dir_b.path()).unwrap();
     {
@@ -177,7 +177,7 @@ async fn e2e_pull_brings_external_changes() {
         .unwrap();
     drive_sync::git::push_to_remote(&repo_b, "main", "origin", None).unwrap();
 
-    // espera pelo menos 2 ciclos de pull
+    // wait for at least 2 pull cycles
     tokio::time::sleep(Duration::from_millis(3500)).await;
 
     fs.refresh_if_needed();

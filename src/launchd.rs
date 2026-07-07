@@ -1,9 +1,9 @@
-//! Geração e gestão do LaunchAgent do macOS.
+//! Generation and management of the macOS LaunchAgent.
 //!
-//! O plist é gerado por template de string (decisão 4 da Fase 2): estrutura
-//! pequena e fixa, auditável no diff e nos testes. Os paths de config, log e
-//! status vão como flags explícitas no ProgramArguments — o plist é a fonte
-//! da verdade legível de onde o daemon lê e grava (decisão 10).
+//! The plist is generated from a string template (decision 4 of Phase 2):
+//! small, fixed structure, auditable in diffs and tests. The config, log and
+//! status paths go as explicit flags in ProgramArguments — the plist is the
+//! readable source of truth for where the daemon reads and writes (decision 10).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,7 +25,7 @@ fn launch_agents_dir() -> PathBuf {
         .join("Library/LaunchAgents")
 }
 
-/// Path do plist do agente: `~/Library/LaunchAgents/<label>.plist`.
+/// Path of the agent plist: `~/Library/LaunchAgents/<label>.plist`.
 pub fn agent_plist_path() -> PathBuf {
     launch_agents_dir().join(format!("{}.plist", LABEL))
 }
@@ -34,8 +34,8 @@ pub fn tray_plist_path() -> PathBuf {
     launch_agents_dir().join(format!("{}.plist", TRAY_LABEL))
 }
 
-/// Plist do agente da tray (sobe no login; sem KeepAlive — fechar pela opção
-/// "Sair da tray" não deve ressuscitar).
+/// Plist for the tray agent (starts at login; no KeepAlive — closing via the
+/// "Quit tray" option must not resurrect it).
 pub fn render_tray_plist(binary: &Path, status_file: &Path) -> String {
     let e = |p: &Path| xml_escape(&p.to_string_lossy());
     format!(
@@ -63,12 +63,12 @@ pub fn render_tray_plist(binary: &Path, status_file: &Path) -> String {
     )
 }
 
-/// Renderiza o plist do LaunchAgent. Puro e testável.
+/// Renders the LaunchAgent plist. Pure and testable.
 ///
-/// - `RunAtLoad`: monta no login.
-/// - `KeepAlive {SuccessfulExit=false}`: crash religa; parada limpa
-///   (SIGTERM/eject, exit 0) NÃO ressuscita (decisão 5).
-/// - `ExitTimeOut 60`: margem para o drain final antes do SIGKILL do launchd.
+/// - `RunAtLoad`: mounts at login.
+/// - `KeepAlive {SuccessfulExit=false}`: crash restarts; clean stop
+///   (SIGTERM/eject, exit 0) does NOT resurrect (decision 5).
+/// - `ExitTimeOut 60`: headroom for the final drain before launchd's SIGKILL.
 pub fn render_plist(
     binary: &Path,
     repo: &Path,
@@ -133,13 +133,14 @@ fn gui_domain() -> String {
     format!("gui/{}", unsafe { libc::getuid() })
 }
 
-/// Instala o LaunchAgent: resolve paths absolutos, prepara diretórios padrão,
-/// copia o config se necessário, grava o plist e registra no launchd.
-/// `with_tray` registra um segundo agente que sobe a tray no login.
+/// Installs the LaunchAgent: resolves absolute paths, prepares standard
+/// directories, copies the config if needed, writes the plist and registers
+/// it with launchd. `with_tray` registers a second agent that starts the tray
+/// at login.
 pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
     let binary = std::env::current_exe()?;
     let repo = std::fs::canonicalize(repo)
-        .map_err(|e| anyhow::anyhow!("repo {} inacessível: {}", repo, e))?;
+        .map_err(|e| anyhow::anyhow!("repo {} inaccessible: {}", repo, e))?;
     std::fs::create_dir_all(mount)?;
     let mount = std::fs::canonicalize(mount)?;
 
@@ -148,8 +149,9 @@ pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
     std::fs::create_dir_all(&app_support)?;
     std::fs::create_dir_all(&log_dir)?;
 
-    // Migração (06-07-2026): config/chave saíram do Application Support para
-    // ~/.config/drive-sync. Se o novo não existe e o legado sim, move.
+    // Migration (2026-07-06): config/key moved out of Application Support to
+    // ~/.config/drive-sync. If the new path does not exist and the legacy one
+    // does, move it.
     let _ = std::fs::create_dir_all(paths::config_dir());
     for (legacy, new) in [
         (paths::legacy_config_path(), paths::standard_config_path()),
@@ -157,26 +159,27 @@ pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
     ] {
         if !new.exists() && legacy.exists() {
             match std::fs::rename(&legacy, &new) {
-                Ok(_) => println!("migrado: {} -> {}", legacy.display(), new.display()),
-                Err(e) => eprintln!("aviso: falha ao migrar {}: {}", legacy.display(), e),
+                Ok(_) => println!("migrated: {} -> {}", legacy.display(), new.display()),
+                Err(e) => eprintln!("warning: failed to migrate {}: {}", legacy.display(), e),
             }
         }
     }
 
-    // Config: se o padrão não existe e há um ./config.json no CWD (fluxo dev),
-    // copia — senão o daemon parte dos defaults (sem identidade = sem commit).
+    // Config: if the standard one does not exist and there is a ./config.json
+    // in the CWD (dev flow), copy it — otherwise the daemon starts from the
+    // defaults (no identity = no commits).
     let config = paths::standard_config_path();
     if !config.exists() {
         if Path::new("config.json").exists() {
             std::fs::copy("config.json", &config)?;
             println!(
-                "[{}] install: config.json copiado para {}",
+                "[{}] install: config.json copied to {}",
                 log_ts(),
                 config.display()
             );
         } else {
             println!(
-                "[{}] install: sem config.json — crie {} com user_name/user_email para habilitar commits",
+                "[{}] install: no config.json — create {} with user_name/user_email to enable commits",
                 log_ts(),
                 config.display()
             );
@@ -191,13 +194,13 @@ pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
     }
     std::fs::write(&plist_path, plist)?;
 
-    // Re-install idempotente: derruba a instância anterior (se houver) antes
-    // de registrar de novo. bootout de agente inexistente falha — ignorado.
+    // Idempotent re-install: takes down the previous instance (if any) before
+    // registering again. bootout of a nonexistent agent fails — ignored.
     let _ = launchctl(&["bootout", &format!("{}/{}", gui_domain(), LABEL)]);
     let out = launchctl(&["bootstrap", &gui_domain(), plist_path.to_str().unwrap()])?;
     if !out.status.success() {
         anyhow::bail!(
-            "launchctl bootstrap falhou: {}",
+            "launchctl bootstrap failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -210,47 +213,47 @@ pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
         let out = launchctl(&["bootstrap", &gui_domain(), tray_path.to_str().unwrap()])?;
         if !out.status.success() {
             eprintln!(
-                "[{}] install: bootstrap da tray falhou ({}) — rode `drive-sync tray` manualmente",
+                "[{}] install: tray bootstrap failed ({}) — run `drive-sync tray` manually",
                 log_ts(),
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         } else {
-            println!("[{}] install: tray registrada ({})", log_ts(), TRAY_LABEL);
+            println!("[{}] install: tray registered ({})", log_ts(), TRAY_LABEL);
         }
     }
 
-    println!("[{}] install: LaunchAgent registrado ({})", log_ts(), LABEL);
+    println!("[{}] install: LaunchAgent registered ({})", log_ts(), LABEL);
     println!("  plist:  {}", plist_path.display());
     println!("  repo:   {}", repo.display());
     println!("  mount:  {}", mount.display());
     println!("  config: {}", config.display());
     println!("  logs:   {}", log_dir.display());
-    println!("  status: {} (drive-sync status acha sozinho)", status_file.display());
+    println!("  status: {} (drive-sync status finds it on its own)", status_file.display());
     Ok(())
 }
 
-/// Remove o LaunchAgent: bootout + remoção do plist.
+/// Removes the LaunchAgent: bootout + plist removal.
 pub fn uninstall() -> anyhow::Result<()> {
     let out = launchctl(&["bootout", &format!("{}/{}", gui_domain(), LABEL)])?;
     if out.status.success() {
-        println!("[{}] uninstall: agente parado e desregistrado", log_ts());
+        println!("[{}] uninstall: agent stopped and unregistered", log_ts());
     } else {
         println!(
-            "[{}] uninstall: agente não estava registrado ({})",
+            "[{}] uninstall: agent was not registered ({})",
             log_ts(),
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     let plist_path = agent_plist_path();
     match std::fs::remove_file(&plist_path) {
-        Ok(()) => println!("[{}] uninstall: {} removido", log_ts(), plist_path.display()),
+        Ok(()) => println!("[{}] uninstall: {} removed", log_ts(), plist_path.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    // Tray (se instalada): bootout de agente ausente é ignorado.
+    // Tray (if installed): bootout of a missing agent is ignored.
     let _ = launchctl(&["bootout", &format!("{}/{}", gui_domain(), TRAY_LABEL)]);
     match std::fs::remove_file(tray_plist_path()) {
-        Ok(()) => println!("[{}] uninstall: agente da tray removido", log_ts()),
+        Ok(()) => println!("[{}] uninstall: tray agent removed", log_ts()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
@@ -275,7 +278,7 @@ mod tests {
         let bin = plist.find("<string>/usr/local/bin/drive-sync</string>").unwrap();
         let repo = plist.find("<string>/Users/x/repo</string>").unwrap();
         let mount = plist.find("<string>/Users/x/GitDrive</string>").unwrap();
-        assert!(bin < repo && repo < mount, "ordem dos argumentos deve ser preservada");
+        assert!(bin < repo && repo < mount, "argument order must be preserved");
         assert!(plist.contains("<key>RunAtLoad</key>"));
         assert!(plist.contains("<key>SuccessfulExit</key>"));
         assert!(plist.contains("<key>ExitTimeOut</key>"));
@@ -285,13 +288,13 @@ mod tests {
     fn render_plist_escapes_xml_in_paths() {
         let plist = render_plist(
             Path::new("/bin/drive-sync"),
-            Path::new("/Users/x/repo & <coisas>"),
+            Path::new("/Users/x/repo & <stuff>"),
             Path::new("/mnt"),
             Path::new("/cfg.json"),
             Path::new("/logs"),
             Path::new("/status.json"),
         );
-        assert!(plist.contains("/Users/x/repo &amp; &lt;coisas&gt;"));
-        assert!(!plist.contains("repo & <coisas>"));
+        assert!(plist.contains("/Users/x/repo &amp; &lt;stuff&gt;"));
+        assert!(!plist.contains("repo & <stuff>"));
     }
 }

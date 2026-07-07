@@ -1,10 +1,11 @@
-//! Resolução de paths de config, logs e status.
+//! Path resolution for config, logs and status.
 //!
-//! Regra (decisão 10 da Fase 2): sem flag, tudo continua relativo ao CWD
-//! (compatível com o fluxo dev `cargo run` a partir do projeto). Os paths
-//! padrão do macOS só entram via flags explícitas — o `drive-sync install`
-//! grava essas flags no plist do LaunchAgent, então o plist é a fonte da
-//! verdade legível de onde estão config, log e status.
+//! Rule (decision 10 of Phase 2): without a flag, everything stays relative
+//! to the CWD (compatible with the `cargo run` dev flow from the project
+//! root). The standard macOS paths only come in via explicit flags — the
+//! `drive-sync install` command writes those flags into the LaunchAgent
+//! plist, so the plist is the readable source of truth for where config,
+//! log and status live.
 
 use std::path::{Path, PathBuf};
 
@@ -14,7 +15,7 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
-/// `~/Library/Application Support/drive-sync` (config + status no uso via launchd).
+/// `~/Library/Application Support/drive-sync` (config + status when running via launchd).
 pub fn app_support_dir() -> PathBuf {
     app_support_dir_from(&home_dir())
 }
@@ -23,7 +24,7 @@ pub(crate) fn app_support_dir_from(home: &Path) -> PathBuf {
     home.join("Library/Application Support/drive-sync")
 }
 
-/// `~/Library/Logs/drive-sync` (logs no uso via launchd).
+/// `~/Library/Logs/drive-sync` (logs when running via launchd).
 pub fn standard_log_dir() -> PathBuf {
     standard_log_dir_from(&home_dir())
 }
@@ -32,8 +33,8 @@ pub(crate) fn standard_log_dir_from(home: &Path) -> PathBuf {
     home.join("Library/Logs/drive-sync")
 }
 
-/// `~/.config/drive-sync` — diretório canônico de config + chave (decisão do
-/// usuário em 06-07-2026; também alinha com o XDG do futuro port Linux).
+/// `~/.config/drive-sync` — canonical config + key directory (user decision
+/// on 2026-07-06; also aligns with XDG for the future Linux port).
 pub fn config_dir() -> PathBuf {
     config_dir_from(&home_dir())
 }
@@ -50,7 +51,7 @@ pub(crate) fn standard_config_path_from(home: &Path) -> PathBuf {
     config_dir_from(home).join("config.json")
 }
 
-/// Path padrão do arquivo de chave da criptografia (Fase 2.7).
+/// Default path of the encryption key file (Phase 2.7).
 pub fn standard_key_path() -> PathBuf {
     standard_key_path_from(&home_dir())
 }
@@ -59,8 +60,8 @@ pub(crate) fn standard_key_path_from(home: &Path) -> PathBuf {
     config_dir_from(home).join("drive.key")
 }
 
-/// Locais antigos (pré 06-07-2026), mantidos como fallback de LEITURA para
-/// instalações existentes.
+/// Old locations (pre 2026-07-06), kept as a READ fallback for existing
+/// installations.
 pub fn legacy_config_path() -> PathBuf {
     app_support_dir().join("config.json")
 }
@@ -69,10 +70,10 @@ pub fn legacy_key_path() -> PathBuf {
     app_support_dir().join("drive.key")
 }
 
-/// Config para LEITURA: flag explícita > `./config.json` (fluxo dev) >
-/// `~/.config/drive-sync/config.json` > local legado (Application Support).
-/// Sem nenhum existente, o default é o path XDG (a mensagem de "não
-/// encontrado" aponta para o lugar canônico).
+/// Config for READING: explicit flag > `./config.json` (dev flow) >
+/// `~/.config/drive-sync/config.json` > legacy location (Application Support).
+/// If none exists, the default is the XDG path (the "not found" message
+/// points at the canonical location).
 pub fn resolve_config_for_read(flag: Option<&str>) -> PathBuf {
     resolve_config_for_read_from(
         flag,
@@ -99,7 +100,7 @@ fn resolve_config_for_read_from(
     xdg.to_path_buf()
 }
 
-/// Chave para LEITURA: valor explícito do config > XDG > local legado.
+/// Key for READING: explicit value from the config > XDG > legacy location.
 pub fn resolve_key_for_read(explicit: Option<&str>) -> PathBuf {
     resolve_key_for_read_from(explicit, &standard_key_path(), &legacy_key_path())
 }
@@ -121,8 +122,8 @@ pub fn standard_status_path() -> PathBuf {
     app_support_dir().join("status.json")
 }
 
-/// Path do status para LEITURA (subcomando `status` e tray):
-/// flag explícita > `./logs/status.json` (fluxo dev) > padrão do macOS.
+/// Status path for READING (`status` subcommand and tray):
+/// explicit flag > `./logs/status.json` (dev flow) > macOS standard.
 pub fn resolve_status_for_read(flag: Option<&str>) -> PathBuf {
     resolve_status_for_read_from(flag, Path::new("logs/status.json"), &standard_status_path())
 }
@@ -144,31 +145,31 @@ mod tests {
 
     #[test]
     fn standard_dirs_derive_from_home() {
-        let home = Path::new("/Users/teste");
+        let home = Path::new("/Users/test");
         assert_eq!(
             app_support_dir_from(home),
-            PathBuf::from("/Users/teste/Library/Application Support/drive-sync")
+            PathBuf::from("/Users/test/Library/Application Support/drive-sync")
         );
         assert_eq!(
             standard_log_dir_from(home),
-            PathBuf::from("/Users/teste/Library/Logs/drive-sync")
+            PathBuf::from("/Users/test/Library/Logs/drive-sync")
         );
         assert_eq!(
             config_dir_from(home),
-            PathBuf::from("/Users/teste/.config/drive-sync")
+            PathBuf::from("/Users/test/.config/drive-sync")
         );
     }
 
     #[test]
     fn config_and_key_defaults_live_in_xdg_config_dir() {
-        let home = Path::new("/Users/teste");
+        let home = Path::new("/Users/test");
         assert_eq!(
             standard_config_path_from(home),
-            PathBuf::from("/Users/teste/.config/drive-sync/config.json")
+            PathBuf::from("/Users/test/.config/drive-sync/config.json")
         );
         assert_eq!(
             standard_key_path_from(home),
-            PathBuf::from("/Users/teste/.config/drive-sync/drive.key")
+            PathBuf::from("/Users/test/.config/drive-sync/drive.key")
         );
     }
 
@@ -179,29 +180,29 @@ mod tests {
         let xdg = dir.path().join("xdg/config.json");
         let legacy = dir.path().join("legacy/config.json");
 
-        // flag vence tudo
+        // flag wins over everything
         assert_eq!(
             resolve_config_for_read_from(Some("/x/c.json"), &dev, &xdg, &legacy),
             PathBuf::from("/x/c.json")
         );
-        // nada existe -> default é o XDG (a mensagem de "não encontrado"
-        // aponta para o lugar canônico novo)
+        // nothing exists -> default is the XDG path (the "not found" message
+        // points at the new canonical location)
         assert_eq!(
             resolve_config_for_read_from(None, &dev, &xdg, &legacy),
             xdg
         );
-        // legacy existe -> legacy (migração suave)
+        // legacy exists -> legacy (smooth migration)
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, b"{}").unwrap();
         assert_eq!(
             resolve_config_for_read_from(None, &dev, &xdg, &legacy),
             legacy
         );
-        // XDG existe -> XDG vence o legacy
+        // XDG exists -> XDG wins over legacy
         std::fs::create_dir_all(xdg.parent().unwrap()).unwrap();
         std::fs::write(&xdg, b"{}").unwrap();
         assert_eq!(resolve_config_for_read_from(None, &dev, &xdg, &legacy), xdg);
-        // dev (CWD) existe -> dev vence (fluxo cargo run no projeto)
+        // dev (CWD) exists -> dev wins (cargo run flow in the project)
         std::fs::write(&dev, b"{}").unwrap();
         assert_eq!(resolve_config_for_read_from(None, &dev, &xdg, &legacy), dev);
     }
@@ -229,8 +230,8 @@ mod tests {
     fn resolve_status_flag_wins() {
         let out = resolve_status_for_read_from(
             Some("/x/status.json"),
-            Path::new("/nao-existe/logs/status.json"),
-            Path::new("/padrao/status.json"),
+            Path::new("/does-not-exist/logs/status.json"),
+            Path::new("/standard/status.json"),
         );
         assert_eq!(out, PathBuf::from("/x/status.json"));
     }
@@ -239,14 +240,14 @@ mod tests {
     fn resolve_status_prefers_existing_local_then_standard() {
         let dir = tempdir().unwrap();
         let local = dir.path().join("status.json");
-        let standard = Path::new("/padrao/status.json");
+        let standard = Path::new("/standard/status.json");
 
-        // local não existe -> padrão
+        // local does not exist -> standard
         assert_eq!(
             resolve_status_for_read_from(None, &local, standard),
             standard.to_path_buf()
         );
-        // local existe -> local
+        // local exists -> local
         std::fs::write(&local, b"{}").unwrap();
         assert_eq!(resolve_status_for_read_from(None, &local, standard), local);
     }

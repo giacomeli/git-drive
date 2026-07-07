@@ -5,10 +5,10 @@ use common::init_repo;
 #[test]
 fn init_repo_produces_repo_with_resolvable_head() {
     let test_repo = init_repo();
-    let head = test_repo.repo.head().expect("HEAD deve existir após init_repo");
-    assert!(head.is_branch(), "HEAD deve apontar para um branch");
+    let head = test_repo.repo.head().expect("HEAD must exist after init_repo");
+    assert!(head.is_branch(), "HEAD must point to a branch");
     assert!(
         test_repo.dir.path().join(".git").exists(),
-        ".git deve existir no dir temporário"
+        ".git must exist in the temp dir"
     );
 }

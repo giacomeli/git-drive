@@ -1,7 +1,7 @@
-//! Notificações do macOS via `osascript` (decisão 3 da Fase 2 — zero
-//! dependências, sem exigir app bundle). Eventos persistentes usam rate limit
-//! (decisão 12): primeira ocorrência + no máximo uma por hora enquanto a
-//! condição durar; a condição resolvida zera o limitador.
+//! macOS notifications via `osascript` (decision 3 of Phase 2 — zero
+//! dependencies, no app bundle required). Persistent events are rate limited
+//! (decision 12): first occurrence + at most one per hour while the condition
+//! lasts; resolving the condition resets the limiter.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -9,27 +9,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::status::now_unix;
 
-/// Janela do rate limit para eventos persistentes (1 hora).
+/// Rate limit window for persistent events (1 hour).
 const RATE_LIMIT_SECS: u64 = 3600;
 
 pub const KEY_PULL_BLOCKED: &str = "pull_blocked";
 
 #[derive(Debug, Clone)]
 pub enum NotifyEvent {
-    /// Merge criou conflicted copies — o usuário precisa resolver.
+    /// Merge created conflicted copies — the user needs to resolve them.
     Conflicts { copies: Vec<String> },
-    /// Push + reconcile falharam — commits locais não publicados.
+    /// Push + reconcile failed — local commits not published.
     PushFailed,
-    /// Volume montado e pronto.
+    /// Volume mounted and ready.
     Mounted { mount: String },
-    /// Parada limpa (SIGTERM/eject) concluída.
+    /// Clean stop (SIGTERM/eject) completed.
     Stopped,
-    /// Pull pulado por working tree sujo (persistente, rate-limited).
+    /// Pull skipped due to dirty working tree (persistent, rate-limited).
     PullBlocked,
 }
 
 impl NotifyEvent {
-    /// Eventos persistentes têm chave de rate limit; pontuais são None.
+    /// Persistent events have a rate limit key; one-shot events are None.
     fn persistent_key(&self) -> Option<&'static str> {
         match self {
             NotifyEvent::PullBlocked => Some(KEY_PULL_BLOCKED),
@@ -38,7 +38,7 @@ impl NotifyEvent {
     }
 }
 
-/// Título e corpo da notificação (pt-BR). Pura e testável.
+/// Notification title and body. Pure and testable.
 pub fn format_event(event: &NotifyEvent) -> (String, String) {
     match event {
         NotifyEvent::Conflicts { copies } => {
@@ -54,34 +54,34 @@ pub fn format_event(event: &NotifyEvent) -> (String, String) {
                 String::new()
             };
             (
-                "drive-sync: conflito de merge".to_string(),
+                "drive-sync: merge conflict".to_string(),
                 format!(
-                    "Versão local preservada em {}{}. A remota virou canônica.",
+                    "Local version preserved at {}{}. The remote one became canonical.",
                     list, more
                 ),
             )
         }
         NotifyEvent::PushFailed => (
-            "drive-sync: push falhou".to_string(),
-            "Mudanças commitadas localmente mas não publicadas. Verifique rede/credenciais (drive-sync status).".to_string(),
+            "drive-sync: push failed".to_string(),
+            "Changes committed locally but not published. Check network/credentials (drive-sync status).".to_string(),
         ),
         NotifyEvent::Mounted { mount } => (
-            "drive-sync: drive montado".to_string(),
-            format!("Volume disponível em {}.", mount),
+            "drive-sync: drive mounted".to_string(),
+            format!("Volume available at {}.", mount),
         ),
         NotifyEvent::Stopped => (
-            "drive-sync: drive desmontado".to_string(),
-            "Parada limpa concluída — nada ficou pendente.".to_string(),
+            "drive-sync: drive unmounted".to_string(),
+            "Clean stop completed — nothing left pending.".to_string(),
         ),
         NotifyEvent::PullBlocked => (
-            "drive-sync: pull bloqueado".to_string(),
-            "Mudanças locais não commitadas impedem o pull (modo sem identidade?). O sync está unidirecional.".to_string(),
+            "drive-sync: pull blocked".to_string(),
+            "Uncommitted local changes are blocking the pull (identity-less mode?). Sync is one-way for now.".to_string(),
         ),
     }
 }
 
-/// Rate limiter por chave: dispara na primeira ocorrência e depois de
-/// `window_secs` enquanto a condição persistir. `reset` ao resolver.
+/// Per-key rate limiter: fires on the first occurrence and then every
+/// `window_secs` while the condition persists. `reset` when resolved.
 pub struct RateLimiter {
     window_secs: u64,
     last_fired: Mutex<HashMap<&'static str, u64>>,
@@ -111,8 +111,8 @@ impl RateLimiter {
     }
 }
 
-/// Despachante de notificações. Nasce DESLIGADO — testes e usos embutidos não
-/// notificam; o modo mount real chama `enable()`.
+/// Notification dispatcher. Starts DISABLED — tests and embedded uses do not
+/// notify; the real mount mode calls `enable()`.
 pub struct Notifier {
     enabled: AtomicBool,
     limiter: RateLimiter,
@@ -136,7 +136,7 @@ impl Notifier {
         self.enabled.store(true, Ordering::SeqCst);
     }
 
-    /// Condição persistente resolvida — a próxima ocorrência notifica de novo.
+    /// Persistent condition resolved — the next occurrence notifies again.
     pub fn reset(&self, key: &'static str) {
         self.limiter.reset(key);
     }
@@ -165,7 +165,7 @@ fn dispatch_osascript(title: &str, body: &str) {
         applescript_escape(body),
         applescript_escape(title)
     );
-    // Fire-and-forget: falha de notificação nunca pode afetar o sync.
+    // Fire-and-forget: a notification failure must never affect the sync.
     let _ = std::process::Command::new("osascript")
         .arg("-e")
         .arg(script)
@@ -182,7 +182,7 @@ mod tests {
     fn format_conflicts_truncates_list() {
         let copies: Vec<String> = (0..5).map(|i| format!("f{}.conflict-h-1", i)).collect();
         let (title, body) = format_event(&NotifyEvent::Conflicts { copies });
-        assert!(title.contains("conflito"));
+        assert!(title.contains("conflict"));
         assert!(body.contains("f0.conflict-h-1"));
         assert!(body.contains("(+2)"), "{}", body);
     }
@@ -193,7 +193,7 @@ mod tests {
         assert!(rl.should_fire(KEY_PULL_BLOCKED, 1_000));
         assert!(!rl.should_fire(KEY_PULL_BLOCKED, 1_500));
         assert!(!rl.should_fire(KEY_PULL_BLOCKED, 4_599));
-        assert!(rl.should_fire(KEY_PULL_BLOCKED, 4_600), "janela expirada deve disparar");
+        assert!(rl.should_fire(KEY_PULL_BLOCKED, 4_600), "expired window must fire");
     }
 
     #[test]
@@ -201,17 +201,17 @@ mod tests {
         let rl = RateLimiter::new(3600);
         assert!(rl.should_fire(KEY_PULL_BLOCKED, 1_000));
         rl.reset(KEY_PULL_BLOCKED);
-        assert!(rl.should_fire(KEY_PULL_BLOCKED, 1_001), "reset deve rearmar");
+        assert!(rl.should_fire(KEY_PULL_BLOCKED, 1_001), "reset must rearm");
     }
 
     #[test]
     fn notifier_disabled_never_rate_limits() {
-        // Desligado não consome a janela do limiter (não notifica nem marca).
+        // Disabled does not consume the limiter window (neither notifies nor marks).
         let n = Notifier::new();
         n.notify(NotifyEvent::PullBlocked);
         assert!(
             n.limiter.should_fire(KEY_PULL_BLOCKED, now_unix()),
-            "evento com notifier desligado não deve consumir a janela"
+            "event with notifier disabled must not consume the window"
         );
     }
 

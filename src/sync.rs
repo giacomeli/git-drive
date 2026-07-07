@@ -12,19 +12,19 @@ use crate::log_ts;
 use crate::notify::{self, Notifier, NotifyEvent};
 use crate::status::StatusState;
 
-/// Conteúdo de um `SyncOp::Write`. `Mem` compartilha o mesmo `Arc` do write
-/// buffer do inode (pico de RAM ~1x o tamanho do arquivo, não uma cópia por
-/// estágio da pipeline).
+/// Content of a `SyncOp::Write`. `Mem` shares the same `Arc` as the inode's
+/// write buffer (RAM peak ~1x the file size, not one copy per pipeline
+/// stage).
 #[derive(Debug, Clone)]
 pub enum WriteContent {
     Mem(Arc<Vec<u8>>),
-    /// Snapshot em arquivo de spool (dentro de `.git/`, mesmo volume do
-    /// working tree): o drain aplica com `rename`, sem materializar em RAM.
+    /// Snapshot in a spool file (inside `.git/`, same volume as the working
+    /// tree): the drain applies it with `rename`, without materializing in RAM.
     Spooled(PathBuf),
 }
 
 impl WriteContent {
-    /// Materializa o conteúdo (cópia). Uso: testes e caminhos frios.
+    /// Materializes the content (copy). Used by tests and cold paths.
     pub fn to_vec(&self) -> Vec<u8> {
         match self {
             WriteContent::Mem(a) => a.as_ref().clone(),
@@ -51,8 +51,8 @@ pub enum SyncOp {
     Mkdir { path: String },
     Rmdir { path: String },
     Rename { from: String, to: String },
-    /// Criação de symlink com alvo opaco (texto). Barreira na fila, como as
-    /// demais ops não-Write — nunca coalesce.
+    /// Symlink creation with an opaque (text) target. A barrier in the queue,
+    /// like every other non-Write op — never coalesces.
     Symlink { path: String, target: String },
 }
 
@@ -81,37 +81,37 @@ pub struct SyncManager {
     remote_name: Option<String>,
     remote_token: Option<String>,
     refresh_flag: Arc<AtomicBool>,
-    /// Incrementado a cada commit local criado pelo drain. `GitDriveFS` compara
-    /// com o último valor visto para descartar write buffers "limpos" (conteúdo
-    /// já commitado no HEAD) — ver `refresh_if_needed`.
+    /// Incremented on every local commit created by the drain. `GitDriveFS`
+    /// compares it against the last value seen to discard "clean" write
+    /// buffers (content already committed to HEAD) — see `refresh_if_needed`.
     commit_generation: Arc<AtomicU64>,
-    /// Serializa os ciclos completos dos dois watchers sobre o mesmo repo:
-    /// drain (apply + commit + push + reconcile) e pull (fetch + merge +
-    /// checkout) nunca rodam concorrentes. A unidade atômica é o CICLO, não a
-    /// chamada git individual — um commit entrando entre o fetch e o checkout
-    /// do pull era a janela de corrida (RF4 da Fase 0).
+    /// Serializes the full cycles of both watchers over the same repo: drain
+    /// (apply + commit + push + reconcile) and pull (fetch + merge +
+    /// checkout) never run concurrently. The atomic unit is the CYCLE, not
+    /// the individual git call — a commit landing between the pull's fetch
+    /// and checkout was the race window (RF4 of Phase 0).
     repo_lock: Arc<Mutex<()>>,
-    /// Estado observável (status.json + subcomando `status`).
+    /// Observable state (status.json + the `status` subcommand).
     status: Arc<StatusState>,
-    /// Notificações macOS (nasce desligado; o modo mount real habilita).
+    /// macOS notifications (starts disabled; the real mount mode enables it).
     notifier: Arc<Notifier>,
-    /// Limiar em bytes para conversão em manifest + chunks no commit
-    /// (0 = chunking desligado). Setter pós-construção, como o status file.
+    /// Threshold in bytes for converting to manifest + chunks at commit time
+    /// (0 = chunking disabled). Post-construction setter, like the status file.
     chunk_threshold_bytes: Arc<AtomicU64>,
-    /// Tamanho de cada chunk, em bytes.
+    /// Size of each chunk, in bytes.
     chunk_size_bytes: Arc<AtomicU64>,
-    /// Criptografia em repouso (Fase 2.7): `Some` = repo cifrado.
+    /// Encryption at rest (Phase 2.7): `Some` = encrypted repo.
     crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
-    /// Chave disponível SÓ para migração de volta ao claro (config desligado
-    /// mas worktree ainda cifrado — decifrar exige a chave).
+    /// Key available ONLY for the migration back to cleartext (config turned
+    /// off but the worktree still encrypted — decrypting requires the key).
     migration_crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
 }
 
 struct Inner {
-    /// Fila em ordem de chegada. A ordem do kernel FUSE É a ordem causal —
-    /// preservá-la elimina por construção os bugs de "rename encadeado
-    /// embaralhado" e "write aplicado antes do rename do diretório" que a
-    /// combinação HashMap + sort por tipo de op produzia.
+    /// Arrival-order queue. The FUSE kernel order IS the causal order —
+    /// preserving it eliminates by construction the "shuffled chained rename"
+    /// and "write applied before the directory rename" bugs that the
+    /// HashMap + sort-by-op-type combination produced.
     buffer: Vec<SyncOp>,
     last_op: Option<Instant>,
 }
@@ -164,7 +164,7 @@ impl SyncManager {
             user_email,
             remote_name,
             remote_token,
-            0, // 0 desliga o pull watcher
+            0, // 0 disables the pull watcher
         )
     }
 
@@ -211,43 +211,43 @@ impl SyncManager {
         manager
     }
 
-    /// Retorna o valor atual da refresh_flag e zera. Usado por `GitDriveFS`
-    /// para decidir quando reconstruir os índices.
+    /// Returns the current value of the refresh_flag and clears it. Used by
+    /// `GitDriveFS` to decide when to rebuild the indexes.
     pub fn take_refresh_flag(&self) -> bool {
         self.refresh_flag.swap(false, Ordering::SeqCst)
     }
 
-    /// Sinaliza que os índices do FUSE devem ser reconstruídos no próximo
-    /// lookup/getattr/readdir. Contraparte de `take_refresh_flag`; os watchers
-    /// internos usam o mesmo mecanismo via clone do `Arc`.
+    /// Signals that the FUSE indexes must be rebuilt on the next
+    /// lookup/getattr/readdir. Counterpart of `take_refresh_flag`; the
+    /// internal watchers use the same mechanism via a clone of the `Arc`.
     pub fn raise_refresh_flag(&self) {
         self.refresh_flag.store(true, Ordering::SeqCst);
     }
 
-    /// Número de commits locais criados pelo drain desde o boot. Monotônico.
+    /// Number of local commits created by the drain since boot. Monotonic.
     pub fn commit_generation(&self) -> u64 {
         self.commit_generation.load(Ordering::SeqCst)
     }
 
-    /// Liga a persistência do status em arquivo (grava o estado corrente).
+    /// Enables status persistence to a file (writes the current state).
     pub fn enable_status_file(&self, path: std::path::PathBuf) {
         self.status.enable_file(path);
     }
 
-    /// Liga a criptografia em repouso (Fase 2.7). Setter pós-construção.
+    /// Enables encryption at rest (Phase 2.7). Post-construction setter.
     pub fn set_crypto(&self, crypto: Option<Arc<crate::crypt::Crypto>>) {
         *self.crypto.lock() = crypto;
     }
 
-    /// Chave para a migração de volta ao claro (criptografia desligada com
-    /// worktree ainda cifrado). Ignorada quando `set_crypto` está ativo.
+    /// Key for the migration back to cleartext (encryption turned off with
+    /// the worktree still encrypted). Ignored when `set_crypto` is active.
     pub fn set_migration_crypto(&self, crypto: Option<Arc<crate::crypt::Crypto>>) {
         *self.migration_crypto.lock() = crypto;
     }
 
-    /// Configura o chunking de arquivos grandes (Fase 2.6). `threshold_bytes`
-    /// 0 desativa. Setter pós-construção para não estender a assinatura já
-    /// extensa de `new_full_with_pull`.
+    /// Configures large-file chunking (Phase 2.6). `threshold_bytes` 0
+    /// disables it. Post-construction setter so we don't extend the already
+    /// long signature of `new_full_with_pull`.
     pub fn set_chunking(&self, threshold_bytes: u64, chunk_size_bytes: u64) {
         self.chunk_threshold_bytes
             .store(threshold_bytes, Ordering::SeqCst);
@@ -255,7 +255,7 @@ impl SyncManager {
             .store(chunk_size_bytes.max(1), Ordering::SeqCst);
     }
 
-    /// Snapshot dos campos compartilhados do ciclo de drain.
+    /// Snapshot of the shared fields of the drain cycle.
     fn drain_ctx(&self) -> DrainCtx {
         DrainCtx {
             inner: self.inner.clone(),
@@ -277,33 +277,33 @@ impl SyncManager {
         }
     }
 
-    /// Drena a fila AGORA, de forma síncrona (aplica + commita + push, sob o
-    /// `repo_lock`). Usado no shutdown limpo: depois do unmount, garante que
-    /// nenhuma op enfileirada se perca com a morte do processo.
+    /// Drains the queue NOW, synchronously (apply + commit + push, under the
+    /// `repo_lock`). Used during clean shutdown: after the unmount, it
+    /// guarantees no queued op is lost when the process dies.
     pub fn drain_now(&self) {
         let changes = { std::mem::take(&mut self.inner.lock().buffer) };
         if changes.is_empty() {
             return;
         }
         println!(
-            "[{}] drain_now: drenando {} op(s) pendentes no shutdown",
+            "[{}] drain_now: draining {} pending op(s) at shutdown",
             log_ts(),
             changes.len()
         );
         self.drain_ctx().run(changes);
     }
 
-    /// Acesso ao estado observável (snapshot para testes/CLI embutido).
+    /// Access to the observable state (snapshot for tests/embedded CLI).
     pub fn status_state(&self) -> Arc<StatusState> {
         self.status.clone()
     }
 
-    /// Acesso ao notificador (o main usa para eventos de mount/parada).
+    /// Access to the notifier (main uses it for mount/stop events).
     pub fn notifier(&self) -> Arc<Notifier> {
         self.notifier.clone()
     }
 
-    /// Habilita as notificações do macOS (modo mount real).
+    /// Enables macOS notifications (real mount mode).
     pub fn enable_notifications(&self) {
         self.notifier.enable();
     }
@@ -325,48 +325,49 @@ impl SyncManager {
             loop {
                 sleep(Duration::from_secs(interval_secs)).await;
 
-                // Não roda pull enquanto há lote pendente (evita corrida com commit local)
+                // Skip the pull while a batch is pending (avoids racing the local commit)
                 let pending = { !inner.lock().buffer.is_empty() };
                 if pending {
-                    status.record_pull("pulado: fila de sync pendente");
+                    status.record_pull("skipped: sync queue pending");
                     continue;
                 }
                 let Some(ref remote) = remote_name else {
                     break;
                 };
 
-                // Serializa com o ciclo do drain (RF4). Sem .await enquanto o
-                // guard vive — o lock cobre só chamadas bloqueantes de git.
+                // Serialize with the drain cycle (RF4). No .await while the
+                // guard is alive — the lock only covers blocking git calls.
                 let _repo_guard = repo_lock.lock();
 
                 let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!("[{}] pull: erro ao abrir repo: {}", log_ts(), e);
+                        eprintln!("[{}] pull: error opening repo: {}", log_ts(), e);
                         continue;
                     }
                 };
 
-                // Guarda RF6: merge/checkout force só com working tree limpo.
-                // Tree suja = mudanças locais ainda não commitadas (típico do
-                // modo sem identidade) — um fast-forward as destruiria.
+                // RF6 guard: merge/checkout force only with a clean working
+                // tree. A dirty tree = local changes not yet committed
+                // (typical of the identity-less mode) — a fast-forward would
+                // destroy them.
                 match git::is_working_tree_clean(&repo) {
                     Ok(true) => {
-                        // Condição de bloqueio resolvida — rearma a notificação.
+                        // Blocking condition resolved — re-arm the notification.
                         notifier.reset(notify::KEY_PULL_BLOCKED);
                     }
                     Ok(false) => {
                         println!(
-                            "[{}] pull: working tree com mudanças não commitadas — pulando",
+                            "[{}] pull: working tree has uncommitted changes — skipping",
                             log_ts()
                         );
-                        status.record_pull("pulado: working tree sujo");
+                        status.record_pull("skipped: dirty working tree");
                         notifier.notify(NotifyEvent::PullBlocked);
                         continue;
                     }
                     Err(e) => {
-                        eprintln!("[{}] pull: erro ao checar working tree: {}", log_ts(), e);
-                        status.record_pull("erro ao checar working tree");
+                        eprintln!("[{}] pull: error checking working tree: {}", log_ts(), e);
+                        status.record_pull("error checking working tree");
                         continue;
                     }
                 }
@@ -374,13 +375,13 @@ impl SyncManager {
                 if let Err(e) =
                     git::fetch_remote(&repo, &branch, remote, remote_token.as_deref())
                 {
-                    eprintln!("[{}] pull: erro no fetch: {}", log_ts(), e);
-                    status.record_pull("erro no fetch");
+                    eprintln!("[{}] pull: fetch error: {}", log_ts(), e);
+                    status.record_pull("fetch error");
                     continue;
                 }
 
-                // Com identidade: merge 3-way + conflicted copy em caso de conflito.
-                // Sem identidade: degrada para FF-only (não dá pra criar merge commit).
+                // With identity: 3-way merge + conflicted copy on conflict.
+                // Without identity: degrades to FF-only (no merge commit possible).
                 let outcome: Result<git::MergeOutcome, git2::Error> =
                     match (user_name.as_deref(), user_email.as_deref()) {
                         (Some(name), Some(email)) => {
@@ -398,27 +399,27 @@ impl SyncManager {
 
                 match outcome {
                     Ok(git::MergeOutcome::NoOp) => {
-                        status.record_pull("sem novidades");
+                        status.record_pull("up to date");
                     }
                     Ok(git::MergeOutcome::FastForwarded) => {
-                        println!("[{}] pull: fast-forward aplicado", log_ts());
+                        println!("[{}] pull: fast-forward applied", log_ts());
                         status.record_pull("fast-forward");
                         refresh_flag.store(true, Ordering::SeqCst);
                     }
                     Ok(git::MergeOutcome::Merged) => {
-                        println!("[{}] pull: merge 3-way sem conflitos", log_ts());
-                        status.record_pull("merge 3-way");
+                        println!("[{}] pull: 3-way merge, no conflicts", log_ts());
+                        status.record_pull("3-way merge");
                         refresh_flag.store(true, Ordering::SeqCst);
                     }
                     Ok(git::MergeOutcome::Conflicted { resolved, suffix }) => {
                         println!(
-                            "[{}] pull: resolveu {} conflito(s) — locais em *.{}: {:?}",
+                            "[{}] pull: resolved {} conflict(s) — local versions at *.{}: {:?}",
                             log_ts(),
                             resolved.len(),
                             suffix,
                             resolved
                         );
-                        status.record_pull(&format!("merge com {} conflito(s)", resolved.len()));
+                        status.record_pull(&format!("merge with {} conflict(s)", resolved.len()));
                         let copies: Vec<String> = resolved
                             .iter()
                             .map(|p| format!("{}.{}", p, suffix))
@@ -428,8 +429,8 @@ impl SyncManager {
                         refresh_flag.store(true, Ordering::SeqCst);
                     }
                     Err(e) => {
-                        eprintln!("[{}] pull: erro no merge: {}", log_ts(), e);
-                        status.record_pull("erro no merge");
+                        eprintln!("[{}] pull: merge error: {}", log_ts(), e);
+                        status.record_pull("merge error");
                     }
                 }
             }
@@ -440,8 +441,8 @@ impl SyncManager {
         self.queue_write_content(path, WriteContent::Mem(Arc::new(content)));
     }
 
-    /// Enfileira um write com conteúdo já empacotado (ex.: `Arc` compartilhado
-    /// com o write buffer do FUSE — nenhuma cópia no caminho quente).
+    /// Enqueues a write with already-packaged content (e.g. an `Arc` shared
+    /// with the FUSE write buffer — no copy on the hot path).
     pub fn queue_write_content(&self, path: &str, content: WriteContent) {
         self.enqueue(SyncOp::Write {
             path: path.to_string(),
@@ -497,8 +498,8 @@ impl SyncManager {
         self.inner.lock().buffer.clone()
     }
 
-    /// Checagem barata (sem clonar conteúdos) de fila não-vazia. Usada como
-    /// guarda no caminho quente do FUSE (`refresh_if_needed`).
+    /// Cheap check (no content cloning) for a non-empty queue. Used as a
+    /// guard on the FUSE hot path (`refresh_if_needed`).
     pub fn has_pending_ops(&self) -> bool {
         !self.inner.lock().buffer.is_empty()
     }
@@ -530,7 +531,7 @@ impl SyncManager {
                     };
 
                     if let Some(changes) = drained {
-                        println!("[{}] drain: sincronizando alterações", log_ts());
+                        println!("[{}] drain: syncing changes", log_ts());
                         ctx.run(changes);
                         break;
                     }
@@ -540,8 +541,8 @@ impl SyncManager {
     }
 }
 
-/// Contexto compartilhado do ciclo de drain — o watcher de debounce e o
-/// `drain_now` do shutdown executam exatamente o mesmo corpo.
+/// Shared context of the drain cycle — the debounce watcher and the
+/// shutdown's `drain_now` run exactly the same body.
 struct DrainCtx {
     inner: Arc<Mutex<Inner>>,
     repo_path: PathBuf,
@@ -563,25 +564,26 @@ struct DrainCtx {
 
 impl DrainCtx {
     fn run(&self, changes: Vec<SyncOp>) {
-        // Serializa o ciclo inteiro (apply + commit + push + reconcile) com o
-        // pull watcher (RF4 da Fase 0). Sem .await no escopo do guard.
+        // Serialize the whole cycle (apply + commit + push + reconcile) with
+        // the pull watcher (RF4 of Phase 0). No .await in the guard's scope.
         let _repo_guard = self.repo_lock.lock();
         let crypto = self.crypto.lock().clone();
         let migration_crypto = self.migration_crypto.lock().clone();
         let chunk_threshold = self.chunk_threshold_bytes.load(Ordering::SeqCst);
         let chunk_size = self.chunk_size_bytes.load(Ordering::SeqCst).max(1);
-        // Aplicação na ordem de chegada — a fila já é causal. Com criptografia,
-        // a tradução claro->cifrado de paths e conteúdo acontece AQUI (o FUSE
-        // e a fila trabalham 100% em claro).
+        // Apply in arrival order — the queue is already causal. With
+        // encryption, the cleartext->encrypted translation of paths and
+        // content happens HERE (the FUSE layer and the queue work 100% in
+        // cleartext).
         let ops: Vec<&SyncOp> = changes.iter().collect();
         for op in &ops {
             apply_op_to_disk(&self.repo_path, op, crypto.as_deref(), chunk_threshold);
         }
-        // Chunking (Fase 2.6): a varredura converte QUALQUER arquivo bruto
-        // acima do limiar — com criptografia, cada chunk é selado e o hash é
-        // do ciphertext. Invariante: nenhum blob bruto acima do limiar é
-        // stageado. Depois, as migrações de estado (Fase 2.7) conformam o
-        // worktree ao config; o GC remove chunks órfãos por último.
+        // Chunking (Phase 2.6): the sweep converts ANY raw file above the
+        // threshold — with encryption, each chunk is sealed and the hash is
+        // over the ciphertext. Invariant: no raw blob above the threshold is
+        // staged. Afterwards, the state migrations (Phase 2.7) conform the
+        // worktree to the config; the GC removes orphan chunks last.
         let mut converted = 0usize;
         if chunk_threshold > 0 {
             converted += convert_oversized_worktree_files(
@@ -595,7 +597,7 @@ impl DrainCtx {
             let migrated = migrate_worktree_to_encrypted(&self.repo_path, c);
             if migrated > 0 {
                 println!(
-                    "[{}] crypto: {} item(ns) migrado(s) para cifrado. AVISO: a história                      Git ANTERIOR permanece em claro no remote — para repo público,                      prefira começar de repo novo",
+                    "[{}] crypto: {} item(s) migrated to encrypted. WARNING: the PREVIOUS Git history remains in cleartext on the remote — for a public repo, prefer starting from a fresh repo",
                     log_ts(),
                     migrated
                 );
@@ -605,7 +607,7 @@ impl DrainCtx {
             let migrated = migrate_worktree_to_clear(&self.repo_path, mk);
             if migrated > 0 {
                 println!(
-                    "[{}] crypto: {} item(ns) decifrado(s) de volta ao claro",
+                    "[{}] crypto: {} item(s) decrypted back to cleartext",
                     log_ts(),
                     migrated
                 );
@@ -636,12 +638,12 @@ impl DrainCtx {
         let mut pushed: Option<bool> = None;
         if let Some(_oid) = commit_oid {
             self.commit_generation.fetch_add(1, Ordering::SeqCst);
-            // Conversão da varredura cria paths novos no HEAD que o índice do
-            // FUSE pode não conhecer (arquivo chegou por fora do mount) — sem
-            // o refresh, o arquivo ficaria invisível no drive até um pull real
-            // (incidente da migração do zip, 03-07-2026). Flag DEPOIS do
-            // commit: rebuild antes dele leria o HEAD antigo e consumiria a
-            // flag à toa.
+            // The sweep's conversion creates new paths in HEAD that the FUSE
+            // index may not know about (file arrived from outside the mount)
+            // — without the refresh, the file would stay invisible in the
+            // drive until a real pull (zip migration incident, 2026-07-03).
+            // Flag AFTER the commit: a rebuild before it would read the old
+            // HEAD and consume the flag for nothing.
             if converted > 0 {
                 self.refresh_flag.store(true, Ordering::SeqCst);
             }
@@ -664,7 +666,7 @@ impl DrainCtx {
                     if recovered {
                         self.refresh_flag.store(true, Ordering::SeqCst);
                     } else {
-                        // Push + reconcile falharam: commit local sem publicar.
+                        // Push + reconcile failed: local commit left unpublished.
                         self.notifier.notify(NotifyEvent::PushFailed);
                     }
                 }
@@ -680,15 +682,16 @@ impl DrainCtx {
     }
 }
 
-/// Traduz um path CLARO da fila para o path no disco (cifrado quando a
-/// criptografia está ativa). Nome que estoura o limite do filesystem cai no
-/// claro com erro logado — preferível a perder a op.
+/// Translates a CLEARTEXT path from the queue into the on-disk path
+/// (encrypted when encryption is active). A name that exceeds the filesystem
+/// limit falls back to cleartext with a logged error — better than losing
+/// the op.
 fn disk_rel_path(crypto: Option<&crate::crypt::Crypto>, clear: &str) -> String {
     match crypto {
         Some(c) => match c.enc_path(clear) {
             Ok(enc) => enc,
             Err(e) => {
-                eprintln!("[{}] crypto: {} em {:?} — mantendo claro", log_ts(), e, clear);
+                eprintln!("[{}] crypto: {} at {:?} — keeping cleartext", log_ts(), e, clear);
                 clear.to_string()
             }
         },
@@ -712,16 +715,16 @@ fn apply_op_to_disk(
                 (WriteContent::Mem(data), None) => std::fs::write(&full, data.as_slice()),
                 (WriteContent::Mem(data), Some(c)) => {
                     if chunk_threshold > 0 && data.len() as u64 > chunk_threshold {
-                        // Acima do limiar: plaintext temporário no path cifrado —
-                        // a varredura de chunking sela chunk a chunk em seguida
-                        // (selar inteiro aqui materializaria tudo em RAM).
+                        // Above the threshold: temporary plaintext at the encrypted
+                        // path — the chunking sweep seals chunk by chunk right after
+                        // (sealing it whole here would materialize everything in RAM).
                         std::fs::write(&full, data.as_slice())
                     } else {
                         std::fs::write(&full, c.seal(data.as_slice()))
                     }
                 }
-                // rename move o snapshot sem passar pela RAM; fallback para
-                // copy+remove se o spool estiver em outro volume.
+                // rename moves the snapshot without going through RAM; falls
+                // back to copy+remove if the spool is on another volume.
                 (WriteContent::Spooled(src), None) => {
                     std::fs::rename(src, &full).or_else(|_| {
                         std::fs::copy(src, &full).map(|_| ())?;
@@ -732,7 +735,7 @@ fn apply_op_to_disk(
                 (WriteContent::Spooled(src), Some(c)) => {
                     let len = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
                     if chunk_threshold > 0 && len > chunk_threshold {
-                        // Mesmo racional do Mem grande: a varredura sela por chunk.
+                        // Same rationale as the large Mem case: the sweep seals per chunk.
                         std::fs::rename(src, &full).or_else(|_| {
                             std::fs::copy(src, &full).map(|_| ())?;
                             let _ = std::fs::remove_file(src);
@@ -748,14 +751,14 @@ fn apply_op_to_disk(
             };
             match result {
                 Ok(_) => println!("[{}] disk: write {}", log_ts(), path),
-                Err(e) => eprintln!("[{}] disk: erro ao salvar {}: {}", log_ts(), path, e),
+                Err(e) => eprintln!("[{}] disk: error saving {}: {}", log_ts(), path, e),
             }
         }
         SyncOp::Delete { path } => {
             let full = repo_path.join(disk_rel_path(crypto, path));
             let result = match std::fs::remove_file(&full) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound && crypto.is_some() => {
-                    // Estado misto: a versão no disco pode ainda estar em claro.
+                    // Mixed state: the on-disk version may still be in cleartext.
                     std::fs::remove_file(repo_path.join(path))
                 }
                 other => other,
@@ -763,17 +766,17 @@ fn apply_op_to_disk(
             match result {
                 Ok(_) => println!("[{}] disk: unlink {}", log_ts(), path),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Path nunca chegou ao disco (ex.: temp dirs `.sb-*` que o
-                    // filtro bloqueia na criação mas deixa passar no delete).
-                    // Idempotente: já não existe = remoção bem-sucedida.
+                    // The path never reached the disk (e.g. `.sb-*` temp dirs
+                    // that the filter blocks on creation but lets through on
+                    // delete). Idempotent: already gone = successful removal.
                 }
-                Err(e) => eprintln!("[{}] disk: erro ao remover {}: {}", log_ts(), path, e),
+                Err(e) => eprintln!("[{}] disk: error removing {}: {}", log_ts(), path, e),
             }
         }
         SyncOp::Mkdir { path } => {
             let full = repo_path.join(disk_rel_path(crypto, path));
             if let Err(e) = std::fs::create_dir_all(&full) {
-                eprintln!("[{}] disk: erro ao criar diretório {}: {}", log_ts(), path, e);
+                eprintln!("[{}] disk: error creating directory {}: {}", log_ts(), path, e);
                 return;
             }
             let keep_rel = disk_rel_path(crypto, &format!("{}/.gitkeep", path));
@@ -785,7 +788,7 @@ fn apply_op_to_disk(
                 };
                 if let Err(e) = std::fs::write(&keep, keep_bytes) {
                     eprintln!(
-                        "[{}] disk: erro ao criar .gitkeep em {}: {}",
+                        "[{}] disk: error creating .gitkeep in {}: {}",
                         log_ts(),
                         path,
                         e
@@ -802,11 +805,11 @@ fn apply_op_to_disk(
             match std::fs::remove_dir(&full) {
                 Ok(_) => println!("[{}] disk: rmdir {}", log_ts(), path),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Mesmo racional do Delete: diretório que nunca chegou ao
-                    // disco (ex.: `.sb-*`) gera ENOENT no rmdir. Silencia.
+                    // Same rationale as Delete: a directory that never reached
+                    // the disk (e.g. `.sb-*`) yields ENOENT on rmdir. Silence it.
                 }
                 Err(e) => eprintln!(
-                    "[{}] disk: erro ao remover diretório {}: {}",
+                    "[{}] disk: error removing directory {}: {}",
                     log_ts(),
                     path,
                     e
@@ -816,7 +819,7 @@ fn apply_op_to_disk(
         SyncOp::Rename { from, to } => {
             let mut from_full = repo_path.join(disk_rel_path(crypto, from));
             if crypto.is_some() && !from_full.exists() {
-                // Estado misto: origem pode ainda estar com nome claro.
+                // Mixed state: the source may still have its cleartext name.
                 from_full = repo_path.join(from);
             }
             let to_full = repo_path.join(disk_rel_path(crypto, to));
@@ -826,7 +829,7 @@ fn apply_op_to_disk(
             match std::fs::rename(&from_full, &to_full) {
                 Ok(_) => println!("[{}] disk: rename {} -> {}", log_ts(), from, to),
                 Err(e) => eprintln!(
-                    "[{}] disk: erro ao renomear {} -> {}: {}",
+                    "[{}] disk: error renaming {} -> {}: {}",
                     log_ts(),
                     from,
                     to,
@@ -840,13 +843,14 @@ fn apply_op_to_disk(
                 std::fs::create_dir_all(parent).ok();
             }
             let disk_target = disk_rel_path(crypto, target);
-            // symlink(2) falha com EEXIST se o path existe — remover antes
-            // reproduz a semântica da fila (o estado final é o symlink).
+            // symlink(2) fails with EEXIST if the path exists — removing it
+            // first reproduces the queue semantics (the final state is the
+            // symlink).
             let _ = std::fs::remove_file(&full);
             match std::os::unix::fs::symlink(&disk_target, &full) {
                 Ok(_) => println!("[{}] disk: symlink {} -> {}", log_ts(), path, target),
                 Err(e) => eprintln!(
-                    "[{}] disk: erro ao criar symlink {} -> {}: {}",
+                    "[{}] disk: error creating symlink {} -> {}: {}",
                     log_ts(),
                     path,
                     target,
@@ -857,8 +861,8 @@ fn apply_op_to_disk(
     }
 }
 
-/// Retorna o oid do commit criado, ou `None` (sem identidade, tree limpa ou
-/// erro — o motivo vai para o log).
+/// Returns the oid of the created commit, or `None` (no identity, clean tree
+/// or error — the reason goes to the log).
 fn commit_batch(
     repo_path: &Path,
     branch: &str,
@@ -868,7 +872,7 @@ fn commit_batch(
 ) -> Option<git2::Oid> {
     let (Some(name), Some(email)) = (user_name.as_deref(), user_email.as_deref()) else {
         println!(
-            "[{}] commit: user_name/user_email ausentes — commit ignorado",
+            "[{}] commit: user_name/user_email missing — skipping commit",
             log_ts()
         );
         return None;
@@ -876,22 +880,22 @@ fn commit_batch(
     let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[{}] commit: erro ao abrir repo: {}", log_ts(), e);
+            eprintln!("[{}] commit: error opening repo: {}", log_ts(), e);
             return None;
         }
     };
     let message = build_commit_message(ops);
     match git::commit_working_tree(&repo, branch, name, email, &message) {
         Ok(Some(oid)) => {
-            println!("[{}] commit: criado {}", log_ts(), oid);
+            println!("[{}] commit: created {}", log_ts(), oid);
             Some(oid)
         }
         Ok(None) => {
-            println!("[{}] commit: tree limpa, nada a commitar", log_ts());
+            println!("[{}] commit: clean tree, nothing to commit", log_ts());
             None
         }
         Err(e) => {
-            eprintln!("[{}] commit: erro: {}", log_ts(), e);
+            eprintln!("[{}] commit: error: {}", log_ts(), e);
             None
         }
     }
@@ -901,7 +905,7 @@ fn push_batch(repo_path: &Path, branch: &str, remote: &str, token: &Option<Strin
     let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[{}] push: erro ao abrir repo: {}", log_ts(), e);
+            eprintln!("[{}] push: error opening repo: {}", log_ts(), e);
             return false;
         }
     };
@@ -911,15 +915,15 @@ fn push_batch(repo_path: &Path, branch: &str, remote: &str, token: &Option<Strin
             true
         }
         Err(e) => {
-            eprintln!("[{}] push: erro em {}: {}", log_ts(), remote, e);
+            eprintln!("[{}] push: error on {}: {}", log_ts(), remote, e);
             false
         }
     }
 }
 
-/// Push falhou (geralmente non-FF). Faz fetch + pull_and_merge + retry de push único.
-/// Retorna `true` se o retry teve sucesso (implica que o working tree mudou e o caller
-/// deve sinalizar refresh pro FUSE).
+/// The push failed (usually non-FF). Does fetch + pull_and_merge + a single push
+/// retry. Returns `true` if the retry succeeded (implies the working tree changed
+/// and the caller must signal a refresh to the FUSE layer).
 #[allow(clippy::too_many_arguments)]
 fn reconcile_and_retry_push(
     repo_path: &Path,
@@ -933,7 +937,7 @@ fn reconcile_and_retry_push(
 ) -> bool {
     let (Some(name), Some(email)) = (user_name.as_deref(), user_email.as_deref()) else {
         eprintln!(
-            "[{}] reconcile: push falhou e sem identidade — impossível reconciliar",
+            "[{}] reconcile: push failed and no identity configured — cannot reconcile",
             log_ts()
         );
         return false;
@@ -941,13 +945,13 @@ fn reconcile_and_retry_push(
     let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[{}] reconcile: erro ao abrir repo: {}", log_ts(), e);
+            eprintln!("[{}] reconcile: error opening repo: {}", log_ts(), e);
             return false;
         }
     };
 
     if let Err(e) = git::fetch_remote(&repo, branch, remote, token.as_deref()) {
-        eprintln!("[{}] reconcile: erro no fetch: {}", log_ts(), e);
+        eprintln!("[{}] reconcile: fetch error: {}", log_ts(), e);
         return false;
     }
 
@@ -955,14 +959,14 @@ fn reconcile_and_retry_push(
     match git::pull_and_merge(&repo, branch, remote, name, email, &suffix) {
         Ok(git::MergeOutcome::NoOp) => {
             eprintln!(
-                "[{}] reconcile: sem divergência — erro original pode ser rede/auth",
+                "[{}] reconcile: no divergence — the original error may be network/auth",
                 log_ts()
             );
             return false;
         }
         Ok(git::MergeOutcome::Conflicted { ref resolved, ref suffix }) => {
             println!(
-                "[{}] reconcile: {} conflito(s) — locais em *.{}: {:?}",
+                "[{}] reconcile: {} conflict(s) — local versions at *.{}: {:?}",
                 log_ts(),
                 resolved.len(),
                 suffix,
@@ -976,27 +980,27 @@ fn reconcile_and_retry_push(
             notifier.notify(NotifyEvent::Conflicts { copies });
         }
         Ok(o) => {
-            println!("[{}] reconcile: aplicado ({:?})", log_ts(), o);
+            println!("[{}] reconcile: applied ({:?})", log_ts(), o);
         }
         Err(e) => {
-            eprintln!("[{}] reconcile: erro no pull_and_merge: {}", log_ts(), e);
+            eprintln!("[{}] reconcile: pull_and_merge error: {}", log_ts(), e);
             return false;
         }
     }
 
     match git::push_to_remote(&repo, branch, remote, token.as_deref()) {
         Ok(_) => {
-            println!("[{}] push: retry em {} ok", log_ts(), remote);
+            println!("[{}] push: retry on {} ok", log_ts(), remote);
             true
         }
         Err(e) => {
-            eprintln!("[{}] push: retry ainda falhou: {}", log_ts(), e);
+            eprintln!("[{}] push: retry failed again: {}", log_ts(), e);
             false
         }
     }
 }
 
-/// Gera sufixo único para conflicted copies. Formato: `conflict-<hostname>-<unix_ts>`.
+/// Generates a unique suffix for conflicted copies. Format: `conflict-<hostname>-<unix_ts>`.
 fn conflict_suffix() -> String {
     let host = gethostname_or("unknown");
     let ts = std::time::SystemTime::now()
@@ -1036,9 +1040,10 @@ fn build_commit_message(ops: &[&SyncOp]) -> String {
     format!("drive-sync: {} changes ({}{})", n, preview.join(", "), more)
 }
 
-/// Varre o working tree e converte em manifest + chunks todo arquivo regular
-/// acima de `threshold` que não seja ignorado nem já manifest. Pula `.git`
-/// (em qualquer nível) e `.chunks`. Streaming: RAM limitada a um chunk.
+/// Sweeps the working tree and converts into manifest + chunks every regular
+/// file above `threshold` that is neither ignored nor already a manifest.
+/// Skips `.git` (at any level) and `.chunks`. Streaming: RAM bounded by one
+/// chunk.
 fn convert_oversized_worktree_files(
     repo_path: &Path,
     threshold: u64,
@@ -1048,7 +1053,7 @@ fn convert_oversized_worktree_files(
     let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[{}] chunk: erro ao abrir repo: {}", log_ts(), e);
+            eprintln!("[{}] chunk: error opening repo: {}", log_ts(), e);
             return 0;
         }
     };
@@ -1058,8 +1063,9 @@ fn convert_oversized_worktree_files(
         if !meta.is_file() || meta.len() <= threshold {
             continue;
         }
-        // Ignorados são local-only: nunca commitam, chunkar quebraria a
-        // leitura. No modo cifrado a semântica de ignore está desativada.
+        // Ignored files are local-only: they never get committed, and
+        // chunking them would break reads. In encrypted mode the ignore
+        // semantics are disabled.
         if crypto.is_none() && repo.is_path_ignored(&rel).unwrap_or(false) {
             continue;
         }
@@ -1067,10 +1073,10 @@ fn convert_oversized_worktree_files(
             continue;
         }
         if file_starts_with_encrypted_magic(&full) {
-            // Selado inteiro acima do limiar: legado que o fluxo atual não
-            // produz (writes grandes chegam plaintext para esta varredura).
+            // Sealed whole above the threshold: legacy the current flow no
+            // longer produces (large writes arrive as plaintext for this sweep).
             eprintln!(
-                "[{}] chunk: {} selado acima do limiar — pulado (re-salve o arquivo)",
+                "[{}] chunk: {} sealed above the threshold — skipped (re-save the file)",
                 log_ts(),
                 rel
             );
@@ -1080,20 +1086,20 @@ fn convert_oversized_worktree_files(
             Ok(manifest) => {
                 converted += 1;
                 println!(
-                    "[{}] chunk: {} -> {} chunk(s) de até {} bytes",
+                    "[{}] chunk: {} -> {} chunk(s) of up to {} bytes",
                     log_ts(),
                     rel,
                     manifest.hashes.len(),
                     chunk_size
                 );
             }
-            Err(e) => eprintln!("[{}] chunk: erro ao converter {}: {}", log_ts(), rel, e),
+            Err(e) => eprintln!("[{}] chunk: error converting {}: {}", log_ts(), rel, e),
         }
     }
     converted
 }
 
-/// Converte um arquivo bruto em chunks + manifest (substitui o arquivo pelo
+/// Converts a raw file into chunks + manifest (replaces the file with the
 /// manifest via temp + rename).
 fn convert_file_to_chunks(
     repo_root: &Path,
@@ -1111,15 +1117,16 @@ fn convert_file_to_chunks(
             .as_ref()
             .map(|f| f as &dyn Fn(&[u8]) -> Vec<u8>),
     )?;
-    // Manifest fica plaintext aqui; a migração de estado (logo em seguida no
-    // mesmo drain) sela e move para o nome cifrado quando a cripto está ativa.
+    // The manifest stays plaintext here; the state migration (right after,
+    // in the same drain) seals it and moves it to the encrypted name when
+    // encryption is active.
     let tmp = full.with_extension("drive-sync-manifest.tmp");
     std::fs::write(&tmp, manifest.serialize())?;
     std::fs::rename(&tmp, full)?;
     Ok(manifest)
 }
 
-/// `true` se o arquivo começa com a magic de conteúdo cifrado.
+/// `true` if the file starts with the encrypted-content magic.
 fn file_starts_with_encrypted_magic(path: &Path) -> bool {
     use std::io::Read;
     let Ok(mut f) = std::fs::File::open(path) else {
@@ -1130,9 +1137,9 @@ fn file_starts_with_encrypted_magic(path: &Path) -> bool {
     crate::crypt::Crypto::is_encrypted_bytes(&buf[..len])
 }
 
-/// Migração `claro -> cifrado`: conforma cada arquivo/symlink do working tree
-/// ao estado cifrado (nome E conteúdo). Idempotente — arquivo já conforme é
-/// pulado. Retorna quantos itens foram convertidos.
+/// `cleartext -> encrypted` migration: conforms every file/symlink in the
+/// working tree to the encrypted state (name AND content). Idempotent — a
+/// file already conforming is skipped. Returns how many items were converted.
 fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> usize {
     let mut converted = 0usize;
     for (full, rel) in walk_worktree_files(repo_path) {
@@ -1154,7 +1161,7 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
             let (Ok(new_rel), Ok(new_target)) =
                 (c.enc_path(&clear_rel), c.enc_path(&clear_target))
             else {
-                eprintln!("[{}] crypto: nome longo demais em {:?} — pulado", log_ts(), clear_rel);
+                eprintln!("[{}] crypto: name too long at {:?} — skipped", log_ts(), clear_rel);
                 continue;
             };
             let new_full = repo_path.join(&new_rel);
@@ -1177,7 +1184,7 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
         }
         let clear_rel = c.dec_path(&rel);
         let Ok(new_rel) = c.enc_path(&clear_rel) else {
-            eprintln!("[{}] crypto: nome longo demais em {:?} — pulado", log_ts(), clear_rel);
+            eprintln!("[{}] crypto: name too long at {:?} — skipped", log_ts(), clear_rel);
             continue;
         };
         let new_full = repo_path.join(&new_rel);
@@ -1185,7 +1192,7 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
             let _ = std::fs::create_dir_all(parent);
         }
         if sealed {
-            // Conteúdo ok, só o nome precisa migrar.
+            // Content is fine; only the name needs to migrate.
             if new_full != full && std::fs::rename(&full, &new_full).is_ok() {
                 converted += 1;
             }
@@ -1193,10 +1200,11 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
         }
         let Ok(plain) = std::fs::read(&full) else { continue };
         if crate::chunk::Manifest::is_manifest_bytes(&plain) {
-            // Arquivo chunkado EM CLARO: selar só o manifest deixaria os
-            // chunks antigos em plaintext no repo (vazamento). Expande para
-            // temp (streaming) e re-chunka com selagem; os chunks claros
-            // viram órfãos e o GC (que roda depois, com a chave) os remove.
+            // File chunked IN CLEARTEXT: sealing only the manifest would
+            // leave the old chunks in plaintext in the repo (a leak). Expand
+            // to a temp file (streaming) and re-chunk with sealing; the
+            // cleartext chunks become orphans and the GC (which runs later,
+            // with the key) removes them.
             if let Ok(old_manifest) = crate::chunk::Manifest::parse(&plain) {
                 let any_clear_chunk = old_manifest.hashes.iter().any(|h| {
                     !file_starts_with_encrypted_magic(
@@ -1204,8 +1212,9 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
                     )
                 });
                 if !any_clear_chunk {
-                    // Chunks já selados (escrita nova sob cripto): basta selar
-                    // o manifest — cai no caminho comum abaixo.
+                    // Chunks already sealed (new write under encryption):
+                    // sealing the manifest is enough — falls through to the
+                    // common path below.
                 } else {
                 let tmp = new_full.with_extension("drive-sync-rechunk.tmp");
                 let expand = (|| -> std::io::Result<()> {
@@ -1214,7 +1223,7 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
                     for h in &old_manifest.hashes {
                         let chunk =
                             std::fs::read(repo_path.join(crate::chunk::shard_rel_path(h)))?;
-                        // Estado misto: chunk selado é aberto; claro passa cru.
+                        // Mixed state: a sealed chunk is opened; cleartext passes through raw.
                         let bytes = if crate::crypt::Crypto::is_encrypted_bytes(&chunk) {
                             c.open(&chunk)
                                 .map_err(|e| std::io::Error::other(e.to_string()))?
@@ -1228,7 +1237,7 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
                 if expand.is_err() {
                     let _ = std::fs::remove_file(&tmp);
                     eprintln!(
-                        "[{}] crypto: falha ao expandir manifest claro {:?} — pulado",
+                        "[{}] crypto: failed to expand cleartext manifest {:?} — skipped",
                         log_ts(),
                         rel
                     );
@@ -1273,9 +1282,9 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
     converted
 }
 
-/// Migração `cifrado -> claro`: decifra nomes e conteúdo; manifests selados
-/// são expandidos de volta ao arquivo inteiro (o chunk sweep re-chunka em
-/// claro na sequência, se ainda for grande).
+/// `encrypted -> cleartext` migration: decrypts names and content; sealed
+/// manifests are expanded back into the whole file (the chunk sweep
+/// re-chunks it in cleartext right after, if still large).
 fn migrate_worktree_to_clear(repo_path: &Path, mk: &crate::crypt::Crypto) -> usize {
     let mut converted = 0usize;
     for (full, rel) in walk_worktree_files(repo_path) {
@@ -1312,7 +1321,7 @@ fn migrate_worktree_to_clear(repo_path: &Path, mk: &crate::crypt::Crypto) -> usi
             let _ = std::fs::create_dir_all(parent);
         }
         if !sealed {
-            // Só o nome está cifrado.
+            // Only the name is encrypted.
             if std::fs::rename(&full, &new_full).is_ok() {
                 converted += 1;
             }
@@ -1321,15 +1330,15 @@ fn migrate_worktree_to_clear(repo_path: &Path, mk: &crate::crypt::Crypto) -> usi
         let Ok(sealed_bytes) = std::fs::read(&full) else { continue };
         let Ok(plain) = mk.open(&sealed_bytes) else {
             eprintln!(
-                "[{}] crypto: falha ao decifrar {:?} na migração — pulado",
+                "[{}] crypto: failed to decrypt {:?} during migration — skipped",
                 log_ts(),
                 rel
             );
             continue;
         };
         if crate::chunk::Manifest::is_manifest_bytes(&plain) {
-            // Expandir: remonta o arquivo inteiro decifrando chunk a chunk
-            // (streaming em disco; RAM limitada a um chunk).
+            // Expand: reassembles the whole file by decrypting chunk by
+            // chunk (streaming to disk; RAM bounded by one chunk).
             let Ok(manifest) = crate::chunk::Manifest::parse(&plain) else { continue };
             let tmp = new_full.with_extension("drive-sync-expand.tmp");
             let ok = (|| -> std::io::Result<()> {
@@ -1365,8 +1374,8 @@ fn migrate_worktree_to_clear(repo_path: &Path, mk: &crate::crypt::Crypto) -> usi
     converted
 }
 
-/// Remove diretórios vazios deixados pelas migrações de nome (bottom-up).
-/// `.git` e `.chunks` ficam intocados.
+/// Removes empty directories left behind by the name migrations (bottom-up).
+/// `.git` and `.chunks` stay untouched.
 fn prune_empty_dirs(repo_path: &Path) {
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
     let mut stack = vec![repo_path.to_path_buf()];
@@ -1386,12 +1395,12 @@ fn prune_empty_dirs(repo_path: &Path) {
     }
     dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
     for d in dirs {
-        let _ = std::fs::remove_dir(&d); // só remove se vazio
+        let _ = std::fs::remove_dir(&d); // only removes if empty
     }
 }
 
-/// Remove de `.chunks/` os arquivos que nenhum manifest do working tree
-/// referencia. Barato quando não há chunks (early return).
+/// Removes from `.chunks/` the files that no manifest in the working tree
+/// references. Cheap when there are no chunks (early return).
 fn gc_orphan_chunks(repo_path: &Path, key: Option<&crate::crypt::Crypto>) {
     let chunks_root = repo_path.join(crate::chunk::CHUNKS_DIR);
     let existing: Vec<std::path::PathBuf> = walk_dir_files(&chunks_root);
@@ -1407,10 +1416,11 @@ fn gc_orphan_chunks(repo_path: &Path, key: Option<&crate::crypt::Crypto>) {
         let Ok(mut bytes) = std::fs::read(&full) else { continue };
         if crate::crypt::Crypto::is_encrypted_bytes(&bytes) {
             let Some(k) = key else {
-                // Manifests selados sem chave: impossível saber as referências
-                // — NUNCA coletar às cegas (removeria chunks vivos).
+                // Sealed manifests without a key: impossible to know the
+                // references — NEVER collect blindly (it would remove live
+                // chunks).
                 eprintln!(
-                    "[{}] chunk: gc pulado — worktree cifrado sem chave disponível",
+                    "[{}] chunk: gc skipped — encrypted worktree without an available key",
                     log_ts()
                 );
                 return;
@@ -1433,10 +1443,10 @@ fn gc_orphan_chunks(repo_path: &Path, key: Option<&crate::crypt::Crypto>) {
             .unwrap_or_default();
         if !referenced.contains(&name) {
             match std::fs::remove_file(&chunk_file) {
-                Ok(_) => println!("[{}] chunk: gc removeu órfão {}", log_ts(), name),
-                Err(e) => eprintln!("[{}] chunk: gc falhou em {}: {}", log_ts(), name, e),
+                Ok(_) => println!("[{}] chunk: gc removed orphan {}", log_ts(), name),
+                Err(e) => eprintln!("[{}] chunk: gc failed on {}: {}", log_ts(), name, e),
             }
-            // Shard vazio some junto (best-effort).
+            // Empty shard dir goes with it (best-effort).
             if let Some(parent) = chunk_file.parent() {
                 let _ = std::fs::remove_dir(parent);
             }
@@ -1444,8 +1454,8 @@ fn gc_orphan_chunks(repo_path: &Path, key: Option<&crate::crypt::Crypto>) {
     }
 }
 
-/// Arquivos do working tree como (path completo, path relativo), pulando
-/// `.git` em qualquer nível e `.chunks` na raiz. Não segue symlinks.
+/// Working tree files as (full path, relative path), skipping `.git` at any
+/// level and `.chunks` at the root. Does not follow symlinks.
 fn walk_worktree_files(repo_path: &Path) -> Vec<(std::path::PathBuf, String)> {
     let mut out = Vec::new();
     let mut stack = vec![repo_path.to_path_buf()];
@@ -1464,9 +1474,9 @@ fn walk_worktree_files(repo_path: &Path) -> Vec<(std::path::PathBuf, String)> {
             if meta.is_dir() {
                 stack.push(full);
             } else if meta.is_file() || meta.file_type().is_symlink() {
-                // Symlinks INCLUÍDOS: a migração de criptografia precisa
-                // visitá-los (nome e alvo). Consumidores que só tratam
-                // arquivo regular checam is_file() por conta própria.
+                // Symlinks INCLUDED: the encryption migration needs to visit
+                // them (name and target). Consumers that only handle regular
+                // files check is_file() on their own.
                 let rel = full
                     .strip_prefix(repo_path)
                     .map(|p| p.to_string_lossy().into_owned())
@@ -1478,7 +1488,7 @@ fn walk_worktree_files(repo_path: &Path) -> Vec<(std::path::PathBuf, String)> {
     out
 }
 
-/// Arquivos (recursivo) sob um diretório. Vazio se o diretório não existe.
+/// Files (recursive) under a directory. Empty if the directory does not exist.
 fn walk_dir_files(root: &Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -1497,8 +1507,8 @@ fn walk_dir_files(root: &Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// `true` se o arquivo começa com a magic line de manifest (leitura de poucos
-/// bytes, sem carregar o arquivo).
+/// `true` if the file starts with the manifest magic line (reads a few
+/// bytes, without loading the whole file).
 fn file_starts_with_manifest_magic(path: &Path) -> bool {
     use std::io::Read;
     let Ok(mut f) = std::fs::File::open(path) else {
@@ -1509,11 +1519,11 @@ fn file_starts_with_manifest_magic(path: &Path) -> bool {
     crate::chunk::Manifest::is_manifest_bytes(&buf[..n])
 }
 
-/// Paths que o macOS gera como ruído e que nunca devem vazar pro working tree/commit.
-/// Detecta qualquer componente do caminho que bata com um padrão conhecido.
-/// Paths que nunca devem aparecer no working tree — sujeira gerada e deletada
-/// pelo próprio macOS (AppleDouble, metadados de Finder/Spotlight/Trash).
-/// Filtramos TODAS as ops: a gente não quer nem o rastro delas em commit.
+/// Paths that macOS generates as noise and that must never leak into the
+/// working tree/commit. Detects any path component matching a known pattern.
+/// Paths that must never appear in the working tree — junk created and
+/// deleted by macOS itself (AppleDouble, Finder/Spotlight/Trash metadata).
+/// We filter ALL ops: we don't want even a trace of them in a commit.
 pub(crate) fn is_fully_ephemeral_path(path: &str) -> bool {
     if path.is_empty() {
         return false;
@@ -1539,10 +1549,10 @@ pub(crate) fn is_fully_ephemeral_path(path: &str) -> bool {
     false
 }
 
-/// Padrão do safe-save do TextEdit/NSDocument: `<nome>.sb-<hex>-<rand>`.
-/// Temp dirs e backups hardlinkados. Usamos esse padrão só pra bloquear a
-/// **criação** (Write/Mkdir). Delete/Rmdir/Rename passam, pra que o usuário
-/// possa limpar resíduos `.sb-*` que já estejam commitados no repo.
+/// TextEdit/NSDocument safe-save pattern: `<name>.sb-<hex>-<rand>`.
+/// Temp dirs and hardlinked backups. We use this pattern only to block
+/// **creation** (Write/Mkdir). Delete/Rmdir/Rename pass through, so the user
+/// can clean up `.sb-*` residue already committed to the repo.
 fn is_textedit_scratch_path(path: &str) -> bool {
     if path.is_empty() {
         return false;
@@ -1564,8 +1574,8 @@ fn op_touches_ephemeral(op: &SyncOp) -> bool {
     }
 }
 
-/// `true` se `a` e `b` são o mesmo path ou um é ancestral do outro
-/// (limite de componente em '/': "a" contém "a/b", mas não "ab").
+/// `true` if `a` and `b` are the same path or one is an ancestor of the
+/// other (component boundary at '/': "a" contains "a/b", but not "ab").
 fn paths_related(a: &str, b: &str) -> bool {
     if a == b {
         return true;
@@ -1581,7 +1591,7 @@ fn paths_related(a: &str, b: &str) -> bool {
     a_contains_b || b_contains_a
 }
 
-/// Paths que uma op toca (rename toca origem e destino).
+/// Paths an op touches (rename touches both source and destination).
 fn op_paths(op: &SyncOp) -> [Option<&str>; 2] {
     match op {
         SyncOp::Rename { from, to } => [Some(from), Some(to)],
@@ -1589,19 +1599,20 @@ fn op_paths(op: &SyncOp) -> [Option<&str>; 2] {
     }
 }
 
-/// Anexa `op` à fila preservando a ordem de chegada. Única coalescência
-/// permitida: `Write` substitui in-place o `Write` mais recente do MESMO path,
-/// desde que nenhuma op posterior a ele toque um path relacionado (igual ou
-/// ancestral/descendente) — rename, delete, mkdir e rmdir são barreiras.
-/// A correção nunca depende da coalescência; ela só evita conteúdo redundante
-/// em write storms (flushes repetidos do mesmo arquivo dentro do debounce).
+/// Appends `op` to the queue preserving arrival order. The only coalescing
+/// allowed: a `Write` replaces in-place the most recent `Write` for the SAME
+/// path, as long as no later op touches a related path (equal or
+/// ancestor/descendant) — rename, delete, mkdir and rmdir are barriers.
+/// Correctness never depends on the coalescing; it only avoids redundant
+/// content during write storms (repeated flushes of the same file within the
+/// debounce window).
 pub(crate) fn push_coalescing(queue: &mut Vec<SyncOp>, op: SyncOp) {
     if let SyncOp::Write { path, content } = op {
         for existing in queue.iter_mut().rev() {
             if let SyncOp::Write { path: p, content: c } = existing {
                 if *p == path {
-                    // Snapshot spooled substituído nunca chegará ao drain —
-                    // remover o arquivo aqui evita acúmulo no diretório de spool.
+                    // A replaced spooled snapshot will never reach the drain —
+                    // removing the file here avoids buildup in the spool dir.
                     if let WriteContent::Spooled(old) = &*c {
                         let _ = std::fs::remove_file(old);
                     }
@@ -1631,7 +1642,7 @@ mod tests {
         SyncManager::new("/tmp/ignored", 60)
     }
 
-    /// Empacota bytes em WriteContent::Mem para os testes de fila.
+    /// Wraps bytes in WriteContent::Mem for the queue tests.
     fn wc(bytes: &[u8]) -> WriteContent {
         WriteContent::Mem(Arc::new(bytes.to_vec()))
     }
@@ -1647,7 +1658,7 @@ mod tests {
                 assert_eq!(path, "a.txt");
                 assert_eq!(content.to_vec(), b"hello");
             }
-            other => panic!("esperado Write, obtido {:?}", other),
+            other => panic!("expected Write, got {:?}", other),
         }
     }
 
@@ -1660,15 +1671,15 @@ mod tests {
         assert_eq!(snap.len(), 1);
         match &snap[0] {
             SyncOp::Write { content, .. } => assert_eq!(content.to_vec(), b"second"),
-            other => panic!("esperado Write, obtido {:?}", other),
+            other => panic!("expected Write, got {:?}", other),
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn queue_mkdir_then_rmdir_same_path_keeps_causal_order() {
-        // Semântica da fila causal (Fase 0): as duas ops são mantidas na ordem
-        // de chegada — o drain aplica mkdir e depois rmdir (estado final
-        // idêntico, sem depender de heurística de "última ganha").
+        // Causal queue semantics (Phase 0): both ops are kept in arrival
+        // order — the drain applies mkdir and then rmdir (identical final
+        // state, without relying on a "last one wins" heuristic).
         let m = mgr();
         m.queue_mkdir("foo");
         m.queue_rmdir("foo");
@@ -1680,8 +1691,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn queue_rename_then_write_to_destination_keeps_both_in_order() {
-        // Antes (HashMap keyed por destino), o Write APAGAVA o Rename da fila.
-        // Na fila causal ambos sobrevivem, na ordem de chegada.
+        // Before (HashMap keyed by destination), the Write ERASED the Rename
+        // from the queue. In the causal queue both survive, in arrival order.
         let m = mgr();
         m.queue_rename("a.txt", "b.txt");
         m.queue_write("b.txt", b"x".to_vec());
@@ -1699,7 +1710,7 @@ mod tests {
         assert_eq!(snap.len(), 1);
         match &snap[0] {
             SyncOp::Delete { path } => assert_eq!(path, "x.txt"),
-            other => panic!("esperado Delete, obtido {:?}", other),
+            other => panic!("expected Delete, got {:?}", other),
         }
     }
 
@@ -1713,8 +1724,8 @@ mod tests {
         assert!(is_fully_ephemeral_path(".Trashes/whatever"));
         assert!(!is_fully_ephemeral_path("hi.txt"));
         assert!(!is_fully_ephemeral_path("foo/hi.txt"));
-        // .sb-* não entra em `is_ephemeral_path` (filtro total) — só em
-        // `is_textedit_scratch_path`, que é parcial.
+        // .sb-* is not covered by `is_ephemeral_path` (full filter) — only by
+        // `is_textedit_scratch_path`, which is partial.
         assert!(!is_fully_ephemeral_path("hi.txt.sb-36d9af71-iFhNoR"));
         assert!(!is_fully_ephemeral_path(""));
     }
@@ -1722,14 +1733,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn textedit_scratch_paths_block_creation_but_allow_delete() {
         let m = mgr();
-        // Criação: filtra
+        // Creation: filtered out
         m.queue_write("hi.txt.sb-36d9af71-backup", b"x".to_vec());
         m.queue_mkdir("hi.txt.sb-36d9af71-tempdir");
-        // Delete/rmdir: passa (usuário consegue limpar `.sb-*` legado)
+        // Delete/rmdir: passes through (the user can clean up legacy `.sb-*`)
         m.queue_delete("hi.txt.sb-36d9af71-old-backup");
         m.queue_rmdir("hi.txt.sb-36d9af71-old-tempdir");
         let snap = m.buffer_snapshot();
-        assert_eq!(snap.len(), 2, "esperado só Delete+Rmdir, obtido {:?}", snap);
+        assert_eq!(snap.len(), 2, "expected only Delete+Rmdir, got {:?}", snap);
         assert!(snap.iter().any(|op| matches!(op, SyncOp::Delete { .. })));
         assert!(snap.iter().any(|op| matches!(op, SyncOp::Rmdir { .. })));
     }
@@ -1744,7 +1755,7 @@ mod tests {
         assert_eq!(snap.len(), 1);
         match &snap[0] {
             SyncOp::Write { path, .. } => assert_eq!(path, "hi.txt"),
-            other => panic!("esperado Write para hi.txt, obtido {:?}", other),
+            other => panic!("expected Write for hi.txt, got {:?}", other),
         }
     }
 
@@ -1773,22 +1784,22 @@ mod tests {
         m.queue_symlink("alias.txt", "real.txt");
         m.queue_symlink(".DS_Store", "x");
         let snap = m.buffer_snapshot();
-        assert_eq!(snap.len(), 1, "path efêmero deve ser filtrado: {:?}", snap);
+        assert_eq!(snap.len(), 1, "ephemeral path must be filtered out: {:?}", snap);
         match &snap[0] {
             SyncOp::Symlink { path, target } => {
                 assert_eq!(path, "alias.txt");
                 assert_eq!(target, "real.txt");
             }
-            other => panic!("esperado Symlink, obtido {:?}", other),
+            other => panic!("expected Symlink, got {:?}", other),
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn queue_write_content_shares_arc_without_copy() {
-        // Requisito 16 da Fase 2.5: buffer e SyncOp::Write compartilham o
-        // MESMO conteúdo (Arc) — pico de RAM ~1x, não ~3x o tamanho.
+        // Requirement 16 of Phase 2.5: the buffer and SyncOp::Write share the
+        // SAME content (Arc) — RAM peak ~1x, not ~3x the size.
         let m = mgr();
-        let content = std::sync::Arc::new(b"conteudo grande".to_vec());
+        let content = std::sync::Arc::new(b"large content".to_vec());
         m.queue_write_content("a.txt", WriteContent::Mem(content.clone()));
         let snap = m.buffer_snapshot();
         assert_eq!(snap.len(), 1);
@@ -1796,29 +1807,30 @@ mod tests {
             SyncOp::Write { content: WriteContent::Mem(arc), .. } => {
                 assert!(
                     std::sync::Arc::ptr_eq(arc, &content),
-                    "conteúdo deve ser compartilhado por Arc, não clonado"
+                    "content must be shared via Arc, not cloned"
                 );
             }
-            other => panic!("esperado Write compartilhado, obtido {:?}", other),
+            other => panic!("expected shared Write, got {:?}", other),
         }
     }
 
     #[test]
     fn push_coalescing_symlink_is_barrier_for_write() {
-        // Write pós-symlink não pode coalescer com Write pré-symlink no mesmo
-        // path: `rm f && ln -s alvo f && echo x > f` são três estados causais.
+        // A post-symlink Write must not coalesce with a pre-symlink Write on
+        // the same path: `rm f && ln -s target f && echo x > f` are three
+        // causal states.
         let mut q = Vec::new();
         push_coalescing(&mut q, SyncOp::Write { path: "f.txt".into(), content: wc(b"pre") });
-        push_coalescing(&mut q, SyncOp::Symlink { path: "f.txt".into(), target: "alvo".into() });
+        push_coalescing(&mut q, SyncOp::Symlink { path: "f.txt".into(), target: "target".into() });
         push_coalescing(&mut q, SyncOp::Write { path: "f.txt".into(), content: wc(b"post") });
-        assert_eq!(q.len(), 3, "Symlink deve ser barreira: {:?}", q);
+        assert_eq!(q.len(), 3, "Symlink must be a barrier: {:?}", q);
         assert!(matches!(&q[2], SyncOp::Write { content, .. } if content.to_vec() == b"post"));
     }
 
     #[test]
     fn push_coalescing_rename_is_barrier_for_write() {
-        // Write(b) não pode atravessar Rename{a->b}: o conteúdo pré e pós
-        // rename são estados diferentes do path.
+        // Write(b) must not cross Rename{a->b}: the pre- and post-rename
+        // content are different states of the path.
         let mut q = Vec::new();
         push_coalescing(&mut q, SyncOp::Write { path: "b.txt".into(), content: wc(b"pre") });
         push_coalescing(&mut q, SyncOp::Rename { from: "a.txt".into(), to: "b.txt".into() });
@@ -1829,12 +1841,12 @@ mod tests {
 
     #[test]
     fn push_coalescing_dir_rename_is_barrier_for_nested_write() {
-        // Rename de diretório é barreira para writes DENTRO dele (prefixo).
+        // A directory rename is a barrier for writes INSIDE it (prefix).
         let mut q = Vec::new();
         push_coalescing(&mut q, SyncOp::Write { path: "d/f.txt".into(), content: wc(b"v1") });
         push_coalescing(&mut q, SyncOp::Rename { from: "c".into(), to: "d".into() });
         push_coalescing(&mut q, SyncOp::Write { path: "d/f.txt".into(), content: wc(b"v2") });
-        assert_eq!(q.len(), 3, "write pós-rename não pode coalescer com o pré-rename");
+        assert_eq!(q.len(), 3, "post-rename write must not coalesce with the pre-rename one");
     }
 
     #[test]

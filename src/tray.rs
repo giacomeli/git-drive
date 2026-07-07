@@ -1,8 +1,9 @@
-//! Ícone de status na barra de menus (`drive-sync tray`).
+//! Menu bar status icon (`drive-sync tray`).
 //!
-//! Processo separado do daemon (decisão 1 da Fase 2): faz polling do
-//! `status.json` e reflete o estado no ícone e no menu. Crates `tray-icon` +
-//! `tao` (decisão 2) — preparadas para o port Linux futuro (appindicator).
+//! Separate process from the daemon (decision 1 of Phase 2): polls
+//! `status.json` and reflects the state in the icon and menu. Crates
+//! `tray-icon` + `tao` (decision 2) — ready for the future Linux port
+//! (appindicator).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -13,35 +14,35 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::status::{self, SyncStatus};
 
-/// Intervalo de polling do status.json.
+/// Polling interval for status.json.
 const POLL_SECS: u64 = 2;
-/// `updated_at` mais velho que isso (com pull de 60s, 3 ciclos) = stale.
+/// `updated_at` older than this (with a 60s pull, 3 cycles) = stale.
 const STALE_SECS: u64 = 180;
 
-/// Estado visual do ícone, do melhor para o pior.
+/// Visual state of the icon, from best to worst.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayState {
-    /// Sincronizado, nada pendente.
+    /// Synced, nothing pending.
     Ok,
-    /// Ops pendentes / atividade em andamento.
+    /// Pending ops / activity in progress.
     Busy,
-    /// Conflitos ou push falho — exige atenção.
+    /// Conflicts or failed push — needs attention.
     Attention,
-    /// Daemon parado, morto ou status stale.
+    /// Daemon stopped, dead, or stale status.
     Stopped,
 }
 
 impl TrayState {
     fn label(self) -> &'static str {
         match self {
-            TrayState::Ok => "sincronizado",
-            TrayState::Busy => "sincronizando",
-            TrayState::Attention => "atenção",
-            TrayState::Stopped => "parado",
+            TrayState::Ok => "synced",
+            TrayState::Busy => "syncing",
+            TrayState::Attention => "attention",
+            TrayState::Stopped => "stopped",
         }
     }
 
-    /// RGBA do círculo do ícone (cores do sistema macOS).
+    /// RGBA of the icon circle (macOS system colors).
     fn color(self) -> [u8; 4] {
         match self {
             TrayState::Ok => [52, 199, 89, 255],
@@ -52,8 +53,8 @@ impl TrayState {
     }
 }
 
-/// Mapeia o status lido (ou a ausência dele) para estado + linhas de resumo.
-/// Pura e testável — o event loop só renderiza o que sai daqui.
+/// Maps the status read (or its absence) to a state + summary lines.
+/// Pure and testable — the event loop only renders what comes out of here.
 pub fn evaluate(
     status: Option<&SyncStatus>,
     now: u64,
@@ -62,7 +63,7 @@ pub fn evaluate(
     let Some(s) = status else {
         return (
             TrayState::Stopped,
-            vec!["sem status disponível — o drive já foi montado?".to_string()],
+            vec!["no status available — has the drive been mounted yet?".to_string()],
         );
     };
 
@@ -73,25 +74,25 @@ pub fn evaluate(
         || alive == Some(false)
         || now.saturating_sub(s.updated_at) > STALE_SECS
     {
-        lines.push("daemon parado".to_string());
+        lines.push("daemon stopped".to_string());
         TrayState::Stopped
     } else if !s.conflicts.is_empty()
         || s.last_drain.as_ref().is_some_and(|d| d.pushed == Some(false))
     {
         if !s.conflicts.is_empty() {
-            lines.push(format!("{} conflito(s) para resolver", s.conflicts.len()));
+            lines.push(format!("{} conflict(s) to resolve", s.conflicts.len()));
         }
         if s.last_drain.as_ref().is_some_and(|d| d.pushed == Some(false)) {
-            lines.push("push falhou — mudanças não publicadas".to_string());
+            lines.push("push failed — changes not published".to_string());
         }
         TrayState::Attention
     } else if s.pending_ops > 0 {
-        lines.push(format!("{} op(s) pendentes", s.pending_ops));
+        lines.push(format!("{} pending op(s)", s.pending_ops));
         TrayState::Busy
     } else {
         match &s.last_drain {
-            Some(d) => lines.push(format!("último sync há {} s", now.saturating_sub(d.at))),
-            None => lines.push("nenhum sync ainda nesta sessão".to_string()),
+            Some(d) => lines.push(format!("last sync {} s ago", now.saturating_sub(d.at))),
+            None => lines.push("no sync yet in this session".to_string()),
         }
         TrayState::Ok
     };
@@ -101,7 +102,7 @@ pub fn evaluate(
     (state, lines)
 }
 
-/// Círculo preenchido com antialias simples, para `Icon::from_rgba`.
+/// Filled circle with simple antialiasing, for `Icon::from_rgba`.
 fn icon_rgba(color: [u8; 4], size: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity((size * size * 4) as usize);
     let center = (size as f32 - 1.0) / 2.0;
@@ -125,7 +126,7 @@ fn icon_rgba(color: [u8; 4], size: u32) -> Vec<u8> {
 
 fn make_icon(state: TrayState) -> Icon {
     const SIZE: u32 = 22;
-    Icon::from_rgba(icon_rgba(state.color(), SIZE), SIZE, SIZE).expect("ícone RGBA válido")
+    Icon::from_rgba(icon_rgba(state.color(), SIZE), SIZE, SIZE).expect("valid RGBA icon")
 }
 
 fn open_in_terminal(command: &str) {
@@ -142,27 +143,28 @@ fn open_in_terminal(command: &str) {
         .spawn();
 }
 
-/// Sobe a tray. BLOQUEIA a main thread com o event loop do tao (exigência do
-/// AppKit) — por isso o dispatch no main acontece antes do runtime tokio.
+/// Starts the tray. BLOCKS the main thread with tao's event loop (an AppKit
+/// requirement) — which is why the dispatch in main happens before the tokio
+/// runtime.
 pub fn run(status_path: PathBuf) -> anyhow::Result<()> {
     #[allow(unused_mut)]
     let mut event_loop = EventLoopBuilder::new().build();
-    // Sem ícone no Dock: a tray é um acessório de barra de menus.
+    // No Dock icon: the tray is a menu bar accessory.
     #[cfg(target_os = "macos")]
     {
         use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
         event_loop.set_activation_policy(ActivationPolicy::Accessory);
     }
 
-    // Menu: linhas de resumo (desabilitadas) + ações.
+    // Menu: summary lines (disabled) + actions.
     let header = MenuItem::new("drive-sync", false, None);
-    let line1 = MenuItem::new("carregando status...", false, None);
+    let line1 = MenuItem::new("loading status...", false, None);
     let line2 = MenuItem::new("", false, None);
     let line3 = MenuItem::new("", false, None);
-    let open_finder = MenuItem::new("Abrir drive no Finder", true, None);
-    let tail_log = MenuItem::new("Ver log em tempo real", true, None);
-    let detail = MenuItem::new("Status detalhado", true, None);
-    let quit = MenuItem::new("Sair da tray", true, None);
+    let open_finder = MenuItem::new("Open drive in Finder", true, None);
+    let tail_log = MenuItem::new("View live log", true, None);
+    let detail = MenuItem::new("Detailed status", true, None);
+    let quit = MenuItem::new("Quit tray", true, None);
 
     let menu = Menu::new();
     menu.append_items(&[
@@ -187,7 +189,7 @@ pub fn run(status_path: PathBuf) -> anyhow::Result<()> {
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(500));
 
-        // Criação do ícone precisa acontecer com o event loop já ativo no macOS.
+        // Icon creation must happen with the event loop already active on macOS.
         if tray.is_none() {
             if let tao::event::Event::NewEvents(tao::event::StartCause::Init) = event {
                 tray = Some(
@@ -196,12 +198,12 @@ pub fn run(status_path: PathBuf) -> anyhow::Result<()> {
                         .with_icon(make_icon(TrayState::Stopped))
                         .with_tooltip("drive-sync")
                         .build()
-                        .expect("criar tray icon"),
+                        .expect("create tray icon"),
                 );
             }
         }
 
-        // Polling do status.
+        // Status polling.
         if tray.is_some() && last_poll.elapsed() >= Duration::from_secs(POLL_SECS) {
             last_poll = Instant::now();
             current = status::read_from(Path::new(&status_path)).ok();
@@ -218,7 +220,7 @@ pub fn run(status_path: PathBuf) -> anyhow::Result<()> {
             }
         }
 
-        // Ações do menu.
+        // Menu actions.
         while let Ok(ev) = menu_channel.try_recv() {
             if ev.id == open_finder.id() {
                 if let Some(s) = &current {
@@ -264,7 +266,7 @@ mod tests {
             }),
             last_pull: Some(PullInfo {
                 at: 995,
-                outcome: "sem novidades".into(),
+                outcome: "up to date".into(),
             }),
             ..Default::default()
         }
@@ -275,7 +277,7 @@ mod tests {
         let s = base_status();
         let (state, lines) = evaluate(Some(&s), 1_010, Some(true));
         assert_eq!(state, TrayState::Ok);
-        assert!(lines.iter().any(|l| l.contains("último sync")));
+        assert!(lines.iter().any(|l| l.contains("last sync")));
     }
 
     #[test]
@@ -312,7 +314,7 @@ mod tests {
     fn icon_rgba_has_expected_size_and_center_alpha() {
         let px = icon_rgba([255, 0, 0, 255], 22);
         assert_eq!(px.len(), 22 * 22 * 4);
-        // centro opaco, canto transparente
+        // opaque center, transparent corner
         let center_idx = ((11 * 22 + 11) * 4 + 3) as usize;
         assert_eq!(px[center_idx], 255);
         assert_eq!(px[3], 0);
