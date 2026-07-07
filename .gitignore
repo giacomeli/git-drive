@@ -3,9 +3,17 @@ target
 .DS_Store
 logs/
 
-# ponto de montagem usado nos testes manuais — nunca versionar o conteúdo montado
+# mount point used in manual tests -- never version mounted content
 gitmount/
 
-# drive-sync: config.json pode conter remote_token em texto plano —
-# remova esta linha apenas se você tem certeza de que não vai versionar credenciais.
+# drive-sync: config.json may contain remote_token in plain text --
+# only remove this line if you are sure you will never commit credentials.
 config.json
+
+# private planning notes (specs/plans) and local agent state -- never published
+specs/
+.claude/
+
+# security audit stays local -- not published
+docs/security-audit.md
+docs/pt-br/auditoria-seguranca.md

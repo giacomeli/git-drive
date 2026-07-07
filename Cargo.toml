@@ -2,6 +2,9 @@
 name = "drive-sync"
 version = "0.1.0"
 edition = "2021"
+description = "Mount a Git repository as a filesystem: a FUSE drive with automatic bidirectional Git sync"
+license = "MIT"
+repository = "https://github.com/giacomeli/git-drive"
 
 [dependencies]
 fuser = { version = "0.14", features = ["abi-7-21"] }
@@ -26,9 +29,9 @@ tao = "0.35.3"
 tempfile = "3"
 serial_test = "3"
 
-# Patch local em fuser 0.14.0: corrige panic em SetAttr::crtime/chgtime/bkuptime
-# (overflow `Instant + Duration`) que mata o daemon quando o Finder envia
-# SETATTR com crtime ruim ao colar arquivos. Bug ainda presente em fuser 0.17
-# upstream. Ver vendor/fuser/src/ll/request.rs (procurar "PATCH local").
+# Local patch on fuser 0.14.0: fixes a panic in SetAttr::crtime/chgtime/bkuptime
+# (`Instant + Duration` overflow) that kills the daemon when Finder sends a
+# SETATTR with a bad crtime while pasting files. Bug still present in fuser
+# 0.17 upstream. See vendor/fuser/src/ll/request.rs (search for "PATCH local").
 [patch.crates-io]
 fuser = { path = "vendor/fuser" }
