@@ -1510,7 +1510,7 @@ fn commit_encrypted_file(
     content: &[u8],
 ) {
     let workdir = repo.workdir().unwrap();
-    let cipher_rel = crypto.enc_path(clear_rel).unwrap();
+    let cipher_rel = crypto.enc_path(clear_rel);
     let full = workdir.join(&cipher_rel);
     std::fs::create_dir_all(full.parent().unwrap()).unwrap();
     std::fs::write(&full, crypto.seal(content)).unwrap();
@@ -1547,7 +1547,7 @@ async fn encrypted_repo_boot_exposes_clear_names_and_content() {
         "PLAINTEXT size, not the sealed blob's"
     );
     // The encrypted name does not leak into the view
-    let cipher_rel = crypto.enc_path("docs/Nota Secreta.txt").unwrap();
+    let cipher_rel = crypto.enc_path("docs/Nota Secreta.txt");
     assert_eq!(fs.find_inode(&cipher_rel), None);
     let entries = fs.apply_readdir(1).unwrap();
     assert!(entries.iter().any(|(_, _, n)| n == "docs"));
@@ -1562,7 +1562,7 @@ async fn encrypted_read_with_wrong_key_is_eio() {
     let mut fs = new_encrypted_fs(test.dir.path().to_str().unwrap(), wrong);
 
     // The name does not decrypt with the wrong key -> shows up literal (encrypted)
-    let cipher_rel = crypto.enc_path("dado.bin").unwrap();
+    let cipher_rel = crypto.enc_path("dado.bin");
     let ino = fs.find_inode(&cipher_rel).expect("literal name fallback");
     assert_eq!(
         fs.apply_read(ino, 0, 100),
@@ -1576,8 +1576,8 @@ async fn encrypted_symlink_readlink_returns_clear_target() {
     let test = init_repo();
     let crypto = fs_crypto();
     let workdir = test.repo.workdir().unwrap();
-    let link_rel = crypto.enc_path("atalho.txt").unwrap();
-    let target_cipher = crypto.enc_path("docs/alvo real.txt").unwrap();
+    let link_rel = crypto.enc_path("atalho.txt");
+    let target_cipher = crypto.enc_path("docs/alvo real.txt");
     std::os::unix::fs::symlink(&target_cipher, workdir.join(&link_rel)).unwrap();
     commit_all(&test.repo, "add symlink cifrado");
 
@@ -1605,7 +1605,7 @@ async fn encrypted_chunked_file_reads_reassembled_plaintext() {
         Some(&seal as &dyn Fn(&[u8]) -> Vec<u8>),
     )
     .unwrap();
-    let cipher_rel = crypto.enc_path("grande.bin").unwrap();
+    let cipher_rel = crypto.enc_path("grande.bin");
     std::fs::write(workdir.join(&cipher_rel), crypto.seal(&manifest.serialize())).unwrap();
     commit_all(&test.repo, "add chunked cifrado");
 
@@ -1646,7 +1646,7 @@ async fn encrypted_conflicted_copy_shows_clear_prefix() {
     let test = init_repo();
     let crypto = fs_crypto();
     let workdir = test.repo.workdir().unwrap();
-    let cipher = crypto.enc_path("nota.txt").unwrap();
+    let cipher = crypto.enc_path("nota.txt");
     let conflicted_rel = format!("{}.conflict-mac-99", cipher);
     std::fs::write(workdir.join(&conflicted_rel), crypto.seal(b"versao local")).unwrap();
     commit_all(&test.repo, "conflicted copy");

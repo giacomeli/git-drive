@@ -7,8 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::log_ts;
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SyncStatus {
     pub pid: u32,
@@ -176,12 +174,7 @@ impl StatusState {
             return;
         };
         if let Err(e) = write_atomic(&path, status) {
-            eprintln!(
-                "[{}] status: failed to write {}: {}",
-                log_ts(),
-                path.display(),
-                e
-            );
+            log::error!("status: failed to write {}: {}", path.display(), e);
         }
     }
 }

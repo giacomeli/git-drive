@@ -2,7 +2,6 @@ use clap::{Arg, ArgMatches, Command};
 use drive_sync::config::Config;
 use drive_sync::fs::GitDriveFS;
 use drive_sync::git;
-use drive_sync::log_ts;
 use drive_sync::sync::SyncManager;
 use fuser::MountOption;
 use std::io::Write;
@@ -20,13 +19,10 @@ fn install_panic_hook() {
     }
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        eprintln!(
-            "[{}] PANIC caught by the hook — the daemon is about to die",
-            log_ts()
-        );
-        eprintln!("[{}] PANIC info: {}", log_ts(), info);
+        log::error!("PANIC caught by the hook — the daemon is about to die");
+        log::error!("PANIC info: {}", info);
         let bt = std::backtrace::Backtrace::force_capture();
-        eprintln!("[{}] PANIC backtrace:\n{}", log_ts(), bt);
+        log::error!("PANIC backtrace:\n{}", bt);
         // Also delegate to the default hook (keeps the standard print behavior).
         default_hook(info);
     }));
@@ -102,6 +98,22 @@ fn cli() -> Command {
                         .long("file")
                         .value_name("PATH")
                         .help("Path to status.json (default: ./logs/status.json, then the macOS default)"),
+                ),
+        )
+        .subcommand(
+            Command::new("viewer")
+                .about("Open a window with the daemon status and a live log tail")
+                .arg(
+                    Arg::new("file")
+                        .long("file")
+                        .value_name("PATH")
+                        .help("Path to status.json (default: ./logs/status.json, then the macOS default)"),
+                )
+                .arg(
+                    Arg::new("log")
+                        .long("log")
+                        .value_name("PATH")
+                        .help("Log file to tail (default: taken from status.json)"),
                 ),
         )
         .arg(
@@ -189,6 +201,15 @@ fn main() -> anyhow::Result<()> {
         // that is why the dispatch happens before any tokio runtime.
         return drive_sync::tray::run(file);
     }
+    if let Some(sub) = matches.subcommand_matches("viewer") {
+        let file = drive_sync::paths::resolve_status_for_read(
+            sub.get_one::<String>("file").map(String::as_str),
+        );
+        let log = sub.get_one::<String>("log").map(PathBuf::from);
+        // Like the tray, the viewer owns the main thread (eframe event loop),
+        // so it dispatches before any tokio runtime is created.
+        return drive_sync::viewer::run(file, log);
+    }
 
     run_mount(&matches)
 }
@@ -211,41 +232,38 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| log_dir.join("status.json"));
 
-    // After arg parsing (so `--help`/`--version` still print to the
-    // terminal): redirect stdout/stderr to the session log. This captures
-    // our println!/eprintln! AND the `log` crate output (fuser via
-    // env_logger) in a single file. Announces the path on `/dev/tty`.
-    let log_path = drive_sync::redirect_io_to_log_file(verbose, &log_dir).ok();
-    if let Some(ref path) = log_path {
-        if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
-            let _ = writeln!(tty, "log at: {}", path.display());
-        }
+    // Config is loaded first: the logger's rotation and level come from it.
+    let config = Config::load_from(&config_path);
+
+    // Initialize the process logger (flexi_logger): rotating files in `log_dir`,
+    // level from config and overridable by `RUST_LOG` (also captures fuser's
+    // `log` output). `--verbose` mirrors every record to stderr, like the old
+    // tee. The handle must stay alive for the whole run. `log_path` is the
+    // active (current) file, announced on `/dev/tty` and published in status.
+    let (_log_handle, log_path) = drive_sync::init_logging(
+        verbose,
+        &log_dir,
+        &config.log_level,
+        config.log_max_mb,
+        config.log_keep_files,
+    )?;
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        let _ = writeln!(tty, "log at: {}", log_path.display());
     }
 
-    // The hook must run AFTER the redirect so stderr lands in the file.
+    // The hook logs via the `log` facade, captured by flexi_logger.
     install_panic_hook();
 
-    // env_logger honors RUST_LOG. With RUST_LOG=fuser=debug, we can see the
-    // raw opcode macFUSE sends.
-    env_logger::init();
-
-    let config = Config::load_from(&config_path);
-    if let Some(ref path) = log_path {
-        println!("[{}] boot: log={}", log_ts(), path.display());
-    }
-    println!(
-        "[{}] boot: debounce={}s",
-        log_ts(),
-        config.write_debounce_secs
-    );
-    println!("[{}] boot: repo={}", log_ts(), repo_path);
-    println!("[{}] boot: mount={}", log_ts(), mount_path);
+    log::info!("boot: log={}", log_path.display());
+    log::info!("boot: debounce={}s", config.write_debounce_secs);
+    log::info!("boot: repo={}", repo_path);
+    log::info!("boot: mount={}", mount_path);
 
     let branch = {
         let repo = git::open_repo(&repo_path)?;
         git::current_branch_name(&repo)?
     };
-    println!("[{}] boot: branch={}", log_ts(), branch);
+    log::info!("boot: branch={}", branch);
 
     // Explicit runtime: the SyncManager watchers need the tokio context.
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -276,11 +294,7 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
                 e
             )
         })?;
-        println!(
-            "[{}] boot: encryption ENABLED (key: {})",
-            log_ts(),
-            key_path.display()
-        );
+        log::info!("boot: encryption ENABLED (key: {})", key_path.display());
         Some(std::sync::Arc::new(
             drive_sync::crypt::Crypto::from_master_key(&master),
         ))
@@ -294,9 +308,8 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
                 sync.set_migration_crypto(Some(std::sync::Arc::new(
                     drive_sync::crypt::Crypto::from_master_key(&master),
                 )));
-                println!(
-                    "[{}] boot: encryption disabled; key present — migration to cleartext active",
-                    log_ts()
+                log::info!(
+                    "boot: encryption disabled; key present — migration to cleartext active"
                 );
             }
         }
@@ -311,14 +324,8 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     );
     // Observable status (read by `drive-sync status` and by the tray)
     sync.enable_status_file(status_file);
-    sync.status_state().set_runtime_info(
-        &mount_path,
-        log_path
-            .as_deref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default()
-            .as_str(),
-    );
+    sync.status_state()
+        .set_runtime_info(&mount_path, &log_path.to_string_lossy());
 
     let fs = GitDriveFS::new_with_options_crypto(
         &repo_path,
@@ -364,7 +371,7 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     // Background session: main owns the lifecycle and drives the ordered
     // shutdown (decisions 6 and 7 of Phase 2).
     let session = fuser::spawn_mount2(fs, &mount_path, &options)?;
-    println!("[{}] boot: volume mounted at {}", log_ts(), mount_path);
+    log::info!("boot: volume mounted at {}", mount_path);
     sync_handle.enable_notifications();
     sync_handle
         .notifier()
@@ -381,16 +388,16 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
         loop {
             tokio::select! {
                 _ = term.recv() => {
-                    println!("[{}] shutdown: SIGTERM received", log_ts());
+                    log::info!("shutdown: SIGTERM received");
                     return Ok::<bool, anyhow::Error>(false);
                 }
                 _ = int.recv() => {
-                    println!("[{}] shutdown: SIGINT received", log_ts());
+                    log::info!("shutdown: SIGINT received");
                     return Ok(false);
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                     if session.guard.is_finished() {
-                        println!("[{}] shutdown: volume ejected externally", log_ts());
+                        log::info!("shutdown: volume ejected externally");
                         return Ok(true);
                     }
                 }
@@ -402,7 +409,7 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     // unmount forces the kernel to deliver FLUSH/RELEASE for open fds, and
     // those ops enter the queue in time to be drained.
     if !ejected {
-        println!("[{}] shutdown: unmounting {}", log_ts(), mount_path);
+        log::info!("shutdown: unmounting {}", mount_path);
     }
     session.join();
     sync_handle.drain_now();
@@ -410,7 +417,7 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     sync_handle
         .notifier()
         .notify(drive_sync::notify::NotifyEvent::Stopped);
-    println!("[{}] shutdown: clean stop completed", log_ts());
+    log::info!("shutdown: clean stop completed");
 
     Ok(())
 }
@@ -441,9 +448,8 @@ fn prepare_mountpoint(mount: &str) -> anyhow::Result<()> {
             canonical
         ),
         Err(e) => {
-            println!(
-                "[{}] boot: zombie mount detected at {} ({}) — forcing unmount",
-                log_ts(),
+            log::warn!(
+                "boot: zombie mount detected at {} ({}) — forcing unmount",
                 canonical,
                 e
             );

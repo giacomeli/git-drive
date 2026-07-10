@@ -8,7 +8,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::log_ts;
 use crate::paths;
 
 pub const LABEL: &str = "dev.giacomeli.drive-sync";
@@ -172,15 +171,13 @@ pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
     if !config.exists() {
         if Path::new("config.json").exists() {
             std::fs::copy("config.json", &config)?;
-            println!(
-                "[{}] install: config.json copied to {}",
-                log_ts(),
+            log::info!(
+                "install: config.json copied to {}",
                 config.display()
             );
         } else {
-            println!(
-                "[{}] install: no config.json — create {} with user_name/user_email to enable commits",
-                log_ts(),
+            log::warn!(
+                "install: no config.json — create {} with user_name/user_email to enable commits",
                 config.display()
             );
         }
@@ -212,17 +209,16 @@ pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
         let _ = launchctl(&["bootout", &format!("{}/{}", gui_domain(), TRAY_LABEL)]);
         let out = launchctl(&["bootstrap", &gui_domain(), tray_path.to_str().unwrap()])?;
         if !out.status.success() {
-            eprintln!(
-                "[{}] install: tray bootstrap failed ({}) — run `drive-sync tray` manually",
-                log_ts(),
+            log::error!(
+                "install: tray bootstrap failed ({}) — run `drive-sync tray` manually",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         } else {
-            println!("[{}] install: tray registered ({})", log_ts(), TRAY_LABEL);
+            log::info!("install: tray registered ({})", TRAY_LABEL);
         }
     }
 
-    println!("[{}] install: LaunchAgent registered ({})", log_ts(), LABEL);
+    log::info!("install: LaunchAgent registered ({})", LABEL);
     println!("  plist:  {}", plist_path.display());
     println!("  repo:   {}", repo.display());
     println!("  mount:  {}", mount.display());
@@ -236,24 +232,23 @@ pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
 pub fn uninstall() -> anyhow::Result<()> {
     let out = launchctl(&["bootout", &format!("{}/{}", gui_domain(), LABEL)])?;
     if out.status.success() {
-        println!("[{}] uninstall: agent stopped and unregistered", log_ts());
+        log::info!("uninstall: agent stopped and unregistered");
     } else {
-        println!(
-            "[{}] uninstall: agent was not registered ({})",
-            log_ts(),
+        log::warn!(
+            "uninstall: agent was not registered ({})",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     let plist_path = agent_plist_path();
     match std::fs::remove_file(&plist_path) {
-        Ok(()) => println!("[{}] uninstall: {} removed", log_ts(), plist_path.display()),
+        Ok(()) => log::info!("uninstall: {} removed", plist_path.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
     // Tray (if installed): bootout of a missing agent is ignored.
     let _ = launchctl(&["bootout", &format!("{}/{}", gui_domain(), TRAY_LABEL)]);
     match std::fs::remove_file(tray_plist_path()) {
-        Ok(()) => println!("[{}] uninstall: tray agent removed", log_ts()),
+        Ok(()) => log::info!("uninstall: tray agent removed"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }

@@ -8,7 +8,6 @@ use tokio::time::{sleep, Instant};
 use tokio::task;
 
 use crate::git;
-use crate::log_ts;
 use crate::notify::{self, Notifier, NotifyEvent};
 use crate::status::StatusState;
 
@@ -285,9 +284,8 @@ impl SyncManager {
         if changes.is_empty() {
             return;
         }
-        println!(
-            "[{}] drain_now: draining {} pending op(s) at shutdown",
-            log_ts(),
+        log::info!(
+            "drain_now: draining {} pending op(s) at shutdown",
             changes.len()
         );
         self.drain_ctx().run(changes);
@@ -342,7 +340,7 @@ impl SyncManager {
                 let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!("[{}] pull: error opening repo: {}", log_ts(), e);
+                        log::error!("pull: error opening repo: {}", e);
                         continue;
                     }
                 };
@@ -357,16 +355,15 @@ impl SyncManager {
                         notifier.reset(notify::KEY_PULL_BLOCKED);
                     }
                     Ok(false) => {
-                        println!(
-                            "[{}] pull: working tree has uncommitted changes — skipping",
-                            log_ts()
+                        log::warn!(
+                            "pull: working tree has uncommitted changes — skipping"
                         );
                         status.record_pull("skipped: dirty working tree");
                         notifier.notify(NotifyEvent::PullBlocked);
                         continue;
                     }
                     Err(e) => {
-                        eprintln!("[{}] pull: error checking working tree: {}", log_ts(), e);
+                        log::error!("pull: error checking working tree: {}", e);
                         status.record_pull("error checking working tree");
                         continue;
                     }
@@ -375,7 +372,7 @@ impl SyncManager {
                 if let Err(e) =
                     git::fetch_remote(&repo, &branch, remote, remote_token.as_deref())
                 {
-                    eprintln!("[{}] pull: fetch error: {}", log_ts(), e);
+                    log::error!("pull: fetch error: {}", e);
                     status.record_pull("fetch error");
                     continue;
                 }
@@ -402,19 +399,18 @@ impl SyncManager {
                         status.record_pull("up to date");
                     }
                     Ok(git::MergeOutcome::FastForwarded) => {
-                        println!("[{}] pull: fast-forward applied", log_ts());
+                        log::info!("pull: fast-forward applied");
                         status.record_pull("fast-forward");
                         refresh_flag.store(true, Ordering::SeqCst);
                     }
                     Ok(git::MergeOutcome::Merged) => {
-                        println!("[{}] pull: 3-way merge, no conflicts", log_ts());
+                        log::info!("pull: 3-way merge, no conflicts");
                         status.record_pull("3-way merge");
                         refresh_flag.store(true, Ordering::SeqCst);
                     }
                     Ok(git::MergeOutcome::Conflicted { resolved, suffix }) => {
-                        println!(
-                            "[{}] pull: resolved {} conflict(s) — local versions at *.{}: {:?}",
-                            log_ts(),
+                        log::warn!(
+                            "pull: resolved {} conflict(s) — local versions at *.{}: {:?}",
                             resolved.len(),
                             suffix,
                             resolved
@@ -429,7 +425,7 @@ impl SyncManager {
                         refresh_flag.store(true, Ordering::SeqCst);
                     }
                     Err(e) => {
-                        eprintln!("[{}] pull: merge error: {}", log_ts(), e);
+                        log::error!("pull: merge error: {}", e);
                         status.record_pull("merge error");
                     }
                 }
@@ -531,7 +527,7 @@ impl SyncManager {
                     };
 
                     if let Some(changes) = drained {
-                        println!("[{}] drain: syncing changes", log_ts());
+                        log::info!("drain: syncing changes");
                         ctx.run(changes);
                         break;
                     }
@@ -596,9 +592,8 @@ impl DrainCtx {
         if let Some(c) = crypto.as_deref() {
             let migrated = migrate_worktree_to_encrypted(&self.repo_path, c);
             if migrated > 0 {
-                println!(
-                    "[{}] crypto: {} item(s) migrated to encrypted. WARNING: the PREVIOUS Git history remains in cleartext on the remote — for a public repo, prefer starting from a fresh repo",
-                    log_ts(),
+                log::warn!(
+                    "crypto: {} item(s) migrated to encrypted. WARNING: the PREVIOUS Git history remains in cleartext on the remote — for a public repo, prefer starting from a fresh repo",
                     migrated
                 );
             }
@@ -606,9 +601,8 @@ impl DrainCtx {
         } else if let Some(mk) = migration_crypto.as_deref() {
             let migrated = migrate_worktree_to_clear(&self.repo_path, mk);
             if migrated > 0 {
-                println!(
-                    "[{}] crypto: {} item(s) decrypted back to cleartext",
-                    log_ts(),
+                log::info!(
+                    "crypto: {} item(s) decrypted back to cleartext",
                     migrated
                 );
                 if chunk_threshold > 0 {
@@ -683,20 +677,55 @@ impl DrainCtx {
 }
 
 /// Translates a CLEARTEXT path from the queue into the on-disk path
-/// (encrypted when encryption is active). A name that exceeds the filesystem
-/// limit falls back to cleartext with a logged error — better than losing
-/// the op.
+/// (encrypted when encryption is active). Long components map to their bounded
+/// `dslong_<hash>` name; the matching sidecar is materialized separately by
+/// `write_sidecars` on the write path.
 fn disk_rel_path(crypto: Option<&crate::crypt::Crypto>, clear: &str) -> String {
     match crypto {
-        Some(c) => match c.enc_path(clear) {
-            Ok(enc) => enc,
-            Err(e) => {
-                eprintln!("[{}] crypto: {} at {:?} — keeping cleartext", log_ts(), e, clear);
-                clear.to_string()
-            }
-        },
+        Some(c) => c.enc_path(clear),
         None => clear.to_string(),
     }
+}
+
+/// Materializes the long-name sidecars (`<disk>.name`) for every long component
+/// along `clear`. Idempotent (deterministic content). No-op without crypto or
+/// without any long component.
+fn write_sidecars(repo_path: &Path, crypto: Option<&crate::crypt::Crypto>, clear: &str) {
+    let Some(c) = crypto else { return };
+    for sc in c.enc_path_full(clear).sidecars {
+        let full = repo_path.join(&sc.path);
+        if let Some(parent) = full.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let needs = std::fs::read(&full)
+            .map(|b| b != sc.content.as_bytes())
+            .unwrap_or(true);
+        if needs {
+            if let Err(e) = std::fs::write(&full, sc.content.as_bytes()) {
+                log::error!("crypto: failed to write long-name sidecar {:?}: {}", full, e);
+            }
+        }
+    }
+}
+
+/// Removes the sidecar of `clear`'s LEAF component, if it is a long name.
+/// Parent-directory sidecars are left in place (siblings still need them).
+/// Used on unlink/rmdir/rename-source.
+fn remove_leaf_sidecar(repo_path: &Path, crypto: Option<&crate::crypt::Crypto>, clear: &str) {
+    let Some(c) = crypto else { return };
+    let disk = c.enc_path(clear);
+    let (dir, leaf) = match disk.rsplit_once('/') {
+        Some((d, l)) => (Some(d), l),
+        None => (None, disk.as_str()),
+    };
+    if !crate::crypt::is_long_name(leaf) {
+        return;
+    }
+    let sidecar_rel = match dir {
+        Some(d) => format!("{}/{}", d, crate::crypt::sidecar_name(leaf)),
+        None => crate::crypt::sidecar_name(leaf),
+    };
+    let _ = std::fs::remove_file(repo_path.join(sidecar_rel));
 }
 
 fn apply_op_to_disk(
@@ -750,8 +779,11 @@ fn apply_op_to_disk(
                 }
             };
             match result {
-                Ok(_) => println!("[{}] disk: write {}", log_ts(), path),
-                Err(e) => eprintln!("[{}] disk: error saving {}: {}", log_ts(), path, e),
+                Ok(_) => {
+                    write_sidecars(repo_path, crypto, path);
+                    log::trace!("disk: write {}", path);
+                }
+                Err(e) => log::error!("disk: error saving {}: {}", path, e),
             }
         }
         SyncOp::Delete { path } => {
@@ -764,21 +796,23 @@ fn apply_op_to_disk(
                 other => other,
             };
             match result {
-                Ok(_) => println!("[{}] disk: unlink {}", log_ts(), path),
+                Ok(_) => log::trace!("disk: unlink {}", path),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     // The path never reached the disk (e.g. `.sb-*` temp dirs
                     // that the filter blocks on creation but lets through on
                     // delete). Idempotent: already gone = successful removal.
                 }
-                Err(e) => eprintln!("[{}] disk: error removing {}: {}", log_ts(), path, e),
+                Err(e) => log::error!("disk: error removing {}: {}", path, e),
             }
+            remove_leaf_sidecar(repo_path, crypto, path);
         }
         SyncOp::Mkdir { path } => {
             let full = repo_path.join(disk_rel_path(crypto, path));
             if let Err(e) = std::fs::create_dir_all(&full) {
-                eprintln!("[{}] disk: error creating directory {}: {}", log_ts(), path, e);
+                log::error!("disk: error creating directory {}: {}", path, e);
                 return;
             }
+            write_sidecars(repo_path, crypto, path);
             let keep_rel = disk_rel_path(crypto, &format!("{}/.gitkeep", path));
             let keep = repo_path.join(keep_rel);
             if !keep.exists() {
@@ -787,34 +821,33 @@ fn apply_op_to_disk(
                     None => Vec::new(),
                 };
                 if let Err(e) = std::fs::write(&keep, keep_bytes) {
-                    eprintln!(
-                        "[{}] disk: error creating .gitkeep in {}: {}",
-                        log_ts(),
+                    log::error!(
+                        "disk: error creating .gitkeep in {}: {}",
                         path,
                         e
                     );
                     return;
                 }
             }
-            println!("[{}] disk: mkdir {}", log_ts(), path);
+            log::trace!("disk: mkdir {}", path);
         }
         SyncOp::Rmdir { path } => {
             let full = repo_path.join(disk_rel_path(crypto, path));
             let keep = repo_path.join(disk_rel_path(crypto, &format!("{}/.gitkeep", path)));
             let _ = std::fs::remove_file(&keep);
             match std::fs::remove_dir(&full) {
-                Ok(_) => println!("[{}] disk: rmdir {}", log_ts(), path),
+                Ok(_) => log::trace!("disk: rmdir {}", path),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     // Same rationale as Delete: a directory that never reached
                     // the disk (e.g. `.sb-*`) yields ENOENT on rmdir. Silence it.
                 }
-                Err(e) => eprintln!(
-                    "[{}] disk: error removing directory {}: {}",
-                    log_ts(),
+                Err(e) => log::error!(
+                    "disk: error removing directory {}: {}",
                     path,
                     e
                 ),
             }
+            remove_leaf_sidecar(repo_path, crypto, path);
         }
         SyncOp::Rename { from, to } => {
             let mut from_full = repo_path.join(disk_rel_path(crypto, from));
@@ -827,10 +860,13 @@ fn apply_op_to_disk(
                 std::fs::create_dir_all(parent).ok();
             }
             match std::fs::rename(&from_full, &to_full) {
-                Ok(_) => println!("[{}] disk: rename {} -> {}", log_ts(), from, to),
-                Err(e) => eprintln!(
-                    "[{}] disk: error renaming {} -> {}: {}",
-                    log_ts(),
+                Ok(_) => {
+                    remove_leaf_sidecar(repo_path, crypto, from);
+                    write_sidecars(repo_path, crypto, to);
+                    log::trace!("disk: rename {} -> {}", from, to);
+                }
+                Err(e) => log::error!(
+                    "disk: error renaming {} -> {}: {}",
                     from,
                     to,
                     e
@@ -848,10 +884,12 @@ fn apply_op_to_disk(
             // symlink).
             let _ = std::fs::remove_file(&full);
             match std::os::unix::fs::symlink(&disk_target, &full) {
-                Ok(_) => println!("[{}] disk: symlink {} -> {}", log_ts(), path, target),
-                Err(e) => eprintln!(
-                    "[{}] disk: error creating symlink {} -> {}: {}",
-                    log_ts(),
+                Ok(_) => {
+                    write_sidecars(repo_path, crypto, path);
+                    log::trace!("disk: symlink {} -> {}", path, target);
+                }
+                Err(e) => log::error!(
+                    "disk: error creating symlink {} -> {}: {}",
                     path,
                     target,
                     e
@@ -871,31 +909,30 @@ fn commit_batch(
     ops: &[&SyncOp],
 ) -> Option<git2::Oid> {
     let (Some(name), Some(email)) = (user_name.as_deref(), user_email.as_deref()) else {
-        println!(
-            "[{}] commit: user_name/user_email missing — skipping commit",
-            log_ts()
+        log::warn!(
+            "commit: user_name/user_email missing — skipping commit"
         );
         return None;
     };
     let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[{}] commit: error opening repo: {}", log_ts(), e);
+            log::error!("commit: error opening repo: {}", e);
             return None;
         }
     };
     let message = build_commit_message(ops);
     match git::commit_working_tree(&repo, branch, name, email, &message) {
         Ok(Some(oid)) => {
-            println!("[{}] commit: created {}", log_ts(), oid);
+            log::info!("commit: created {}", oid);
             Some(oid)
         }
         Ok(None) => {
-            println!("[{}] commit: clean tree, nothing to commit", log_ts());
+            log::info!("commit: clean tree, nothing to commit");
             None
         }
         Err(e) => {
-            eprintln!("[{}] commit: error: {}", log_ts(), e);
+            log::error!("commit: error: {}", e);
             None
         }
     }
@@ -905,17 +942,17 @@ fn push_batch(repo_path: &Path, branch: &str, remote: &str, token: &Option<Strin
     let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[{}] push: error opening repo: {}", log_ts(), e);
+            log::error!("push: error opening repo: {}", e);
             return false;
         }
     };
     match git::push_to_remote(&repo, branch, remote, token.as_deref()) {
         Ok(_) => {
-            println!("[{}] push: {} ok", log_ts(), remote);
+            log::info!("push: {} ok", remote);
             true
         }
         Err(e) => {
-            eprintln!("[{}] push: error on {}: {}", log_ts(), remote, e);
+            log::error!("push: error on {}: {}", remote, e);
             false
         }
     }
@@ -936,38 +973,35 @@ fn reconcile_and_retry_push(
     notifier: &Notifier,
 ) -> bool {
     let (Some(name), Some(email)) = (user_name.as_deref(), user_email.as_deref()) else {
-        eprintln!(
-            "[{}] reconcile: push failed and no identity configured — cannot reconcile",
-            log_ts()
+        log::error!(
+            "reconcile: push failed and no identity configured — cannot reconcile"
         );
         return false;
     };
     let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[{}] reconcile: error opening repo: {}", log_ts(), e);
+            log::error!("reconcile: error opening repo: {}", e);
             return false;
         }
     };
 
     if let Err(e) = git::fetch_remote(&repo, branch, remote, token.as_deref()) {
-        eprintln!("[{}] reconcile: fetch error: {}", log_ts(), e);
+        log::error!("reconcile: fetch error: {}", e);
         return false;
     }
 
     let suffix = conflict_suffix();
     match git::pull_and_merge(&repo, branch, remote, name, email, &suffix) {
         Ok(git::MergeOutcome::NoOp) => {
-            eprintln!(
-                "[{}] reconcile: no divergence — the original error may be network/auth",
-                log_ts()
+            log::error!(
+                "reconcile: no divergence — the original error may be network/auth"
             );
             return false;
         }
         Ok(git::MergeOutcome::Conflicted { ref resolved, ref suffix }) => {
-            println!(
-                "[{}] reconcile: {} conflict(s) — local versions at *.{}: {:?}",
-                log_ts(),
+            log::warn!(
+                "reconcile: {} conflict(s) — local versions at *.{}: {:?}",
                 resolved.len(),
                 suffix,
                 resolved
@@ -980,21 +1014,21 @@ fn reconcile_and_retry_push(
             notifier.notify(NotifyEvent::Conflicts { copies });
         }
         Ok(o) => {
-            println!("[{}] reconcile: applied ({:?})", log_ts(), o);
+            log::info!("reconcile: applied ({:?})", o);
         }
         Err(e) => {
-            eprintln!("[{}] reconcile: pull_and_merge error: {}", log_ts(), e);
+            log::error!("reconcile: pull_and_merge error: {}", e);
             return false;
         }
     }
 
     match git::push_to_remote(&repo, branch, remote, token.as_deref()) {
         Ok(_) => {
-            println!("[{}] push: retry on {} ok", log_ts(), remote);
+            log::info!("push: retry on {} ok", remote);
             true
         }
         Err(e) => {
-            eprintln!("[{}] push: retry failed again: {}", log_ts(), e);
+            log::error!("push: retry failed again: {}", e);
             false
         }
     }
@@ -1053,7 +1087,7 @@ fn convert_oversized_worktree_files(
     let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[{}] chunk: error opening repo: {}", log_ts(), e);
+            log::error!("chunk: error opening repo: {}", e);
             return 0;
         }
     };
@@ -1075,9 +1109,8 @@ fn convert_oversized_worktree_files(
         if file_starts_with_encrypted_magic(&full) {
             // Sealed whole above the threshold: legacy the current flow no
             // longer produces (large writes arrive as plaintext for this sweep).
-            eprintln!(
-                "[{}] chunk: {} sealed above the threshold — skipped (re-save the file)",
-                log_ts(),
+            log::warn!(
+                "chunk: {} sealed above the threshold — skipped (re-save the file)",
                 rel
             );
             continue;
@@ -1085,15 +1118,14 @@ fn convert_oversized_worktree_files(
         match convert_file_to_chunks(repo_path, &full, chunk_size, crypto) {
             Ok(manifest) => {
                 converted += 1;
-                println!(
-                    "[{}] chunk: {} -> {} chunk(s) of up to {} bytes",
-                    log_ts(),
+                log::info!(
+                    "chunk: {} -> {} chunk(s) of up to {} bytes",
                     rel,
                     manifest.hashes.len(),
                     chunk_size
                 );
             }
-            Err(e) => eprintln!("[{}] chunk: error converting {}: {}", log_ts(), rel, e),
+            Err(e) => log::error!("chunk: error converting {}: {}", rel, e),
         }
     }
     converted
@@ -1143,10 +1175,18 @@ fn file_starts_with_encrypted_magic(path: &Path) -> bool {
 fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> usize {
     let mut converted = 0usize;
     for (full, rel) in walk_worktree_files(repo_path) {
+        let leaf = rel.rsplit('/').next().unwrap_or(&rel);
+        // Long-name sidecars are our own metadata, never user files.
+        if crate::crypt::is_long_sidecar(leaf) {
+            continue;
+        }
         let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
+        // A component is already conforming if it decrypts OR if it is a hashed
+        // long name (whose cleartext lives in its sidecar) — otherwise the pass
+        // would re-encrypt the hash and corrupt the entry.
         let name_ok = rel
             .split('/')
-            .all(|comp| c.dec_component(comp).is_some());
+            .all(|comp| c.dec_component(comp).is_some() || crate::crypt::is_long_name(comp));
         if meta.file_type().is_symlink() {
             let Ok(target) = std::fs::read_link(&full) else { continue };
             let target_str = target.to_string_lossy().into_owned();
@@ -1158,16 +1198,13 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
             }
             let clear_rel = c.dec_path(&rel);
             let clear_target = c.dec_path(&target_str);
-            let (Ok(new_rel), Ok(new_target)) =
-                (c.enc_path(&clear_rel), c.enc_path(&clear_target))
-            else {
-                eprintln!("[{}] crypto: name too long at {:?} — skipped", log_ts(), clear_rel);
-                continue;
-            };
+            let new_rel = c.enc_path(&clear_rel);
+            let new_target = c.enc_path(&clear_target);
             let new_full = repo_path.join(&new_rel);
             if let Some(parent) = new_full.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
+            write_sidecars(repo_path, Some(c), &clear_rel);
             let _ = std::fs::remove_file(&full);
             let _ = std::fs::remove_file(&new_full);
             if std::os::unix::fs::symlink(&new_target, &new_full).is_ok() {
@@ -1183,14 +1220,12 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
             continue;
         }
         let clear_rel = c.dec_path(&rel);
-        let Ok(new_rel) = c.enc_path(&clear_rel) else {
-            eprintln!("[{}] crypto: name too long at {:?} — skipped", log_ts(), clear_rel);
-            continue;
-        };
+        let new_rel = c.enc_path(&clear_rel);
         let new_full = repo_path.join(&new_rel);
         if let Some(parent) = new_full.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        write_sidecars(repo_path, Some(c), &clear_rel);
         if sealed {
             // Content is fine; only the name needs to migrate.
             if new_full != full && std::fs::rename(&full, &new_full).is_ok() {
@@ -1236,9 +1271,8 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
                 })();
                 if expand.is_err() {
                     let _ = std::fs::remove_file(&tmp);
-                    eprintln!(
-                        "[{}] crypto: failed to expand cleartext manifest {:?} — skipped",
-                        log_ts(),
+                    log::warn!(
+                        "crypto: failed to expand cleartext manifest {:?} — skipped",
                         rel
                     );
                     continue;
@@ -1329,9 +1363,8 @@ fn migrate_worktree_to_clear(repo_path: &Path, mk: &crate::crypt::Crypto) -> usi
         }
         let Ok(sealed_bytes) = std::fs::read(&full) else { continue };
         let Ok(plain) = mk.open(&sealed_bytes) else {
-            eprintln!(
-                "[{}] crypto: failed to decrypt {:?} during migration — skipped",
-                log_ts(),
+            log::warn!(
+                "crypto: failed to decrypt {:?} during migration — skipped",
                 rel
             );
             continue;
@@ -1419,9 +1452,8 @@ fn gc_orphan_chunks(repo_path: &Path, key: Option<&crate::crypt::Crypto>) {
                 // Sealed manifests without a key: impossible to know the
                 // references — NEVER collect blindly (it would remove live
                 // chunks).
-                eprintln!(
-                    "[{}] chunk: gc skipped — encrypted worktree without an available key",
-                    log_ts()
+                log::warn!(
+                    "chunk: gc skipped — encrypted worktree without an available key"
                 );
                 return;
             };
@@ -1443,8 +1475,8 @@ fn gc_orphan_chunks(repo_path: &Path, key: Option<&crate::crypt::Crypto>) {
             .unwrap_or_default();
         if !referenced.contains(&name) {
             match std::fs::remove_file(&chunk_file) {
-                Ok(_) => println!("[{}] chunk: gc removed orphan {}", log_ts(), name),
-                Err(e) => eprintln!("[{}] chunk: gc failed on {}: {}", log_ts(), name, e),
+                Ok(_) => log::debug!("chunk: gc removed orphan {}", name),
+                Err(e) => log::error!("chunk: gc failed on {}: {}", name, e),
             }
             // Empty shard dir goes with it (best-effort).
             if let Some(parent) = chunk_file.parent() {
@@ -1645,6 +1677,49 @@ mod tests {
     /// Wraps bytes in WriteContent::Mem for the queue tests.
     fn wc(bytes: &[u8]) -> WriteContent {
         WriteContent::Mem(Arc::new(bytes.to_vec()))
+    }
+
+    #[test]
+    fn apply_op_writes_and_removes_long_name_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let c = crate::crypt::Crypto::from_master_key(&[5u8; 32]);
+        let clear = format!("{}.txt", "y".repeat(200));
+
+        // Write: the on-disk file uses the hashed long name and gets a sidecar.
+        apply_op_to_disk(
+            repo,
+            &SyncOp::Write {
+                path: clear.clone(),
+                content: wc(b"secret data"),
+            },
+            Some(&c),
+            0,
+        );
+        let full = c.enc_path_full(&clear);
+        assert_eq!(full.sidecars.len(), 1);
+        let disk_file = repo.join(&full.disk);
+        let sidecar = repo.join(&full.sidecars[0].path);
+        assert!(disk_file.exists(), "hashed long-name file must exist");
+        assert!(disk_file
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("dslong_"));
+        assert!(sidecar.exists(), "sidecar must be written");
+        assert_eq!(
+            std::fs::read_to_string(&sidecar).unwrap(),
+            full.sidecars[0].content
+        );
+        // Content is sealed, never cleartext.
+        let bytes = std::fs::read(&disk_file).unwrap();
+        assert!(crate::crypt::Crypto::is_encrypted_bytes(&bytes));
+
+        // Delete: removes the file AND its sidecar (no orphan left behind).
+        apply_op_to_disk(repo, &SyncOp::Delete { path: clear.clone() }, Some(&c), 0);
+        assert!(!disk_file.exists());
+        assert!(!sidecar.exists(), "sidecar must be removed with the file");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

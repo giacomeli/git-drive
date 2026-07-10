@@ -24,6 +24,16 @@ const TAG_LEN: usize = 16;
 const NAME_COMPONENT_MAX: usize = 255;
 /// Conflicted-copy suffix applied by the pull on top of the ENCRYPTED name.
 const CONFLICT_MARKER: &str = ".conflict-";
+/// Prefix of a hashed long-name entry: used when the base32 encrypted name
+/// would exceed `NAME_COMPONENT_MAX`. The full encrypted name is stored in a
+/// sidecar `<disk>.name`. The prefix contains `_`, which is outside the base32
+/// alphabet, so it can never collide with a normal encrypted component and is
+/// safe on case-insensitive filesystems (APFS).
+pub const LONG_NAME_PREFIX: &str = "dslong_";
+/// Suffix of the sidecar file that carries the full encrypted name.
+pub const SIDECAR_SUFFIX: &str = ".name";
+/// Bytes of HMAC kept for the hashed long name (160-bit -> 32 base32 chars).
+const LONG_HASH_BYTES: usize = 20;
 
 /// Base32 alphabet (RFC 4648) in lowercase — safe on case-insensitive
 /// filesystems (APFS default), where base64 would collide by case.
@@ -42,8 +52,6 @@ pub struct Crypto {
 pub enum CryptError {
     /// Blob without the magic, truncated, tampered with, or wrong key.
     OpenFailed,
-    /// Encrypted name would exceed the filesystem limit.
-    NameTooLong,
 }
 
 impl std::fmt::Display for CryptError {
@@ -52,11 +60,38 @@ impl std::fmt::Display for CryptError {
             CryptError::OpenFailed => {
                 write!(f, "decryption failed: wrong key or tampered blob")
             }
-            CryptError::NameTooLong => {
-                write!(f, "encrypted name exceeds the filesystem's 255-byte limit")
-            }
         }
     }
+}
+
+/// One encrypted path component as it should exist on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncName {
+    /// Name to use on disk. Always `<= NAME_COMPONENT_MAX` bytes.
+    pub disk: String,
+    /// When the encoded name overflowed the component limit: the full base32
+    /// encrypted name, to be written into the sidecar `<disk>.name`. `None`
+    /// when the name fits inline (the common case).
+    pub sidecar: Option<String>,
+}
+
+/// A long-name sidecar to materialize on disk: a small file mapping the hashed
+/// on-disk name back to the full encrypted name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sidecar {
+    /// Full on-disk (encrypted) path of the `<disk>.name` sidecar file.
+    pub path: String,
+    /// File content: the full base32 encrypted component name.
+    pub content: String,
+}
+
+/// An encrypted path plus every sidecar that must exist for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncPath {
+    /// The on-disk (encrypted) path.
+    pub disk: String,
+    /// Sidecars for any long components along the path.
+    pub sidecars: Vec<Sidecar>,
 }
 
 impl Crypto {
@@ -127,7 +162,12 @@ impl Crypto {
     }
 
     /// Encrypts a name component: deterministic AEAD + lowercase base32.
-    pub fn enc_component(&self, clear: &str) -> Result<String, CryptError> {
+    ///
+    /// Never fails on length: when the encoded name would exceed the 255-byte
+    /// component limit, the on-disk name becomes a bounded hash
+    /// (`dslong_<hash>`) and the full encrypted name is returned as a sidecar,
+    /// so no file is ever dropped or written in cleartext.
+    pub fn enc_component(&self, clear: &str) -> EncName {
         let plaintext = clear.as_bytes();
         let nonce = Self::derive_nonce(&self.name_nonce_key, plaintext);
         let ct = self
@@ -139,9 +179,46 @@ impl Crypto {
         raw.extend_from_slice(&ct);
         let encoded = base32_encode(&raw);
         if encoded.len() > NAME_COMPONENT_MAX {
-            return Err(CryptError::NameTooLong);
+            EncName {
+                disk: self.long_disk_name(&encoded),
+                sidecar: Some(encoded),
+            }
+        } else {
+            EncName {
+                disk: encoded,
+                sidecar: None,
+            }
         }
-        Ok(encoded)
+    }
+
+    /// Deterministic bounded on-disk name for an over-long encoded component:
+    /// `dslong_` + base32(HMAC(name-nonce-key, encoded)). Convergent (same
+    /// input -> same name), preserving dedup and staying merge-friendly.
+    fn long_disk_name(&self, encoded: &str) -> String {
+        let mut mac =
+            <HmacSha256 as Mac>::new_from_slice(&self.name_nonce_key).expect("hmac key");
+        mac.update(encoded.as_bytes());
+        let digest = mac.finalize().into_bytes();
+        format!(
+            "{}{}",
+            LONG_NAME_PREFIX,
+            base32_encode(&digest[..LONG_HASH_BYTES])
+        )
+    }
+
+    /// Encrypts one component, preserving a trailing conflicted-copy suffix
+    /// (`.conflict-...`) applied on top of the encrypted name.
+    fn enc_component_keep_conflict(&self, other: &str) -> EncName {
+        if let Some(idx) = other.find(CONFLICT_MARKER) {
+            let (prefix, suffix) = other.split_at(idx);
+            let e = self.enc_component(prefix);
+            EncName {
+                disk: format!("{}{}", e.disk, suffix),
+                sidecar: e.sidecar,
+            }
+        } else {
+            self.enc_component(other)
+        }
     }
 
     /// Decrypts a component. `None` = not a valid encrypted component
@@ -159,27 +236,64 @@ impl Crypto {
         String::from_utf8(plain).ok()
     }
 
-    /// Encrypts a path (or symlink target) component by component.
-    /// Navigation components (``, `.`, `..`) stay literal — a relative target
-    /// `../x` keeps working inside the encrypted tree.
-    pub fn enc_path(&self, clear: &str) -> Result<String, CryptError> {
-        let parts: Result<Vec<String>, CryptError> = clear
+    /// Encrypts a path (or symlink target) component by component, returning
+    /// only the on-disk path. Navigation components (``, `.`, `..`) stay
+    /// literal — a relative target `../x` keeps working inside the encrypted
+    /// tree. Deterministic, so it is safe for lookups without touching
+    /// sidecars (the sidecars are created by the write path via
+    /// `enc_path_full`).
+    pub fn enc_path(&self, clear: &str) -> String {
+        clear
             .split('/')
             .map(|c| match c {
-                "" | "." | ".." => Ok(c.to_string()),
+                "" | "." | ".." => c.to_string(),
+                other => self.enc_component_keep_conflict(other).disk,
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// Like `enc_path`, but also returns every sidecar that must exist on disk
+    /// for the long components along the path. Used by the write path so no
+    /// name is dropped or leaked in cleartext.
+    pub fn enc_path_full(&self, clear: &str) -> EncPath {
+        let mut disk_parts: Vec<String> = Vec::new();
+        let mut sidecars: Vec<Sidecar> = Vec::new();
+        for c in clear.split('/') {
+            match c {
+                "" | "." | ".." => disk_parts.push(c.to_string()),
                 other => {
-                    // Exact inverse of dec_path: the conflicted-copy suffix
-                    // stays clear on top of the encrypted component.
-                    if let Some(idx) = other.find(CONFLICT_MARKER) {
-                        let (prefix, suffix) = other.split_at(idx);
-                        Ok(format!("{}{}", self.enc_component(prefix)?, suffix))
-                    } else {
-                        self.enc_component(other)
+                    let e = self.enc_component_keep_conflict(other);
+                    disk_parts.push(e.disk.clone());
+                    if let Some(content) = e.sidecar {
+                        // Sidecar lives beside its component: same directory,
+                        // name = `<disk>.name`.
+                        let mut sc = disk_parts.clone();
+                        let last = sc.len() - 1;
+                        sc[last] = format!("{}{}", e.disk, SIDECAR_SUFFIX);
+                        sidecars.push(Sidecar {
+                            path: sc.join("/"),
+                            content,
+                        });
                     }
                 }
-            })
-            .collect();
-        Ok(parts?.join("/"))
+            }
+        }
+        EncPath {
+            disk: disk_parts.join("/"),
+            sidecars,
+        }
+    }
+
+    /// Reverses a hashed long-name on-disk component given the content of its
+    /// sidecar (the full base32 encrypted name). A trailing conflicted-copy
+    /// suffix on the on-disk name is reapplied to the cleartext.
+    pub fn dec_long(&self, disk_component: &str, sidecar_content: &str) -> Option<String> {
+        let clear = self.dec_component(sidecar_content)?;
+        match disk_component.find(CONFLICT_MARKER) {
+            Some(idx) => Some(format!("{}{}", clear, &disk_component[idx..])),
+            None => Some(clear),
+        }
     }
 
     /// Decrypts a path component by component, with a literal fallback for
@@ -207,6 +321,35 @@ impl Crypto {
         // Literal fallback: mixed state during migration and internal artifacts.
         component.to_string()
     }
+}
+
+/// True if `name` is a hashed long-name entry (a real file/dir on disk whose
+/// cleartext name is recovered from its sidecar).
+pub fn is_long_name(name: &str) -> bool {
+    name.starts_with(LONG_NAME_PREFIX) && !name.ends_with(SIDECAR_SUFFIX)
+}
+
+/// True if `name` is a long-name sidecar (metadata; hidden from the drive view).
+pub fn is_long_sidecar(name: &str) -> bool {
+    name.starts_with(LONG_NAME_PREFIX) && name.ends_with(SIDECAR_SUFFIX)
+}
+
+/// Sidecar file name for a given long on-disk component name.
+pub fn sidecar_name(disk_component: &str) -> String {
+    format!("{}{}", disk_component, SIDECAR_SUFFIX)
+}
+
+/// If `disk_component` is a conflicted-copy of a long name
+/// (`dslong_<hash>.conflict-...`), the base `dslong_<hash>` without the suffix,
+/// whose sidecar (`dslong_<hash>.name`) holds the encrypted name. `None` when
+/// there is no conflict suffix.
+pub fn long_name_base(disk_component: &str) -> Option<&str> {
+    if !disk_component.starts_with(LONG_NAME_PREFIX) {
+        return None;
+    }
+    disk_component
+        .find(CONFLICT_MARKER)
+        .map(|idx| &disk_component[..idx])
 }
 
 /// Generates a fresh key file: 64 hex chars, permissions 0600. Refuses to
@@ -371,8 +514,9 @@ mod tests {
     #[test]
     fn name_component_roundtrip_and_determinism() {
         let c = crypto();
-        let enc = c.enc_component("Résumé Café.pdf").unwrap();
-        assert_eq!(enc, c.enc_component("Résumé Café.pdf").unwrap());
+        let enc = c.enc_component("Résumé Café.pdf").disk;
+        assert_eq!(enc, c.enc_component("Résumé Café.pdf").disk);
+        assert!(c.enc_component("Résumé Café.pdf").sidecar.is_none());
         assert_eq!(c.dec_component(&enc).unwrap(), "Résumé Café.pdf");
         // Only lowercase letters and digits from the base32 alphabet (APFS-safe)
         assert!(enc.bytes().all(|b| BASE32_ALPHABET.contains(&b)));
@@ -383,7 +527,7 @@ mod tests {
     #[test]
     fn path_roundtrip_preserves_hierarchy() {
         let c = crypto();
-        let enc = c.enc_path("docs/2026/Résumé.pdf").unwrap();
+        let enc = c.enc_path("docs/2026/Résumé.pdf");
         assert_eq!(enc.matches('/').count(), 2, "1:1 hierarchy");
         assert_eq!(c.dec_path(&enc), "docs/2026/Résumé.pdf");
     }
@@ -392,7 +536,7 @@ mod tests {
     fn dec_path_falls_back_to_literal_for_clear_components() {
         let c = crypto();
         // Mixed state: encrypted dir with a literal artifact inside
-        let dir = c.enc_component("projects").unwrap();
+        let dir = c.enc_component("projects").disk;
         let mixed = format!("{}/.gitkeep", dir);
         assert_eq!(c.dec_path(&mixed), "projects/.gitkeep");
         assert_eq!(c.dec_path("clear-name.txt"), "clear-name.txt");
@@ -401,28 +545,81 @@ mod tests {
     #[test]
     fn dec_path_handles_conflict_suffix_on_cipher_name() {
         let c = crypto();
-        let enc = c.enc_component("note.txt").unwrap();
+        let enc = c.enc_component("note.txt").disk;
         let conflicted = format!("{}.conflict-mac-123", enc);
         assert_eq!(c.dec_path(&conflicted), "note.txt.conflict-mac-123");
     }
 
     #[test]
-    fn enc_component_rejects_names_that_would_exceed_fs_limit() {
+    fn long_name_uses_bounded_sidecar_and_roundtrips() {
         let c = crypto();
+        // A name too long to encode inline (~119 bytes is the inline limit).
         let long = "a".repeat(200);
-        assert_eq!(c.enc_component(&long), Err(CryptError::NameTooLong));
-        // And the practical limit (~119 bytes) passes
-        let ok = "b".repeat(110);
-        assert!(c.enc_component(&ok).is_ok());
+        let e = c.enc_component(&long);
+        assert!(e.disk.starts_with(LONG_NAME_PREFIX), "disk: {}", e.disk);
+        assert!(e.disk.len() <= NAME_COMPONENT_MAX);
+        let sidecar = e.sidecar.expect("long name must carry a sidecar");
+        // The sidecar content is the full encrypted name; it round-trips.
+        assert_eq!(c.dec_component(&sidecar).unwrap(), long);
+        assert_eq!(c.dec_long(&e.disk, &sidecar).unwrap(), long);
+        // Deterministic: same clear -> same disk name and same sidecar.
+        let e2 = c.enc_component(&long);
+        assert_eq!(e2.disk, e.disk);
+        assert_eq!(e2.sidecar.as_deref(), Some(sidecar.as_str()));
+
+        // A name within the inline limit does NOT use a sidecar.
+        let ok = c.enc_component(&"b".repeat(110));
+        assert!(ok.sidecar.is_none());
+        assert!(!ok.disk.starts_with(LONG_NAME_PREFIX));
+    }
+
+    #[test]
+    fn enc_path_full_emits_sidecar_beside_long_component() {
+        let c = crypto();
+        let long = "x".repeat(200);
+        let clear = format!("docs/{}/file.txt", long);
+        let full = c.enc_path_full(&clear);
+        // One sidecar, for the long middle component.
+        assert_eq!(full.sidecars.len(), 1);
+        let sc = &full.sidecars[0];
+        // Sidecar sits in the same directory as its component and is named
+        // `<disk>.name`.
+        assert!(sc.path.ends_with(SIDECAR_SUFFIX));
+        let disk_dir = full.disk.rsplit_once('/').unwrap().0; // docs/<long>
+        let sc_dir = sc.path.rsplit_once('/').unwrap().0;
+        assert_eq!(sc_dir, disk_dir.rsplit_once('/').unwrap().0); // docs/<enc>
+        // The middle component on disk is the hashed long name.
+        assert!(disk_dir.contains(LONG_NAME_PREFIX));
+        // is_long_sidecar / is_long_name classify correctly.
+        let sc_leaf = sc.path.rsplit('/').next().unwrap();
+        assert!(is_long_sidecar(sc_leaf));
+        assert!(!is_long_name(sc_leaf));
+    }
+
+    #[test]
+    fn dec_long_reapplies_conflict_suffix() {
+        let c = crypto();
+        let long = "z".repeat(200);
+        let e = c.enc_component(&long);
+        let sidecar = e.sidecar.unwrap();
+        // A merge appends `.conflict-...` on top of the hashed on-disk name;
+        // the original sidecar still resolves it, suffix reapplied.
+        let conflicted = format!("{}.conflict-mac-1", e.disk);
+        assert_eq!(
+            c.dec_long(&conflicted, &sidecar).unwrap(),
+            format!("{}.conflict-mac-1", long)
+        );
+        assert_eq!(long_name_base(&conflicted), Some(e.disk.as_str()));
+        assert_eq!(long_name_base(&e.disk), None);
     }
 
     #[test]
     fn enc_path_keeps_navigation_components_literal() {
         let c = crypto();
-        let enc = c.enc_path("../docs/note.txt").unwrap();
+        let enc = c.enc_path("../docs/note.txt");
         assert!(enc.starts_with("../"));
         assert_eq!(c.dec_path(&enc), "../docs/note.txt");
-        let abs = c.enc_path("/tmp/x").unwrap();
+        let abs = c.enc_path("/tmp/x");
         assert!(abs.starts_with('/'));
         assert_eq!(c.dec_path(&abs), "/tmp/x");
     }

@@ -2,8 +2,6 @@ use std::fs;
 use std::path::Path;
 use serde::Deserialize;
 
-use crate::log_ts;
-
 fn default_write_debounce_secs() -> u64 {
     5
 }
@@ -30,6 +28,18 @@ fn default_chunk_size_mb() -> u64 {
 
 fn default_encryption_enabled() -> bool {
     false
+}
+
+fn default_log_max_mb() -> u64 {
+    50
+}
+
+fn default_log_keep_files() -> usize {
+    10
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +78,18 @@ pub struct Config {
     pub user_email: Option<String>,
     #[serde(default)]
     pub remote_token: Option<String>,
+    /// Maximum size of a single session log file, in MiB, before rotating to a
+    /// new file. Keeps the log from growing without bound (see the 225 MB
+    /// incident). `0` disables size-based rotation.
+    #[serde(default = "default_log_max_mb")]
+    pub log_max_mb: u64,
+    /// How many rotated log files to keep; older ones are pruned automatically.
+    #[serde(default = "default_log_keep_files")]
+    pub log_keep_files: usize,
+    /// Default log level (`error`/`warn`/`info`/`debug`/`trace`). Overridable
+    /// at runtime by the `RUST_LOG` environment variable.
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
 }
 
 impl Default for Config {
@@ -84,36 +106,31 @@ impl Default for Config {
             user_name: None,
             user_email: None,
             remote_token: None,
+            log_max_mb: default_log_max_mb(),
+            log_keep_files: default_log_keep_files(),
+            log_level: default_log_level(),
         }
     }
 }
 
 impl Config {
     pub fn load_from(path: &str) -> Self {
+        // Config loads BEFORE the logger is initialized (the logger's rotation
+        // and level come from it), so these bootstrap diagnostics go straight
+        // to stderr (captured by the journal under systemd), not the `log`
+        // facade — which would silently drop them at this point.
         if !Path::new(path).exists() {
-            println!(
-                "[{}] config: warning: {} not found, using defaults",
-                log_ts(),
-                path
-            );
+            eprintln!("config: {} not found, using defaults", path);
             return Config::default();
         }
 
         let content = fs::read_to_string(path).unwrap_or_else(|_| {
-            println!(
-                "[{}] config: warning: failed to read {}, using defaults",
-                log_ts(),
-                path
-            );
+            eprintln!("config: failed to read {}, using defaults", path);
             "{}".to_string()
         });
 
         serde_json::from_str(&content).unwrap_or_else(|_| {
-            println!(
-                "[{}] config: warning: failed to parse {}, using defaults",
-                log_ts(),
-                path
-            );
+            eprintln!("config: failed to parse {}, using defaults", path);
             Config::default()
         })
     }
@@ -235,6 +252,25 @@ mod tests {
         assert_eq!(cfg.user_name.as_deref(), Some("Alice"));
         assert_eq!(cfg.user_email.as_deref(), Some("alice@example.com"));
         assert_eq!(cfg.remote_token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn load_from_default_log_fields() {
+        let (_dir, path) = write_config("{}");
+        let cfg = Config::load_from(&path);
+        assert_eq!(cfg.log_max_mb, 50);
+        assert_eq!(cfg.log_keep_files, 10);
+        assert_eq!(cfg.log_level, "info");
+    }
+
+    #[test]
+    fn load_from_log_overrides() {
+        let (_dir, path) =
+            write_config(r#"{"log_max_mb": 10, "log_keep_files": 3, "log_level": "debug"}"#);
+        let cfg = Config::load_from(&path);
+        assert_eq!(cfg.log_max_mb, 10);
+        assert_eq!(cfg.log_keep_files, 3);
+        assert_eq!(cfg.log_level, "debug");
     }
 
     #[test]

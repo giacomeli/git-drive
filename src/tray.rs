@@ -129,15 +129,30 @@ fn make_icon(state: TrayState) -> Icon {
     Icon::from_rgba(icon_rgba(state.color(), SIZE), SIZE, SIZE).expect("valid RGBA icon")
 }
 
-fn open_in_terminal(command: &str) {
-    let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!(
-        "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
-        escaped
-    );
-    let _ = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
+/// Opens `path` in the system's default file manager: `open` on macOS,
+/// `xdg-open` on Linux (honors whatever file manager the desktop registered).
+fn open_in_file_manager(path: &str) {
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(not(target_os = "macos"))]
+    let program = "xdg-open";
+    let _ = std::process::Command::new(program)
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Spawns the egui viewer (status + live log tail) as a separate process.
+/// A separate process avoids clashing with the tray's own `tao` event loop and
+/// works cross-platform, replacing the macOS-only `osascript`/Terminal hack.
+/// Uses the current executable so it does not depend on PATH.
+fn spawn_viewer(status_path: &Path) {
+    let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("drive-sync"));
+    let _ = std::process::Command::new(bin)
+        .arg("viewer")
+        .arg("--file")
+        .arg(status_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
@@ -161,9 +176,8 @@ pub fn run(status_path: PathBuf) -> anyhow::Result<()> {
     let line1 = MenuItem::new("loading status...", false, None);
     let line2 = MenuItem::new("", false, None);
     let line3 = MenuItem::new("", false, None);
-    let open_finder = MenuItem::new("Open drive in Finder", true, None);
-    let tail_log = MenuItem::new("View live log", true, None);
-    let detail = MenuItem::new("Detailed status", true, None);
+    let open_drive = MenuItem::new("Open drive in file manager", true, None);
+    let viewer = MenuItem::new("Status & log window", true, None);
     let quit = MenuItem::new("Quit tray", true, None);
 
     let menu = Menu::new();
@@ -173,9 +187,8 @@ pub fn run(status_path: PathBuf) -> anyhow::Result<()> {
         &line2,
         &line3,
         &PredefinedMenuItem::separator(),
-        &open_finder,
-        &tail_log,
-        &detail,
+        &open_drive,
+        &viewer,
         &PredefinedMenuItem::separator(),
         &quit,
     ])?;
@@ -222,23 +235,14 @@ pub fn run(status_path: PathBuf) -> anyhow::Result<()> {
 
         // Menu actions.
         while let Ok(ev) = menu_channel.try_recv() {
-            if ev.id == open_finder.id() {
+            if ev.id == open_drive.id() {
                 if let Some(s) = &current {
                     if !s.mount.is_empty() {
-                        let _ = std::process::Command::new("open").arg(&s.mount).spawn();
+                        open_in_file_manager(&s.mount);
                     }
                 }
-            } else if ev.id == tail_log.id() {
-                if let Some(s) = &current {
-                    if !s.log_file.is_empty() {
-                        open_in_terminal(&format!("tail -f '{}'", s.log_file));
-                    }
-                }
-            } else if ev.id == detail.id() {
-                let bin = std::env::current_exe()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| "drive-sync".to_string());
-                open_in_terminal(&format!("'{}' status --file '{}'", bin, status_path.display()));
+            } else if ev.id == viewer.id() {
+                spawn_viewer(&status_path);
             } else if ev.id == quit.id() {
                 *control_flow = ControlFlow::Exit;
             }

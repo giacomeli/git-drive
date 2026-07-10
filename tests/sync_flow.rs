@@ -1132,13 +1132,13 @@ async fn encrypted_drain_commits_no_plaintext_names_or_content() {
     );
 
     // Content recoverable with the key: find the encrypted file in the worktree
-    let cipher_rel = crypto.enc_path("Pasta Pessoal/segredo.txt").unwrap();
+    let cipher_rel = crypto.enc_path("Pasta Pessoal/segredo.txt");
     let sealed = std::fs::read(test.dir.path().join(&cipher_rel)).expect("encrypted file in the worktree");
     assert!(Crypto::is_encrypted_bytes(&sealed));
     assert_eq!(crypto.open(&sealed).unwrap(), b"conteudo confidencial".to_vec());
 
     // Real symlink with a per-component encrypted target (mode 120000 preserved)
-    let link_rel = crypto.enc_path("atalho.txt").unwrap();
+    let link_rel = crypto.enc_path("atalho.txt");
     let meta = std::fs::symlink_metadata(test.dir.path().join(&link_rel)).unwrap();
     assert!(meta.file_type().is_symlink());
     let target = std::fs::read_link(test.dir.path().join(&link_rel)).unwrap();
@@ -1182,12 +1182,12 @@ async fn encrypted_rename_and_delete_translate_paths() {
 
     sync.queue_write("original.txt", b"dados".to_vec());
     wait_flush().await;
-    let old_rel = crypto.enc_path("original.txt").unwrap();
+    let old_rel = crypto.enc_path("original.txt");
     assert!(test.dir.path().join(&old_rel).exists());
 
     sync.queue_rename("original.txt", "renomeado.txt");
     wait_flush().await;
-    let new_rel = crypto.enc_path("renomeado.txt").unwrap();
+    let new_rel = crypto.enc_path("renomeado.txt");
     assert!(!test.dir.path().join(&old_rel).exists(), "encrypted source should be gone");
     let sealed = std::fs::read(test.dir.path().join(&new_rel)).unwrap();
     assert_eq!(crypto.open(&sealed).unwrap(), b"dados".to_vec());
@@ -1217,7 +1217,7 @@ async fn encrypted_chunking_seals_chunks_and_manifest() {
 
     // Sealed manifest at the encrypted path; chunks are sealed files named
     // by the sha256 of the CIPHERTEXT; decrypted reassembly reproduces the original.
-    let cipher_rel = crypto.enc_path("grande.bin").unwrap();
+    let cipher_rel = crypto.enc_path("grande.bin");
     let sealed_manifest = std::fs::read(test.dir.path().join(&cipher_rel)).unwrap();
     assert!(Crypto::is_encrypted_bytes(&sealed_manifest));
     let manifest = Manifest::parse(&crypto.open(&sealed_manifest).unwrap()).unwrap();
@@ -1259,7 +1259,7 @@ async fn enable_migration_encrypts_existing_worktree() {
         "pre-existing worktree should be migrated to encrypted form"
     );
     let sealed = std::fs::read(
-        test.dir.path().join(crypto.enc_path("antigo.txt").unwrap()),
+        test.dir.path().join(crypto.enc_path("antigo.txt")),
     )
     .expect("migrated file at the encrypted path");
     assert_eq!(crypto.open(&sealed).unwrap(), b"historico claro".to_vec());
@@ -1337,7 +1337,7 @@ async fn enable_migration_rechunks_clear_chunked_files_sealing_chunks() {
         );
     }
     // Sealed manifest at the encrypted path, content intact when reassembled
-    let cipher_rel = crypto.enc_path("video.bin").unwrap();
+    let cipher_rel = crypto.enc_path("video.bin");
     let sealed_manifest = std::fs::read(test.dir.path().join(&cipher_rel)).unwrap();
     let manifest = Manifest::parse(&crypto.open(&sealed_manifest).unwrap()).unwrap();
     assert_eq!(manifest.total_size, 200);
@@ -1401,7 +1401,7 @@ async fn enable_migration_encrypts_preexisting_symlinks() {
         !tree_leaks_plaintext(&test.repo, &["atalho", "real"]),
         "pre-existing symlink should be migrated (name AND target encrypted)"
     );
-    let cipher_link = crypto.enc_path("atalho.txt").unwrap();
+    let cipher_link = crypto.enc_path("atalho.txt");
     let meta = std::fs::symlink_metadata(test.dir.path().join(&cipher_link))
         .expect("migrated symlink at the encrypted path");
     assert!(meta.file_type().is_symlink(), "still a symlink (mode 120000)");

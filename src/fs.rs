@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use crate::git;
-use crate::log_ts;
 use crate::sync::SyncManager;
 
 const TTL: Duration = Duration::from_secs(1);
@@ -352,7 +351,7 @@ impl GitDriveFS {
         let commit = git::get_commit(&repo, "HEAD")?;
         let dirs = git::list_dirs_at_commit(&repo, &commit)?;
         let files = git::list_files_at_commit(&repo, &commit)?;
-        let (dirs, files) = decrypt_listing(crypto.as_deref(), dirs, files);
+        let (dirs, files) = decrypt_listing(crypto.as_deref(), repo_path, dirs, files);
 
         let mut files_by_inode = HashMap::new();
         let mut dirs_by_inode = HashMap::new();
@@ -753,9 +752,8 @@ impl GitDriveFS {
             std::path::Path::new(&self.repo_path).join(crate::chunk::shard_rel_path(hash));
         let data = std::fs::read(&full).map_err(|_| libc::EIO)?;
         if crate::chunk::sha256_hex(&data) != *hash {
-            eprintln!(
-                "[{}] chunk: hash mismatch on chunk {} (idx {}) — EIO",
-                log_ts(),
+            log::error!(
+                "chunk: hash mismatch on chunk {} (idx {}) — EIO",
                 hash,
                 idx
             );
@@ -841,10 +839,7 @@ impl GitDriveFS {
             // Chunked: the buffer is born from the REASSEMBLY, never from the
             // raw manifest — same POSIX semantics as the Phase 0 invariant.
             self.buffer_from_manifest(&m).unwrap_or_else(|| {
-                eprintln!(
-                    "[{}] chunk: failed to reassemble write buffer — starting empty",
-                    log_ts()
-                );
+                log::warn!("chunk: failed to reassemble write buffer — starting empty");
                 WriteBuffer::Mem(Arc::new(Vec::new()))
             })
         } else {
@@ -957,9 +952,11 @@ impl GitDriveFS {
     }
 
     /// Path as it exists on DISK/HEAD: encrypted when encryption is active.
+    /// Deterministic — long components map to their `dslong_<hash>` name, so
+    /// lookups resolve without consulting sidecars.
     fn disk_path(&self, clear: &str) -> String {
         match &self.crypto {
-            Some(c) => c.enc_path(clear).unwrap_or_else(|_| clear.to_string()),
+            Some(c) => c.enc_path(clear),
             None => clear.to_string(),
         }
     }
@@ -970,7 +967,7 @@ impl GitDriveFS {
         match &self.crypto {
             Some(c) if crate::crypt::Crypto::is_encrypted_bytes(&bytes) => {
                 c.open(&bytes).map_err(|e| {
-                    eprintln!("[{}] crypto: {} — EIO", log_ts(), e);
+                    log::error!("crypto: {} — EIO", e);
                     libc::EIO
                 })
             }
@@ -1290,32 +1287,32 @@ impl GitDriveFS {
         let repo = match git::open_repo(&self.repo_path) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[{}] refresh_if_needed: error opening repo: {}", log_ts(), e);
+                log::error!("refresh_if_needed: error opening repo: {}", e);
                 return;
             }
         };
         let commit = match git::get_commit(&repo, "HEAD") {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[{}] refresh_if_needed: error resolving HEAD: {}", log_ts(), e);
+                log::error!("refresh_if_needed: error resolving HEAD: {}", e);
                 return;
             }
         };
         let dirs = match git::list_dirs_at_commit(&repo, &commit) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[{}] refresh_if_needed: list_dirs failed: {}", log_ts(), e);
+                log::error!("refresh_if_needed: list_dirs failed: {}", e);
                 return;
             }
         };
         let files = match git::list_files_at_commit(&repo, &commit) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("[{}] refresh_if_needed: list_files failed: {}", log_ts(), e);
+                log::error!("refresh_if_needed: list_files failed: {}", e);
                 return;
             }
         };
-        let (dirs, files) = decrypt_listing(self.crypto.as_deref(), dirs, files);
+        let (dirs, files) = decrypt_listing(self.crypto.as_deref(), &self.repo_path, dirs, files);
 
         let previous: HashMap<String, u64> = self.inodes_by_path.clone();
 
@@ -1467,9 +1464,8 @@ impl GitDriveFS {
                 .copied()
                 .collect();
             if file_children.len() != 1 {
-                eprintln!(
-                    "[{}] ambiguous implicit swap: source_parent={} has {} files (expected 1) — returning EXDEV",
-                    log_ts(),
+                log::warn!(
+                    "ambiguous implicit swap: source_parent={} has {} files (expected 1) — returning EXDEV",
                     source_parent,
                     file_children.len()
                 );
@@ -1499,9 +1495,8 @@ impl GitDriveFS {
             // earlier; this is defense in depth for other ambiguous
             // exchangedata encodings.
             let Some(ino) = picked else {
-                eprintln!(
-                    "[{}] ambiguous implicit swap: src={:?} has no counterpart in target_parent={} — returning EXDEV",
-                    log_ts(),
+                log::warn!(
+                    "ambiguous implicit swap: src={:?} has no counterpart in target_parent={} — returning EXDEV",
                     src_name,
                     target_parent
                 );
@@ -1834,14 +1829,14 @@ impl GitDriveFS {
         let repo = match git::open_repo(&self.repo_path) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[{}] local-only: error opening repo: {}", log_ts(), e);
+                log::error!("local-only: error opening repo: {}", e);
                 return;
             }
         };
         let ignored = match git::list_ignored_files(&repo) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[{}] local-only: error listing ignored files: {}", log_ts(), e);
+                log::error!("local-only: error listing ignored files: {}", e);
                 return;
             }
         };
@@ -1925,14 +1920,14 @@ impl GitDriveFS {
         let repo = match git::open_repo(&self.repo_path) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[{}] mtime: error opening repo: {}", log_ts(), e);
+                log::error!("mtime: error opening repo: {}", e);
                 return;
             }
         };
         let by_path = match git::commit_times_by_path(&repo, Self::MTIME_WALK_DEPTH_CAP) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("[{}] mtime: revwalk failed: {}", log_ts(), e);
+                log::error!("mtime: revwalk failed: {}", e);
                 return;
             }
         };
@@ -2096,12 +2091,16 @@ impl Filesystem for GitDriveFS {
         {
             let _ = config.add_capabilities(fuser::consts::FUSE_EXCHANGE_DATA);
         }
-        println!("[{}] boot: init ok", log_ts());
+        // `config` is only consulted on macOS (above); silence the unused
+        // binding on other targets without renaming the parameter.
+        #[cfg(not(target_os = "macos"))]
+        let _ = &config;
+        log::info!("boot: init ok");
         Ok(())
     }
 
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-        println!("[{}] OPEN inode={}", log_ts(), ino);
+        log::trace!("OPEN inode={}", ino);
         reply.opened(ino, 0);
     }
 
@@ -2119,9 +2118,8 @@ impl Filesystem for GitDriveFS {
     ) {
         match self.apply_write(ino, offset as usize, data) {
             Ok(written) => {
-                println!(
-                    "[{}] WRITE inode={} offset={} bytes={}",
-                    log_ts(),
+                log::trace!(
+                    "WRITE inode={} offset={} bytes={}",
                     ino,
                     offset,
                     data.len()
@@ -2145,7 +2143,7 @@ impl Filesystem for GitDriveFS {
         // the flush in TextEdit's safe save cycle). Queueing is gated on the
         // dirty flag in `apply_flush` — a read-only fd flush is a no-op.
         if let Some(path) = self.apply_flush(ino) {
-            println!("[{}] FLUSH inode={} path={}", log_ts(), ino, path);
+            log::trace!("FLUSH inode={} path={}", ino, path);
         }
         reply.ok();
     }
@@ -2160,7 +2158,7 @@ impl Filesystem for GitDriveFS {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        println!("[{}] RELEASE inode={}", log_ts(), ino);
+        log::trace!("RELEASE inode={}", ino);
         reply.ok();
     }
 
@@ -2190,9 +2188,8 @@ impl Filesystem for GitDriveFS {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        println!(
-            "[{}] SETATTR inode={} mode={:?} size={:?} mtime={:?}",
-            log_ts(),
+        log::trace!(
+            "SETATTR inode={} mode={:?} size={:?} mtime={:?}",
             ino,
             mode,
             size,
@@ -2252,9 +2249,8 @@ impl Filesystem for GitDriveFS {
             reply.error(libc::EINVAL);
             return;
         };
-        println!(
-            "[{}] LINK ino={} -> parent={} name={:?}",
-            log_ts(),
+        log::debug!(
+            "LINK ino={} -> parent={} name={:?}",
             ino,
             newparent,
             newname_str
@@ -2337,9 +2333,8 @@ impl Filesystem for GitDriveFS {
             reply.error(libc::EINVAL);
             return;
         };
-        println!(
-            "[{}] EXCHANGE {}/{} <-> {}/{}",
-            log_ts(),
+        log::debug!(
+            "EXCHANGE {}/{} <-> {}/{}",
             parent,
             name,
             newparent,
@@ -2566,9 +2561,8 @@ impl Filesystem for GitDriveFS {
             reply.error(libc::EINVAL);
             return;
         };
-        println!(
-            "[{}] CREATE parent={} name={:?}",
-            log_ts(),
+        log::debug!(
+            "CREATE parent={} name={:?}",
             parent,
             filename
         );
@@ -2583,21 +2577,19 @@ impl Filesystem for GitDriveFS {
             reply.error(libc::EINVAL);
             return;
         };
-        println!(
-            "[{}] UNLINK parent={} name={:?}",
-            log_ts(),
+        log::debug!(
+            "UNLINK parent={} name={:?}",
             parent,
             filename
         );
         match self.apply_unlink(parent, filename) {
             Ok(()) => {
-                println!("[{}] UNLINK ok parent={} name={:?}", log_ts(), parent, filename);
+                log::debug!("UNLINK ok parent={} name={:?}", parent, filename);
                 reply.ok()
             }
             Err(code) => {
-                eprintln!(
-                    "[{}] UNLINK ERR parent={} name={:?} code={}",
-                    log_ts(),
+                log::error!(
+                    "UNLINK ERR parent={} name={:?} code={}",
                     parent,
                     filename,
                     code
@@ -2626,9 +2618,8 @@ impl Filesystem for GitDriveFS {
         // ephemeral: it exists only in memory, and moving items into it
         // becomes a removal from the repo (Phase 1 expansion) with content
         // recoverable via buffers until the Trash is emptied or remounted.
-        println!(
-            "[{}] MKDIR parent={} name={:?}",
-            log_ts(),
+        log::debug!(
+            "MKDIR parent={} name={:?}",
             parent,
             filename
         );
@@ -2643,21 +2634,19 @@ impl Filesystem for GitDriveFS {
             reply.error(libc::EINVAL);
             return;
         };
-        println!(
-            "[{}] RMDIR parent={} name={:?}",
-            log_ts(),
+        log::debug!(
+            "RMDIR parent={} name={:?}",
             parent,
             filename
         );
         match self.apply_rmdir(parent, filename) {
             Ok(()) => {
-                println!("[{}] RMDIR ok parent={} name={:?}", log_ts(), parent, filename);
+                log::debug!("RMDIR ok parent={} name={:?}", parent, filename);
                 reply.ok()
             }
             Err(code) => {
-                eprintln!(
-                    "[{}] RMDIR ERR parent={} name={:?} code={}",
-                    log_ts(),
+                log::error!(
+                    "RMDIR ERR parent={} name={:?} code={}",
                     parent,
                     filename,
                     code
@@ -2681,9 +2670,8 @@ impl Filesystem for GitDriveFS {
             reply.error(libc::EINVAL);
             return;
         };
-        println!(
-            "[{}] RENAME {}/{:?} -> {}/{:?} flags=0x{:x}",
-            log_ts(),
+        log::debug!(
+            "RENAME {}/{:?} -> {}/{:?} flags=0x{:x}",
             parent,
             n,
             new_parent,
@@ -2695,13 +2683,12 @@ impl Filesystem for GitDriveFS {
         if flags & APPLE_RENAME_SWAP != 0 {
             match self.apply_exchange(parent, n, new_parent, nn) {
                 Ok(()) => {
-                    println!("[{}] RENAME(SWAP) ok {:?} <-> {:?}", log_ts(), n, nn);
+                    log::debug!("RENAME(SWAP) ok {:?} <-> {:?}", n, nn);
                     reply.ok();
                 }
                 Err(code) => {
-                    eprintln!(
-                        "[{}] RENAME(SWAP) ERR {:?} <-> {:?} code={}",
-                        log_ts(),
+                    log::error!(
+                        "RENAME(SWAP) ERR {:?} <-> {:?} code={}",
                         n,
                         nn,
                         code
@@ -2718,9 +2705,8 @@ impl Filesystem for GitDriveFS {
         }
         match self.apply_rename(parent, n, new_parent, nn) {
             Ok(()) => {
-                println!(
-                    "[{}] RENAME ok {}/{:?} -> {}/{:?}",
-                    log_ts(),
+                log::debug!(
+                    "RENAME ok {}/{:?} -> {}/{:?}",
                     parent,
                     n,
                     new_parent,
@@ -2729,9 +2715,8 @@ impl Filesystem for GitDriveFS {
                 reply.ok()
             }
             Err(code) => {
-                eprintln!(
-                    "[{}] RENAME ERR {}/{:?} -> {}/{:?} code={}",
-                    log_ts(),
+                log::error!(
+                    "RENAME ERR {}/{:?} -> {}/{:?} code={}",
                     parent,
                     n,
                     new_parent,
@@ -2794,9 +2779,8 @@ impl Filesystem for GitDriveFS {
             reply.error(libc::EINVAL);
             return;
         };
-        println!(
-            "[{}] SYMLINK parent={} name={:?} -> {:?}",
-            log_ts(),
+        log::debug!(
+            "SYMLINK parent={} name={:?} -> {:?}",
             parent,
             name,
             target_str
@@ -2883,15 +2867,37 @@ const SEALED_OVERHEAD: u64 = 64;
 /// (conforming blobs are sealed by construction of the drain).
 fn decrypt_listing(
     crypto: Option<&crate::crypt::Crypto>,
+    repo_path: &str,
     dirs: Vec<String>,
     files: Vec<git::ListedFile>,
 ) -> (Vec<String>, Vec<git::ListedFile>) {
     let Some(c) = crypto else { return (dirs, files) };
-    let dirs = dirs.into_iter().map(|d| c.dec_path(&d)).collect();
+
+    // Long-name resolution: read the `<disk>.name` sidecars in this listing to
+    // recover the full encrypted name of each hashed (`dslong_`) component.
+    // Keyed by the component's on-disk path (sidecar path minus `.name`).
+    let mut sidecars: HashMap<String, String> = HashMap::new();
+    for f in &files {
+        if crate::crypt::is_long_sidecar(leaf_name(&f.path)) {
+            let base = &f.path[..f.path.len() - crate::crypt::SIDECAR_SUFFIX.len()];
+            if let Ok(content) =
+                std::fs::read_to_string(std::path::Path::new(repo_path).join(&f.path))
+            {
+                sidecars.insert(base.to_string(), content.trim().to_string());
+            }
+        }
+    }
+
+    let dirs = dirs
+        .into_iter()
+        .map(|d| dec_path_with_sidecars(c, &d, &sidecars))
+        .collect();
     let files = files
         .into_iter()
+        // Sidecars are our own metadata — never shown on the drive.
+        .filter(|f| !crate::crypt::is_long_sidecar(leaf_name(&f.path)))
         .map(|mut f| {
-            let clear = c.dec_path(&f.path);
+            let clear = dec_path_with_sidecars(c, &f.path, &sidecars);
             let decoded = clear != f.path;
             f.path = clear;
             if decoded && f.kind == git::FileKind::Regular {
@@ -2901,6 +2907,44 @@ fn decrypt_listing(
         })
         .collect();
     (dirs, files)
+}
+
+/// Decrypts an on-disk path, resolving hashed long-name (`dslong_`) components
+/// through the sidecar map (keyed by on-disk component path). Normal components
+/// fall back to the stateless `dec_path`; unknown long names stay literal.
+fn dec_path_with_sidecars(
+    c: &crate::crypt::Crypto,
+    on_disk: &str,
+    sidecars: &HashMap<String, String>,
+) -> String {
+    let mut clear: Vec<String> = Vec::new();
+    let mut accum = String::new();
+    for comp in on_disk.split('/') {
+        if !accum.is_empty() {
+            accum.push('/');
+        }
+        accum.push_str(comp);
+        if crate::crypt::is_long_name(comp) {
+            // Exact sidecar, or the conflict base (`dslong_<hash>` without the
+            // `.conflict-...` suffix, whose sidecar holds the encrypted name).
+            let content = sidecars.get(&accum).or_else(|| {
+                crate::crypt::long_name_base(comp).and_then(|base| {
+                    let base_path = match accum.rfind('/') {
+                        Some(i) => format!("{}/{}", &accum[..i], base),
+                        None => base.to_string(),
+                    };
+                    sidecars.get(&base_path)
+                })
+            });
+            match content.and_then(|ct| c.dec_long(comp, ct)) {
+                Some(cl) => clear.push(cl),
+                None => clear.push(comp.to_string()),
+            }
+        } else {
+            clear.push(c.dec_path(comp));
+        }
+    }
+    clear.join("/")
 }
 
 fn leaf_name(path: &str) -> &str {
@@ -2921,6 +2965,45 @@ mod tests {
         c.insert(1, b"abc".to_vec());
         assert_eq!(c.get(1).map(|d| d.as_slice()), Some(b"abc".as_slice()));
         assert_eq!(c.stats(), (1, 1));
+    }
+
+    #[test]
+    fn decrypt_listing_resolves_long_name_and_hides_sidecar() {
+        use super::{decrypt_listing, git};
+        use crate::crypt::Crypto;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        let c = Crypto::from_master_key(&[3u8; 32]);
+
+        let long = "q".repeat(200);
+        let e = c.enc_component(&long);
+        let disk_leaf = e.disk.clone(); // dslong_<hash>
+        let sidecar_content = e.sidecar.clone().unwrap();
+        // Materialize the sidecar as it exists in the worktree.
+        std::fs::write(
+            dir.path().join(format!("{}.name", disk_leaf)),
+            &sidecar_content,
+        )
+        .unwrap();
+
+        let files = vec![
+            git::ListedFile {
+                path: disk_leaf.clone(),
+                size: 116,
+                kind: git::FileKind::Regular,
+            },
+            git::ListedFile {
+                path: format!("{}.name", disk_leaf),
+                size: sidecar_content.len() as u64,
+                kind: git::FileKind::Regular,
+            },
+        ];
+        let (dirs, files) = decrypt_listing(Some(&c), repo, vec![], files);
+        assert!(dirs.is_empty());
+        // The sidecar is hidden and the long name resolves to its cleartext.
+        assert_eq!(files.len(), 1, "sidecar must be hidden from the listing");
+        assert_eq!(files[0].path, long);
     }
 
     #[test]
