@@ -1502,7 +1502,8 @@ fn commit_all(repo: &git2::Repository, msg: &str) {
         .unwrap();
 }
 
-/// Materializes an encrypted file (name + content) in the worktree and commits it.
+/// Materializes an encrypted file (name + content + long-name sidecars) in the
+/// worktree and commits it — mirrors what the drain's apply path produces.
 fn commit_encrypted_file(
     repo: &git2::Repository,
     crypto: &Crypto,
@@ -1510,10 +1511,13 @@ fn commit_encrypted_file(
     content: &[u8],
 ) {
     let workdir = repo.workdir().unwrap();
-    let cipher_rel = crypto.enc_path(clear_rel);
-    let full = workdir.join(&cipher_rel);
+    let enc = crypto.enc_path_full(clear_rel);
+    let full = workdir.join(&enc.disk);
     std::fs::create_dir_all(full.parent().unwrap()).unwrap();
     std::fs::write(&full, crypto.seal(content)).unwrap();
+    for sc in &enc.sidecars {
+        std::fs::write(workdir.join(&sc.path), sc.content.as_bytes()).unwrap();
+    }
     commit_all(repo, "add encrypted");
 }
 
@@ -1577,8 +1581,16 @@ async fn encrypted_symlink_readlink_returns_clear_target() {
     let crypto = fs_crypto();
     let workdir = test.repo.workdir().unwrap();
     let link_rel = crypto.enc_path("atalho.txt");
-    let target_cipher = crypto.enc_path("docs/alvo real.txt");
-    std::os::unix::fs::symlink(&target_cipher, workdir.join(&link_rel)).unwrap();
+    // Target components above the threshold are hashed on disk; readlink
+    // resolves them through the target's worktree sidecars — materialize them
+    // as the drain would when the target path exists on the drive.
+    let target = crypto.enc_path_full("docs/alvo real.txt");
+    for sc in &target.sidecars {
+        let p = workdir.join(&sc.path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, sc.content.as_bytes()).unwrap();
+    }
+    std::os::unix::fs::symlink(&target.disk, workdir.join(&link_rel)).unwrap();
     commit_all(&test.repo, "add symlink cifrado");
 
     let mut fs = new_encrypted_fs(test.dir.path().to_str().unwrap(), crypto);

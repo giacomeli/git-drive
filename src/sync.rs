@@ -664,6 +664,7 @@ impl DrainCtx {
                 &self.user_name,
                 &self.user_email,
                 &ops,
+                crypto.is_some(),
             );
             if let Some(oid) = commit_oid {
                 commits_created += 1;
@@ -861,6 +862,72 @@ fn write_sidecars(repo_path: &Path, crypto: Option<&crate::crypt::Crypto>, clear
         if needs {
             if let Err(e) = std::fs::write(&full, sc.content.as_bytes()) {
                 log::error!("crypto: failed to write long-name sidecar {:?}: {}", full, e);
+            }
+        }
+    }
+}
+
+/// Rebuilds an ON-DISK path to the canonical encrypted form, component by
+/// component: hashed `dslong_` entries are preserved verbatim (their cleartext
+/// lives in their sidecar — a whole-path dec+enc would re-encrypt the literal
+/// hash and corrupt the entry), conforming encrypted components stay as they
+/// are (deterministic re-encode), over-threshold pre-threshold components are
+/// collapsed to `dslong_` + sidecar, and cleartext components are encrypted
+/// (preserving a conflicted-copy suffix). Returns the new rel path plus the
+/// sidecars to materialize as `(rel_path, content)`.
+fn canonicalize_disk_path(
+    c: &crate::crypt::Crypto,
+    rel: &str,
+) -> (String, Vec<(String, String)>) {
+    let mut parts: Vec<String> = Vec::new();
+    let mut sidecars: Vec<(String, String)> = Vec::new();
+    for comp in rel.split('/') {
+        if comp.is_empty() {
+            continue;
+        }
+        if crate::crypt::is_long_name(comp) {
+            parts.push(comp.to_string());
+            continue;
+        }
+        let e = match c.dec_component(comp) {
+            // Valid encrypted component: re-encode from its cleartext —
+            // identity for conforming names, dslong for over-threshold ones.
+            Some(clear) => c.enc_component(&clear),
+            // Cleartext (or mixed/conflicted) component.
+            None => c.enc_component_keep_conflict(comp),
+        };
+        if let Some(content) = e.sidecar {
+            let dir = parts.join("/");
+            let name = crate::crypt::sidecar_name(&e.disk);
+            let sc_rel = if dir.is_empty() {
+                name
+            } else {
+                format!("{}/{}", dir, name)
+            };
+            sidecars.push((sc_rel, content));
+        }
+        parts.push(e.disk);
+    }
+    (parts.join("/"), sidecars)
+}
+
+/// Writes the sidecar files produced by `canonicalize_disk_path`. Idempotent.
+fn materialize_sidecars(repo_path: &Path, sidecars: &[(String, String)]) {
+    for (rel, content) in sidecars {
+        let full = repo_path.join(rel);
+        if let Some(parent) = full.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let needs = std::fs::read(&full)
+            .map(|b| b != content.as_bytes())
+            .unwrap_or(true);
+        if needs {
+            if let Err(e) = std::fs::write(&full, content.as_bytes()) {
+                log::error!(
+                    "crypto: failed to write long-name sidecar {:?}: {}",
+                    full,
+                    e
+                );
             }
         }
     }
@@ -1065,6 +1132,7 @@ fn commit_batch(
     user_name: &Option<String>,
     user_email: &Option<String>,
     ops: &[&SyncOp],
+    redact_paths: bool,
 ) -> Option<git2::Oid> {
     let (Some(name), Some(email)) = (user_name.as_deref(), user_email.as_deref()) else {
         log::warn!(
@@ -1079,7 +1147,7 @@ fn commit_batch(
             return None;
         }
     };
-    let message = build_commit_message(ops);
+    let message = build_commit_message(ops, redact_paths);
     match git::commit_working_tree(&repo, branch, name, email, &message) {
         Ok(Some(oid)) => {
             log::info!("commit: created {}", oid);
@@ -1201,8 +1269,14 @@ fn gethostname_or(fallback: &str) -> String {
     }
 }
 
-fn build_commit_message(ops: &[&SyncOp]) -> String {
+fn build_commit_message(ops: &[&SyncOp], redact_paths: bool) -> String {
     let n = ops.len();
+    // Encrypted repo: the queue paths are CLEARTEXT — echoing them into the
+    // commit message would leak every file name into the (unencrypted) git
+    // history, defeating the name encryption. Count only.
+    if redact_paths {
+        return format!("drive-sync: {} changes", n);
+    }
     let paths: Vec<&str> = ops.iter().map(|op| op.primary_path()).collect();
     let preview: Vec<&str> = paths.iter().take(3).copied().collect();
     let more = if n > preview.len() {
@@ -1320,30 +1394,32 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
             continue;
         }
         let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
-        // A component is already conforming if it decrypts OR if it is a hashed
-        // long name (whose cleartext lives in its sidecar) — otherwise the pass
-        // would re-encrypt the hash and corrupt the entry.
-        let name_ok = rel
-            .split('/')
-            .all(|comp| c.dec_component(comp).is_some() || crate::crypt::is_long_name(comp));
+        // A component conforms when it is a hashed long entry OR decodes AND
+        // stays within LONG_NAME_THRESHOLD — pre-threshold entries (encoded
+        // 81..255, valid base32) must be re-written as dslong, or deep paths
+        // keep breaking macOS's PATH_MAX on the replica (2026-07-10 incident).
+        let comp_ok = |comp: &str| {
+            crate::crypt::is_long_name(comp)
+                || (comp.len() <= crate::crypt::LONG_NAME_THRESHOLD
+                    && c.dec_component(comp).is_some())
+        };
+        let name_ok = rel.split('/').all(comp_ok);
         if meta.file_type().is_symlink() {
             let Ok(target) = std::fs::read_link(&full) else { continue };
             let target_str = target.to_string_lossy().into_owned();
             let target_ok = target_str
                 .split('/')
-                .all(|comp| matches!(comp, "" | "." | "..") || c.dec_component(comp).is_some());
+                .all(|comp| matches!(comp, "" | "." | "..") || comp_ok(comp));
             if name_ok && target_ok {
                 continue;
             }
-            let clear_rel = c.dec_path(&rel);
-            let clear_target = c.dec_path(&target_str);
-            let new_rel = c.enc_path(&clear_rel);
-            let new_target = c.enc_path(&clear_target);
+            let (new_rel, sidecars) = canonicalize_disk_path(c, &rel);
+            let (new_target, _) = canonicalize_disk_path(c, &target_str);
             let new_full = repo_path.join(&new_rel);
             if let Some(parent) = new_full.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            write_sidecars(repo_path, Some(c), &clear_rel);
+            materialize_sidecars(repo_path, &sidecars);
             let _ = std::fs::remove_file(&full);
             let _ = std::fs::remove_file(&new_full);
             if std::os::unix::fs::symlink(&new_target, &new_full).is_ok() {
@@ -1358,13 +1434,12 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
         if name_ok && sealed {
             continue;
         }
-        let clear_rel = c.dec_path(&rel);
-        let new_rel = c.enc_path(&clear_rel);
+        let (new_rel, sidecars) = canonicalize_disk_path(c, &rel);
         let new_full = repo_path.join(&new_rel);
         if let Some(parent) = new_full.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        write_sidecars(repo_path, Some(c), &clear_rel);
+        materialize_sidecars(repo_path, &sidecars);
         if sealed {
             // Content is fine; only the name needs to migrate.
             if new_full != full && std::fs::rename(&full, &new_full).is_ok() {
@@ -1460,13 +1535,27 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
 /// re-chunks it in cleartext right after, if still large).
 fn migrate_worktree_to_clear(repo_path: &Path, mk: &crate::crypt::Crypto) -> usize {
     let mut converted = 0usize;
+    // Long-name sidecars are decryption METADATA: they must survive until every
+    // hashed (`dslong_`) entry has been resolved through them, and disappear
+    // afterwards (a cleartext worktree has no sidecars). Deleting one before
+    // its main entry is processed would leave the hash unresolvable.
+    let mut sidecars_to_remove: Vec<PathBuf> = Vec::new();
     for (full, rel) in walk_worktree_files(repo_path) {
+        let leaf = rel.rsplit('/').next().unwrap_or(&rel);
+        if crate::crypt::is_long_sidecar(leaf) {
+            sidecars_to_remove.push(full);
+            continue;
+        }
         let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
-        let clear_rel = mk.dec_path(&rel);
+        let clear_rel = dec_disk_path_with_worktree_sidecars(mk, repo_path, &rel);
         let name_cipher = clear_rel != rel;
         if meta.file_type().is_symlink() {
             let Ok(target) = std::fs::read_link(&full) else { continue };
-            let clear_target = mk.dec_path(&target.to_string_lossy());
+            let clear_target = dec_disk_path_with_worktree_sidecars(
+                mk,
+                repo_path,
+                &target.to_string_lossy(),
+            );
             let target_cipher = clear_target != target.to_string_lossy();
             if !name_cipher && !target_cipher {
                 continue;
@@ -1542,8 +1631,44 @@ fn migrate_worktree_to_clear(repo_path: &Path, mk: &crate::crypt::Crypto) -> usi
             converted += 1;
         }
     }
+    // Every hashed entry has been resolved by now — drop the sidecars (a
+    // cleartext worktree carries no drive-sync metadata).
+    for sc in sidecars_to_remove {
+        let _ = std::fs::remove_file(sc);
+    }
     prune_empty_dirs(repo_path);
     converted
+}
+
+/// Decrypts an on-disk path, resolving hashed (`dslong_`) components by reading
+/// their `<disk>.name` sidecars straight from the worktree. Components without
+/// a resolvable sidecar stay literal, like every other mixed-state fallback.
+pub(crate) fn dec_disk_path_with_worktree_sidecars(
+    c: &crate::crypt::Crypto,
+    repo_path: &Path,
+    on_disk: &str,
+) -> String {
+    let mut clear: Vec<String> = Vec::new();
+    let mut accum = String::new();
+    for comp in on_disk.split('/') {
+        if !accum.is_empty() {
+            accum.push('/');
+        }
+        accum.push_str(comp);
+        if crate::crypt::is_long_name(comp) {
+            let sc = repo_path.join(crate::crypt::sidecar_name(&accum));
+            match std::fs::read_to_string(&sc)
+                .ok()
+                .and_then(|ct| c.dec_long(comp, ct.trim()))
+            {
+                Some(cl) => clear.push(cl),
+                None => clear.push(comp.to_string()),
+            }
+        } else {
+            clear.push(c.dec_path(comp));
+        }
+    }
+    clear.join("/")
 }
 
 /// Removes empty directories left behind by the name migrations (bottom-up).
@@ -2147,9 +2272,22 @@ mod tests {
             SyncOp::Write { path: "c.txt".into(), content: wc(b"") },
         ];
         let ops: Vec<&SyncOp> = ops_owned.iter().collect();
-        let m = build_commit_message(&ops);
+        let m = build_commit_message(&ops, false);
         assert!(m.contains("3 changes"), "{}", m);
         assert!(m.contains("a.txt"));
+    }
+
+    #[test]
+    fn build_commit_message_redacts_paths_in_encrypted_mode() {
+        let ops_owned = [
+            SyncOp::Write { path: "secret-name.txt".into(), content: wc(b"") },
+            SyncOp::Delete { path: "other/secret.doc".into() },
+        ];
+        let ops: Vec<&SyncOp> = ops_owned.iter().collect();
+        // Encrypted repo: cleartext queue paths must NOT leak into the
+        // (unencrypted) commit message.
+        let m = build_commit_message(&ops, true);
+        assert_eq!(m, "drive-sync: 2 changes");
     }
 
     #[test]
@@ -2161,8 +2299,67 @@ mod tests {
             })
             .collect();
         let ops: Vec<&SyncOp> = ops_owned.iter().collect();
-        let m = build_commit_message(&ops);
+        let m = build_commit_message(&ops, false);
         assert!(m.contains("5 changes"), "{}", m);
         assert!(m.contains("+2 more"), "{}", m);
+    }
+
+    #[test]
+    fn migration_rewrites_pre_threshold_long_components_to_dslong() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let c = crate::crypt::Crypto::from_master_key(&[9u8; 32]);
+
+        // Fabricate an OLD-FORMAT worktree entry: a directly-encoded (valid
+        // base32) component ABOVE the threshold, holding sealed content —
+        // exactly what the pre-threshold binary wrote for medium-length names.
+        let clear_name = "wordpress-uploads-backup-guard.jpg"; // 34 bytes -> ~119 encoded
+        let old_disk = c.enc_component_unbounded(clear_name);
+        assert!(old_disk.len() > crate::crypt::LONG_NAME_THRESHOLD);
+        std::fs::write(repo.join(&old_disk), c.seal(b"payload")).unwrap();
+
+        // An already-conforming short entry must be left alone.
+        let short = c.enc_path("ok.txt");
+        std::fs::write(repo.join(&short), c.seal(b"fine")).unwrap();
+
+        let converted = migrate_worktree_to_encrypted(repo, &c);
+        assert_eq!(converted, 1, "only the over-threshold entry migrates");
+
+        // Old entry is gone; its dslong replacement + sidecar exist.
+        assert!(!repo.join(&old_disk).exists());
+        let e = c.enc_component(clear_name);
+        assert!(e.disk.starts_with(crate::crypt::LONG_NAME_PREFIX));
+        let new_full = repo.join(&e.disk);
+        assert!(new_full.exists(), "dslong replacement must exist");
+        let sc = repo.join(crate::crypt::sidecar_name(&e.disk));
+        assert!(sc.exists(), "sidecar must exist");
+        assert_eq!(
+            c.dec_long(&e.disk, &std::fs::read_to_string(&sc).unwrap()).unwrap(),
+            clear_name
+        );
+        // Content untouched (rename, not re-seal).
+        assert_eq!(c.open(&std::fs::read(&new_full).unwrap()).unwrap(), b"payload");
+
+        // Idempotent: second pass converts nothing.
+        assert_eq!(migrate_worktree_to_encrypted(repo, &c), 0);
+    }
+
+    #[test]
+    fn canonicalize_preserves_dslong_parents_verbatim() {
+        let c = crate::crypt::Crypto::from_master_key(&[9u8; 32]);
+        // A path whose parent is ALREADY a hashed entry and whose leaf is an
+        // old-format over-threshold component: the parent must pass through
+        // untouched (re-encrypting the literal hash would corrupt the entry).
+        let parent = c.enc_component(&"p".repeat(40)).disk;
+        assert!(parent.starts_with(crate::crypt::LONG_NAME_PREFIX));
+        let leaf_old = c.enc_component_unbounded("some-medium-name.txt");
+        let (new_rel, sidecars) =
+            canonicalize_disk_path(&c, &format!("{}/{}", parent, leaf_old));
+        let mut parts = new_rel.split('/');
+        assert_eq!(parts.next().unwrap(), parent, "dslong parent untouched");
+        let new_leaf = parts.next().unwrap();
+        assert!(new_leaf.starts_with(crate::crypt::LONG_NAME_PREFIX));
+        assert_eq!(sidecars.len(), 1);
+        assert!(sidecars[0].0.starts_with(&format!("{}/", parent)));
     }
 }

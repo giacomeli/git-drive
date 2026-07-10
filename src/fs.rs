@@ -945,8 +945,16 @@ impl GitDriveFS {
         let raw = self.apply_read(ino, 0, usize::MAX)?;
         if let Some(c) = &self.crypto {
             // The on-disk target is encrypted per component; the view is clear.
+            // Hashed (`dslong_`) components resolve through their worktree
+            // sidecars (present whenever the target path exists on the drive);
+            // a dangling target with an unknown hash stays literal.
             let s = String::from_utf8_lossy(&raw);
-            return Ok(c.dec_path(&s).into_bytes());
+            return Ok(crate::sync::dec_disk_path_with_worktree_sidecars(
+                c,
+                std::path::Path::new(&self.repo_path),
+                &s,
+            )
+            .into_bytes());
         }
         Ok(raw)
     }
@@ -2953,6 +2961,7 @@ fn leaf_name(path: &str) -> &str {
         None => path,
     }
 }
+
 
 #[cfg(test)]
 mod tests {

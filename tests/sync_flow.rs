@@ -1142,9 +1142,11 @@ async fn encrypted_drain_commits_no_plaintext_names_or_content() {
     let meta = std::fs::symlink_metadata(test.dir.path().join(&link_rel)).unwrap();
     assert!(meta.file_type().is_symlink());
     let target = std::fs::read_link(test.dir.path().join(&link_rel)).unwrap();
+    // The on-disk target is the canonical encrypted path of the clear target
+    // (hashed components resolve through their sidecars on the FUSE side).
     assert_eq!(
-        crypto.dec_path(&target.to_string_lossy()),
-        "Pasta Pessoal/segredo.txt"
+        target.to_string_lossy(),
+        crypto.enc_path("Pasta Pessoal/segredo.txt")
     );
 }
 

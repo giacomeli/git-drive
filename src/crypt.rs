@@ -20,12 +20,22 @@ pub const CONTENT_MAGIC: &[u8] = b"drive-sync-encrypted v1\n";
 
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
-/// Filesystem limit for a single name component.
-const NAME_COMPONENT_MAX: usize = 255;
+/// Maximum length of an encrypted component ON DISK before it collapses into
+/// a hashed `dslong_` entry. The binding limit is NOT the per-component
+/// NAME_MAX (255): it is macOS's PATH_MAX of 1024 bytes for the FULL path.
+/// Every encrypted component costs at least ~66 chars
+/// (base32 of nonce 24 + tag 16 + name), so a deep tree blows past 1024 even
+/// with all components under 255 — the 2026-07-10 incident: the Mac replica
+/// could not check out the Arch backup ("File name too long" on an ~900-char
+/// path). At 80, components of cleartext names up to 10 bytes stay direct and
+/// anything longer becomes a fixed 39-char `dslong_` (SHORTER than its direct
+/// form), giving a worst case of ~81 bytes per level — realistic trees fit
+/// comfortably; hashed-heavy deep trees cost ~40 per level.
+pub const LONG_NAME_THRESHOLD: usize = 80;
 /// Conflicted-copy suffix applied by the pull on top of the ENCRYPTED name.
 const CONFLICT_MARKER: &str = ".conflict-";
 /// Prefix of a hashed long-name entry: used when the base32 encrypted name
-/// would exceed `NAME_COMPONENT_MAX`. The full encrypted name is stored in a
+/// would exceed `LONG_NAME_THRESHOLD`. The full encrypted name is stored in a
 /// sidecar `<disk>.name`. The prefix contains `_`, which is outside the base32
 /// alphabet, so it can never collide with a normal encrypted component and is
 /// safe on case-insensitive filesystems (APFS).
@@ -67,7 +77,7 @@ impl std::fmt::Display for CryptError {
 /// One encrypted path component as it should exist on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncName {
-    /// Name to use on disk. Always `<= NAME_COMPONENT_MAX` bytes.
+    /// Name to use on disk. Always `<= LONG_NAME_THRESHOLD` bytes.
     pub disk: String,
     /// When the encoded name overflowed the component limit: the full base32
     /// encrypted name, to be written into the sidecar `<disk>.name`. `None`
@@ -163,22 +173,14 @@ impl Crypto {
 
     /// Encrypts a name component: deterministic AEAD + lowercase base32.
     ///
-    /// Never fails on length: when the encoded name would exceed the 255-byte
-    /// component limit, the on-disk name becomes a bounded hash
+    /// Never fails on length: when the encoded name would exceed
+    /// `LONG_NAME_THRESHOLD`, the on-disk name becomes a bounded hash
     /// (`dslong_<hash>`) and the full encrypted name is returned as a sidecar,
-    /// so no file is ever dropped or written in cleartext.
+    /// so no file is ever dropped or written in cleartext — and the full path
+    /// stays within macOS's 1024-byte PATH_MAX for realistic tree depths.
     pub fn enc_component(&self, clear: &str) -> EncName {
-        let plaintext = clear.as_bytes();
-        let nonce = Self::derive_nonce(&self.name_nonce_key, plaintext);
-        let ct = self
-            .name_cipher
-            .encrypt(XNonce::from_slice(&nonce), plaintext)
-            .expect("aead encrypt does not fail with valid params");
-        let mut raw = Vec::with_capacity(NONCE_LEN + ct.len());
-        raw.extend_from_slice(&nonce);
-        raw.extend_from_slice(&ct);
-        let encoded = base32_encode(&raw);
-        if encoded.len() > NAME_COMPONENT_MAX {
+        let encoded = self.enc_component_unbounded(clear);
+        if encoded.len() > LONG_NAME_THRESHOLD {
             EncName {
                 disk: self.long_disk_name(&encoded),
                 sidecar: Some(encoded),
@@ -189,6 +191,22 @@ impl Crypto {
                 sidecar: None,
             }
         }
+    }
+
+    /// Raw encrypted+encoded form of a component, WITHOUT the length bound.
+    /// Internal to `enc_component`; also used by the migration tests to
+    /// fabricate pre-threshold ("old format") worktree entries.
+    pub(crate) fn enc_component_unbounded(&self, clear: &str) -> String {
+        let plaintext = clear.as_bytes();
+        let nonce = Self::derive_nonce(&self.name_nonce_key, plaintext);
+        let ct = self
+            .name_cipher
+            .encrypt(XNonce::from_slice(&nonce), plaintext)
+            .expect("aead encrypt does not fail with valid params");
+        let mut raw = Vec::with_capacity(NONCE_LEN + ct.len());
+        raw.extend_from_slice(&nonce);
+        raw.extend_from_slice(&ct);
+        base32_encode(&raw)
     }
 
     /// Deterministic bounded on-disk name for an over-long encoded component:
@@ -208,7 +226,7 @@ impl Crypto {
 
     /// Encrypts one component, preserving a trailing conflicted-copy suffix
     /// (`.conflict-...`) applied on top of the encrypted name.
-    fn enc_component_keep_conflict(&self, other: &str) -> EncName {
+    pub(crate) fn enc_component_keep_conflict(&self, other: &str) -> EncName {
         if let Some(idx) = other.find(CONFLICT_MARKER) {
             let (prefix, suffix) = other.split_at(idx);
             let e = self.enc_component(prefix);
@@ -514,10 +532,13 @@ mod tests {
     #[test]
     fn name_component_roundtrip_and_determinism() {
         let c = crypto();
-        let enc = c.enc_component("Résumé Café.pdf").disk;
-        assert_eq!(enc, c.enc_component("Résumé Café.pdf").disk);
-        assert!(c.enc_component("Résumé Café.pdf").sidecar.is_none());
-        assert_eq!(c.dec_component(&enc).unwrap(), "Résumé Café.pdf");
+        // "Café.pdf" is 9 UTF-8 bytes — within the 10-byte direct budget of
+        // LONG_NAME_THRESHOLD (longer names go through the dslong sidecar,
+        // covered by the medium/long tests).
+        let enc = c.enc_component("Café.pdf").disk;
+        assert_eq!(enc, c.enc_component("Café.pdf").disk);
+        assert!(c.enc_component("Café.pdf").sidecar.is_none());
+        assert_eq!(c.dec_component(&enc).unwrap(), "Café.pdf");
         // Only lowercase letters and digits from the base32 alphabet (APFS-safe)
         assert!(enc.bytes().all(|b| BASE32_ALPHABET.contains(&b)));
         // Wrong key does not decrypt
@@ -527,9 +548,9 @@ mod tests {
     #[test]
     fn path_roundtrip_preserves_hierarchy() {
         let c = crypto();
-        let enc = c.enc_path("docs/2026/Résumé.pdf");
+        let enc = c.enc_path("docs/2026/Nota.pdf");
         assert_eq!(enc.matches('/').count(), 2, "1:1 hierarchy");
-        assert_eq!(c.dec_path(&enc), "docs/2026/Résumé.pdf");
+        assert_eq!(c.dec_path(&enc), "docs/2026/Nota.pdf");
     }
 
     #[test]
@@ -557,7 +578,7 @@ mod tests {
         let long = "a".repeat(200);
         let e = c.enc_component(&long);
         assert!(e.disk.starts_with(LONG_NAME_PREFIX), "disk: {}", e.disk);
-        assert!(e.disk.len() <= NAME_COMPONENT_MAX);
+        assert!(e.disk.len() <= LONG_NAME_THRESHOLD);
         let sidecar = e.sidecar.expect("long name must carry a sidecar");
         // The sidecar content is the full encrypted name; it round-trips.
         assert_eq!(c.dec_component(&sidecar).unwrap(), long);
@@ -567,10 +588,47 @@ mod tests {
         assert_eq!(e2.disk, e.disk);
         assert_eq!(e2.sidecar.as_deref(), Some(sidecar.as_str()));
 
-        // A name within the inline limit does NOT use a sidecar.
-        let ok = c.enc_component(&"b".repeat(110));
+        // A name within the inline threshold (cleartext <= 10 bytes at
+        // LONG_NAME_THRESHOLD = 80) does NOT use a sidecar.
+        let ok = c.enc_component(&"b".repeat(10));
         assert!(ok.sidecar.is_none());
         assert!(!ok.disk.starts_with(LONG_NAME_PREFIX));
+    }
+
+    #[test]
+    fn medium_name_over_threshold_gets_sidecar_and_stays_bounded() {
+        let c = crypto();
+        // 30 cleartext bytes encode to ~112 chars — under NAME_MAX (255) but
+        // over LONG_NAME_THRESHOLD: must collapse to a bounded dslong entry
+        // (macOS PATH_MAX regression guard, 2026-07-10).
+        let medium = "m".repeat(30);
+        let e = c.enc_component(&medium);
+        assert!(e.disk.starts_with(LONG_NAME_PREFIX), "disk: {}", e.disk);
+        assert!(e.disk.len() <= LONG_NAME_THRESHOLD);
+        let sidecar = e.sidecar.expect("over-threshold name carries a sidecar");
+        assert_eq!(c.dec_long(&e.disk, &sidecar).unwrap(), medium);
+    }
+
+    #[test]
+    fn every_component_of_deep_path_stays_within_threshold() {
+        let c = crypto();
+        // 12 levels of realistic wordpress-ish names: no disk component may
+        // exceed the threshold, or deep trees blow past macOS PATH_MAX (1024).
+        let clear = (0..12)
+            .map(|i| format!("wp-content-uploads-backup-{i}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let disk = c.enc_path(&clear);
+        for comp in disk.split('/') {
+            assert!(
+                comp.len() <= LONG_NAME_THRESHOLD,
+                "component too long ({}): {}",
+                comp.len(),
+                comp
+            );
+        }
+        // Full relative path fits macOS PATH_MAX with a generous prefix.
+        assert!(disk.len() + 100 < 1024, "path too long: {}", disk.len());
     }
 
     #[test]
