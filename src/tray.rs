@@ -102,26 +102,48 @@ pub fn evaluate(
     (state, lines)
 }
 
-/// Filled circle with simple antialiasing, for `Icon::from_rgba`.
+/// Folder silhouette (represents the mounted drive folder) tinted by the status
+/// color, for `Icon::from_rgba`. A single flat color keeps the status readable
+/// at a glance; 3x3 supersampling softens the edges. The status color (green /
+/// orange / red / gray) still carries the state — only the shape changed from a
+/// plain dot to a folder, so the icon reads as "the drive" instead of a generic
+/// indicator.
 fn icon_rgba(color: [u8; 4], size: u32) -> Vec<u8> {
+    let s = size as f32;
+    // Folder = a narrow tab over a wider body, in normalized 0..1 coordinates.
+    let inside = |u: f32, v: f32| -> bool {
+        let tab = (0.14..=0.50).contains(&u) && (0.30..=0.44).contains(&v);
+        let body = (0.14..=0.86).contains(&u) && (0.42..=0.74).contains(&v);
+        tab || body
+    };
     let mut out = Vec::with_capacity((size * size * 4) as usize);
-    let center = (size as f32 - 1.0) / 2.0;
-    let radius = size as f32 * 0.38;
     for y in 0..size {
         for x in 0..size {
-            let dx = x as f32 - center;
-            let dy = y as f32 - center;
-            let dist = (dx * dx + dy * dy).sqrt();
-            let alpha = ((radius + 0.8 - dist) / 1.6).clamp(0.0, 1.0);
-            out.extend_from_slice(&[
-                color[0],
-                color[1],
-                color[2],
-                (color[3] as f32 * alpha) as u8,
-            ]);
+            let mut cov = 0u32;
+            for sy in 0..3 {
+                for sx in 0..3 {
+                    let u = (x as f32 + (sx as f32 + 0.5) / 3.0) / s;
+                    let v = (y as f32 + (sy as f32 + 0.5) / 3.0) / s;
+                    if inside(u, v) {
+                        cov += 1;
+                    }
+                }
+            }
+            let alpha = color[3] as f32 * (cov as f32 / 9.0);
+            out.extend_from_slice(&[color[0], color[1], color[2], alpha as u8]);
         }
     }
     out
+}
+
+/// Version + build identifier of the running binary, for the tray menu.
+/// `DRIVE_SYNC_BUILD` is injected by `build.rs`.
+fn build_line() -> String {
+    format!(
+        "build v{} · {}",
+        env!("CARGO_PKG_VERSION"),
+        env!("DRIVE_SYNC_BUILD")
+    )
 }
 
 fn make_icon(state: TrayState) -> Icon {
@@ -173,6 +195,7 @@ pub fn run(status_path: PathBuf) -> anyhow::Result<()> {
 
     // Menu: summary lines (disabled) + actions.
     let header = MenuItem::new("drive-sync", false, None);
+    let build = MenuItem::new(build_line(), false, None);
     let line1 = MenuItem::new("loading status...", false, None);
     let line2 = MenuItem::new("", false, None);
     let line3 = MenuItem::new("", false, None);
@@ -183,6 +206,7 @@ pub fn run(status_path: PathBuf) -> anyhow::Result<()> {
     let menu = Menu::new();
     menu.append_items(&[
         &header,
+        &build,
         &line1,
         &line2,
         &line3,

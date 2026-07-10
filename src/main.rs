@@ -427,56 +427,109 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
 /// fails and gets `umount -f`; a healthy mount means another live instance,
 /// and the boot aborts with a clear error instead of fighting over the
 /// mountpoint.
+/// Prepares the mount point before mounting.
+///
+/// A hard crash (kill -9, OOM, power loss) does not run the ordered unmount and
+/// leaves a **zombie** FUSE mount: the path still shows in the mount table but
+/// every access returns ENOTCONN. `create_dir_all` on such a path fails with
+/// `EEXIST` (mkdir reports it exists, then the is-directory check errors out),
+/// so the zombie must be cleared BEFORE we touch the directory — otherwise the
+/// daemon crash-loops on "File exists" and never self-recovers, defeating the
+/// very recovery this function is meant to provide.
 fn prepare_mountpoint(mount: &str) -> anyhow::Result<()> {
+    clear_stale_mount(mount)?;
     std::fs::create_dir_all(mount)?;
+    Ok(())
+}
+
+/// True if the `mount` command output lists a filesystem mounted at `path`.
+/// Handles both formats — macOS `"<dev> on <path> (<opts>)"` and Linux
+/// `"<dev> on <path> type <fs> (<opts>)"` — by anchoring on `" on <path> "`.
+/// The trailing space avoids matching a longer sibling path (`/mnt` vs `/mnt2`).
+fn mount_line_present(table: &str, canonical: &str, raw: &str) -> bool {
+    let hit = |p: &str| {
+        let needle = format!(" on {p} ");
+        table.lines().any(|l| l.contains(&needle))
+    };
+    hit(canonical) || hit(raw)
+}
+
+/// Handles a mount already sitting at `mount`: a healthy one aborts the boot
+/// (another daemon owns it); a zombie (crash leftover, inaccessible) is forced
+/// down so the boot can proceed. Runs BEFORE `create_dir_all` — see
+/// [`prepare_mountpoint`].
+fn clear_stale_mount(mount: &str) -> anyhow::Result<()> {
+    // canonicalize fails on a zombie mount, so fall back to the raw path.
     let canonical = std::fs::canonicalize(mount)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| mount.to_string());
 
     let table = std::process::Command::new("mount").output()?;
-    let needle = format!(" on {} (", canonical);
-    let listed = String::from_utf8_lossy(&table.stdout)
-        .lines()
-        .any(|l| l.contains(&needle));
-    if !listed {
+    let table = String::from_utf8_lossy(&table.stdout);
+    if !mount_line_present(&table, &canonical, mount) {
         return Ok(());
     }
 
-    match std::fs::read_dir(&canonical) {
-        Ok(_) => anyhow::bail!(
+    // Listed in the mount table: readable => healthy (leave it, abort the boot);
+    // inaccessible => zombie (force it down).
+    if std::fs::read_dir(&canonical)
+        .or_else(|_| std::fs::read_dir(mount))
+        .is_ok()
+    {
+        anyhow::bail!(
             "a healthy volume is already mounted at {} — stop the other daemon or unmount it first",
             canonical
-        ),
-        Err(e) => {
-            log::warn!(
-                "boot: zombie mount detected at {} ({}) — forcing unmount",
-                canonical,
-                e
+        );
+    }
+
+    log::warn!("boot: zombie mount detected at {canonical} — forcing unmount");
+    // Linux: user FUSE mounts come down with fusermount3 -u (plain umount needs
+    // root); macOS uses umount -f. Both best-effort.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = std::process::Command::new("fusermount3")
+            .arg("-u")
+            .arg(mount)
+            .status();
+    }
+    let _ = std::process::Command::new("umount")
+        .arg("-f")
+        .arg(mount)
+        .status();
+    // Give the kernel a moment to release the mountpoint before create_dir_all.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Still inaccessible AND still listed => the unmount did not take; surface an
+    // actionable message instead of the cryptic "File exists" from create_dir_all.
+    if std::fs::metadata(mount).is_err() {
+        let table = std::process::Command::new("mount").output()?;
+        let table = String::from_utf8_lossy(&table.stdout);
+        if mount_line_present(&table, &canonical, mount) {
+            anyhow::bail!(
+                "could not clear the zombie mount at {mount} — run `fusermount3 -u {mount}` (Linux) or `umount -f {mount}` (macOS) manually"
             );
-            // Linux: user FUSE mounts are unmounted via fusermount3 -u;
-            // plain `umount` usually requires root.
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = std::process::Command::new("fusermount3")
-                    .arg("-u")
-                    .arg(&canonical)
-                    .status();
-            }
-            let status = std::process::Command::new("umount")
-                .arg("-f")
-                .arg(&canonical)
-                .status()?;
-            if !status.success() {
-                anyhow::bail!(
-                    "could not unmount the zombie mount at {} — run `umount -f {}` manually",
-                    canonical,
-                    canonical
-                );
-            }
-            // Give the kernel a moment to release the mountpoint.
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            Ok(())
         }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod mount_tests {
+    use super::mount_line_present;
+
+    #[test]
+    fn matches_macos_and_linux_and_rejects_prefixes() {
+        let linux = "gitdrive on /home/j/GitDrive type fuse (rw,nosuid,nodev)";
+        let macos = "gitdrive on /Users/j/GitDrive (macfuse, local, nodev)";
+        assert!(mount_line_present(linux, "/home/j/GitDrive", "/home/j/GitDrive"));
+        assert!(mount_line_present(macos, "/Users/j/GitDrive", "/Users/j/GitDrive"));
+        // a longer sibling path must not match
+        assert!(!mount_line_present(
+            linux,
+            "/home/j/GitDrive2",
+            "/home/j/GitDrive2"
+        ));
+        assert!(!mount_line_present("", "/x", "/x"));
     }
 }
 
