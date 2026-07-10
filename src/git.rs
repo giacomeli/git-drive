@@ -285,17 +285,34 @@ pub fn push_progressive(
         }
     }
 
-    // Missing commits, oldest first, along the first-parent chain (merge
-    // commits ride with their first parent; the second parent's history is
-    // already on the remote or comes inside that single pack).
-    let mut walk = repo.revwalk()?;
-    walk.push(local_tip)?;
-    if let Some(tip) = remote_tip {
-        walk.hide(tip)?;
+    // Pushable steps: the first-parent chain from the local tip down, KEEPING
+    // ONLY commits that descend from the remote tip — each push is then a
+    // fast-forward by construction. Below a merge that incorporated the
+    // remote tip, the first-parent line continues into the OTHER lineage
+    // (e.g. this machine's pre-merge history): those commits do NOT descend
+    // from the remote tip, and pushing one would rewind the branch — the
+    // 2026-07-10 NotFastForward on the Mac replica's convergence merge. They
+    // ride inside the merge commit's own pack instead.
+    let mut commits: Vec<git2::Oid> = Vec::new();
+    let mut cur = local_tip;
+    loop {
+        if remote_tip == Some(cur) {
+            break;
+        }
+        let descends = match remote_tip {
+            Some(tip) => repo.graph_descendant_of(cur, tip)?,
+            None => true, // empty remote: the whole root lineage fast-forwards
+        };
+        if !descends {
+            break;
+        }
+        commits.push(cur);
+        match repo.find_commit(cur)?.parent_id(0) {
+            Ok(parent) => cur = parent,
+            Err(_) => break, // root commit reached
+        }
     }
-    walk.simplify_first_parent()?;
-    walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
-    let commits: Vec<git2::Oid> = walk.collect::<Result<_, _>>()?;
+    commits.reverse();
     let total = commits.len();
 
     for (i, oid) in commits.iter().enumerate() {
@@ -980,6 +997,74 @@ mod tests {
                 .refname_to_id(&format!("refs/heads/{}", branch))
                 .unwrap(),
             repo.refname_to_id(&format!("refs/heads/{}", branch))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn push_progressive_after_merge_pushes_only_descendants_of_remote_tip() {
+        // Machine A and the remote share `base`; B moves the remote; A has its
+        // own lineage, fetches and MERGES. The catch-up must start at the
+        // merge commit (the only pushable step): the first-parent chain below
+        // it runs into A's pre-merge lineage, which does NOT descend from the
+        // remote tip — pushing it would rewind the branch (NotFastForward,
+        // 2026-07-10 Mac replica incident).
+        let (_local_a, repo_a, bare) = setup_local_with_bare_remote();
+        let branch = current_branch_name(&repo_a).unwrap();
+
+        // B pushes b1.
+        let dir_b = tempdir().unwrap();
+        let repo_b = Repository::clone(
+            &format!("file://{}", bare.path().to_str().unwrap()),
+            dir_b.path(),
+        )
+        .unwrap();
+        {
+            let mut cfg = repo_b.config().unwrap();
+            cfg.set_str("user.name", "Bob").unwrap();
+            cfg.set_str("user.email", "b@x.com").unwrap();
+        }
+        commit_file(&repo_b, "from_b.txt", b"b");
+        push_to_remote(&repo_b, &branch, "origin", None).unwrap();
+
+        // A diverges with two local commits, fetches and merges b1.
+        commit_file(&repo_a, "a1.txt", b"1");
+        commit_file(&repo_a, "a2.txt", b"2");
+        fetch_remote(&repo_a, &branch, "origin", None).unwrap();
+        let remote_ref = repo_a
+            .find_reference(&format!("refs/remotes/origin/{}", branch))
+            .unwrap();
+        let theirs = remote_ref.peel_to_commit().unwrap();
+        let ours = repo_a.head().unwrap().peel_to_commit().unwrap();
+        let mut index = repo_a
+            .merge_commits(&ours, &theirs, None)
+            .expect("3-way merge");
+        assert!(!index.has_conflicts());
+        let tree_id = index.write_tree_to(&repo_a).unwrap();
+        let tree = repo_a.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Alice", "a@x.com").unwrap();
+        repo_a
+            .commit(Some("HEAD"), &sig, &sig, "merge", &tree, &[&ours, &theirs])
+            .unwrap();
+
+        // Only the merge commit is pushable — and it fast-forwards the remote
+        // to the local tip in a single step.
+        let events = std::cell::RefCell::new(Vec::new());
+        let n = push_progressive(&repo_a, &branch, "origin", None, &|ev| {
+            if let PushProgress::CommitPushed { done, total } = ev {
+                events.borrow_mut().push((done, total));
+            }
+        })
+        .unwrap();
+        assert_eq!(n, 1, "the merge is the single pushable step");
+        assert_eq!(*events.borrow(), vec![(1, 1)]);
+        let bare_repo = Repository::open(bare.path()).unwrap();
+        assert_eq!(
+            bare_repo
+                .refname_to_id(&format!("refs/heads/{}", branch))
+                .unwrap(),
+            repo_a
+                .refname_to_id(&format!("refs/heads/{}", branch))
                 .unwrap()
         );
     }
