@@ -494,6 +494,15 @@ fn clear_stale_mount(mount: &str) -> anyhow::Result<()> {
             .arg("-u")
             .arg(mount)
             .status();
+        // A desktop app (e.g. the file manager used for a copy) often still
+        // holds an fd inside the dead mount — the plain unmount fails with
+        // EBUSY and the daemon would crash-loop on boot (2026-07-10 incident:
+        // nautilus held the zombie). Lazy unmount detaches the mountpoint now
+        // and lets the kernel reap it when the holder lets go.
+        let _ = std::process::Command::new("fusermount3")
+            .arg("-uz")
+            .arg(mount)
+            .status();
     }
     let _ = std::process::Command::new("umount")
         .arg("-f")
