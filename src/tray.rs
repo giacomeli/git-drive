@@ -111,9 +111,12 @@ pub fn evaluate(
 fn icon_rgba(color: [u8; 4], size: u32) -> Vec<u8> {
     let s = size as f32;
     // Folder = a narrow tab over a wider body, in normalized 0..1 coordinates.
+    // Sized to fill the canvas (~72% wide, ~64% tall) and centered on both axes
+    // so it reads at menu-bar scale like the neighboring icons instead of a tiny
+    // glyph floating in the middle.
     let inside = |u: f32, v: f32| -> bool {
-        let tab = (0.14..=0.50).contains(&u) && (0.30..=0.44).contains(&v);
-        let body = (0.14..=0.86).contains(&u) && (0.42..=0.74).contains(&v);
+        let tab = (0.14..=0.48).contains(&u) && (0.18..=0.34).contains(&v);
+        let body = (0.14..=0.86).contains(&u) && (0.30..=0.82).contains(&v);
         tab || body
     };
     let mut out = Vec::with_capacity((size * size * 4) as usize);
