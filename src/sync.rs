@@ -99,6 +99,10 @@ pub struct SyncManager {
     chunk_threshold_bytes: Arc<AtomicU64>,
     /// Size of each chunk, in bytes.
     chunk_size_bytes: Arc<AtomicU64>,
+    /// Maximum content bytes per drain batch: the queue is split into
+    /// size-bounded batches, each one its own commit, published one by one
+    /// (bounded push packs). 0 = whole drain in a single commit.
+    commit_batch_bytes: Arc<AtomicU64>,
     /// Encryption at rest (Phase 2.7): `Some` = encrypted repo.
     crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
     /// Key available ONLY for the migration back to cleartext (config turned
@@ -199,6 +203,7 @@ impl SyncManager {
             notifier: Arc::new(Notifier::new()),
             chunk_threshold_bytes: Arc::new(AtomicU64::new(95 * 1024 * 1024)),
             chunk_size_bytes: Arc::new(AtomicU64::new(80 * 1024 * 1024)),
+            commit_batch_bytes: Arc::new(AtomicU64::new(256 * 1024 * 1024)),
             crypto: Arc::new(Mutex::new(None)),
             migration_crypto: Arc::new(Mutex::new(None)),
         };
@@ -254,6 +259,12 @@ impl SyncManager {
             .store(chunk_size_bytes.max(1), Ordering::SeqCst);
     }
 
+    /// Configures the drain batch limit in bytes (0 = single batch).
+    /// Post-construction setter, like `set_chunking`.
+    pub fn set_batching(&self, batch_bytes: u64) {
+        self.commit_batch_bytes.store(batch_bytes, Ordering::SeqCst);
+    }
+
     /// Snapshot of the shared fields of the drain cycle.
     fn drain_ctx(&self) -> DrainCtx {
         DrainCtx {
@@ -271,6 +282,7 @@ impl SyncManager {
             notifier: self.notifier.clone(),
             chunk_threshold_bytes: self.chunk_threshold_bytes.clone(),
             chunk_size_bytes: self.chunk_size_bytes.clone(),
+            commit_batch_bytes: self.commit_batch_bytes.clone(),
             crypto: self.crypto.clone(),
             migration_crypto: self.migration_crypto.clone(),
         }
@@ -554,6 +566,7 @@ struct DrainCtx {
     notifier: Arc<Notifier>,
     chunk_threshold_bytes: Arc<AtomicU64>,
     chunk_size_bytes: Arc<AtomicU64>,
+    commit_batch_bytes: Arc<AtomicU64>,
     crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
     migration_crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
 }
@@ -567,82 +580,138 @@ impl DrainCtx {
         let migration_crypto = self.migration_crypto.lock().clone();
         let chunk_threshold = self.chunk_threshold_bytes.load(Ordering::SeqCst);
         let chunk_size = self.chunk_size_bytes.load(Ordering::SeqCst).max(1);
-        // Apply in arrival order — the queue is already causal. With
-        // encryption, the cleartext->encrypted translation of paths and
-        // content happens HERE (the FUSE layer and the queue work 100% in
-        // cleartext).
-        let ops: Vec<&SyncOp> = changes.iter().collect();
-        for op in &ops {
-            apply_op_to_disk(&self.repo_path, op, crypto.as_deref(), chunk_threshold);
-        }
-        // Chunking (Phase 2.6): the sweep converts ANY raw file above the
-        // threshold — with encryption, each chunk is sealed and the hash is
-        // over the ciphertext. Invariant: no raw blob above the threshold is
-        // staged. Afterwards, the state migrations (Phase 2.7) conform the
-        // worktree to the config; the GC removes orphan chunks last.
-        let mut converted = 0usize;
-        if chunk_threshold > 0 {
-            converted += convert_oversized_worktree_files(
-                &self.repo_path,
-                chunk_threshold,
-                chunk_size,
-                crypto.as_deref(),
+        let batch_limit = self.commit_batch_bytes.load(Ordering::SeqCst);
+
+        // Phase A (local durability first): the causal queue is split into
+        // size-bounded batches, each applied and committed on its own — a mass
+        // copy becomes N bounded commits instead of one giant one (the 24 GB
+        // single-pack push is what GitHub aborted in the 2026-07-10 incident).
+        // Consuming batch by batch also drops each batch's content `Arc`s right
+        // after its commit, so the RAM peak is ~one batch, not the whole queue.
+        let total_ops = changes.len();
+        let batches = split_batches(changes, batch_limit);
+        let n_batches = batches.len();
+        if n_batches > 1 {
+            log::info!(
+                "drain: {} op(s) split into {} batch(es) of up to {} MB",
+                total_ops,
+                n_batches,
+                batch_limit / (1024 * 1024)
             );
         }
-        if let Some(c) = crypto.as_deref() {
-            let migrated = migrate_worktree_to_encrypted(&self.repo_path, c);
-            if migrated > 0 {
-                log::warn!(
-                    "crypto: {} item(s) migrated to encrypted. WARNING: the PREVIOUS Git history remains in cleartext on the remote — for a public repo, prefer starting from a fresh repo",
-                    migrated
+        let mut last_commit: Option<git2::Oid> = None;
+        let mut commits_created = 0usize;
+        for (i, batch) in batches.into_iter().enumerate() {
+            // Apply in arrival order — the queue is already causal. With
+            // encryption, the cleartext->encrypted translation of paths and
+            // content happens HERE (the FUSE layer and the queue work 100% in
+            // cleartext).
+            let ops: Vec<&SyncOp> = batch.iter().collect();
+            for op in &ops {
+                apply_op_to_disk(&self.repo_path, op, crypto.as_deref(), chunk_threshold);
+            }
+            // Chunking (Phase 2.6): the sweep converts ANY raw file above the
+            // threshold — with encryption, each chunk is sealed and the hash
+            // is over the ciphertext. Invariant: no raw blob above the
+            // threshold is staged (per batch: no batch commit may contain an
+            // oversized raw blob). Then the state migrations (Phase 2.7)
+            // conform the worktree; the GC removes orphan chunks last.
+            let mut converted = 0usize;
+            if chunk_threshold > 0 {
+                converted += convert_oversized_worktree_files(
+                    &self.repo_path,
+                    chunk_threshold,
+                    chunk_size,
+                    crypto.as_deref(),
                 );
             }
-            converted += migrated;
-        } else if let Some(mk) = migration_crypto.as_deref() {
-            let migrated = migrate_worktree_to_clear(&self.repo_path, mk);
-            if migrated > 0 {
-                log::info!(
-                    "crypto: {} item(s) decrypted back to cleartext",
-                    migrated
-                );
-                if chunk_threshold > 0 {
-                    converted += convert_oversized_worktree_files(
-                        &self.repo_path,
-                        chunk_threshold,
-                        chunk_size,
-                        None,
+            if let Some(c) = crypto.as_deref() {
+                let migrated = migrate_worktree_to_encrypted(&self.repo_path, c);
+                if migrated > 0 {
+                    log::warn!(
+                        "crypto: {} item(s) migrated to encrypted. WARNING: the PREVIOUS Git history remains in cleartext on the remote — for a public repo, prefer starting from a fresh repo",
+                        migrated
                     );
                 }
+                converted += migrated;
+            } else if let Some(mk) = migration_crypto.as_deref() {
+                let migrated = migrate_worktree_to_clear(&self.repo_path, mk);
+                if migrated > 0 {
+                    log::info!(
+                        "crypto: {} item(s) decrypted back to cleartext",
+                        migrated
+                    );
+                    if chunk_threshold > 0 {
+                        converted += convert_oversized_worktree_files(
+                            &self.repo_path,
+                            chunk_threshold,
+                            chunk_size,
+                            None,
+                        );
+                    }
+                }
+                converted += migrated;
             }
-            converted += migrated;
-        }
-        if chunk_threshold > 0 {
-            gc_orphan_chunks(
+            if chunk_threshold > 0 {
+                gc_orphan_chunks(
+                    &self.repo_path,
+                    crypto.as_deref().or(migration_crypto.as_deref()),
+                );
+            }
+            let commit_oid = commit_batch(
                 &self.repo_path,
-                crypto.as_deref().or(migration_crypto.as_deref()),
+                &self.branch,
+                &self.user_name,
+                &self.user_email,
+                &ops,
             );
-        }
-        let commit_oid = commit_batch(
-            &self.repo_path,
-            &self.branch,
-            &self.user_name,
-            &self.user_email,
-            &ops,
-        );
-        let mut pushed: Option<bool> = None;
-        if let Some(_oid) = commit_oid {
-            self.commit_generation.fetch_add(1, Ordering::SeqCst);
-            // The sweep's conversion creates new paths in HEAD that the FUSE
-            // index may not know about (file arrived from outside the mount)
-            // — without the refresh, the file would stay invisible in the
-            // drive until a real pull (zip migration incident, 2026-07-03).
-            // Flag AFTER the commit: a rebuild before it would read the old
-            // HEAD and consume the flag for nothing.
-            if converted > 0 {
-                self.refresh_flag.store(true, Ordering::SeqCst);
+            if let Some(oid) = commit_oid {
+                commits_created += 1;
+                last_commit = Some(oid);
+                if n_batches > 1 {
+                    log::info!("drain: batch {}/{} committed", i + 1, n_batches);
+                }
+                self.commit_generation.fetch_add(1, Ordering::SeqCst);
+                // The sweep's conversion creates new paths in HEAD that the
+                // FUSE index may not know about (file arrived from outside the
+                // mount) — without the refresh, the file would stay invisible
+                // in the drive until a real pull (zip migration incident,
+                // 2026-07-03). Flag AFTER the commit: a rebuild before it
+                // would read the old HEAD and consume the flag for nothing.
+                if converted > 0 {
+                    self.refresh_flag.store(true, Ordering::SeqCst);
+                }
             }
+            // Heartbeat per batch: keeps updated_at fresh during long drains
+            // (the tray marked the daemon stopped after 15 quiet minutes) and
+            // publishes how many commits still await push.
+            let pending = self.inner.lock().buffer.len();
+            self.status.record_drain(
+                ops.len(),
+                commit_oid.map(|o| o.to_string()),
+                None,
+                pending,
+            );
+            if self.remote_name.is_some() {
+                self.status.set_unpushed(commits_created);
+            }
+            drop(ops);
+            drop(batch); // free this batch's content before the next one
+        }
+
+        // Phase B (publish): push commit by commit — every pack stays around
+        // one batch. A mid-catch-up failure leaves the remote on an
+        // intermediate commit; the next cycle resumes from there.
+        let mut pushed: Option<bool> = None;
+        if last_commit.is_some() {
             if let Some(ref remote) = self.remote_name {
-                let ok = push_batch(&self.repo_path, &self.branch, remote, &self.remote_token);
+                let ok = publish_progressive(
+                    &self.repo_path,
+                    &self.branch,
+                    remote,
+                    &self.remote_token,
+                    &self.status,
+                );
                 if ok {
                     pushed = Some(true);
                 } else {
@@ -660,7 +729,7 @@ impl DrainCtx {
                     if recovered {
                         self.refresh_flag.store(true, Ordering::SeqCst);
                     } else {
-                        // Push + reconcile failed: local commit left unpublished.
+                        // Push + reconcile failed: local commits left unpublished.
                         self.notifier.notify(NotifyEvent::PushFailed);
                     }
                 }
@@ -668,11 +737,100 @@ impl DrainCtx {
         }
         let pending = self.inner.lock().buffer.len();
         self.status.record_drain(
-            ops.len(),
-            commit_oid.map(|o| o.to_string()),
+            total_ops,
+            last_commit.map(|o| o.to_string()),
             pushed,
             pending,
         );
+    }
+}
+
+/// Content bytes an op contributes to a batch (only writes carry content;
+/// metadata ops — delete/mkdir/rmdir/rename/symlink — are free).
+fn op_content_len(op: &SyncOp) -> u64 {
+    match op {
+        SyncOp::Write { content, .. } => content.len(),
+        _ => 0,
+    }
+}
+
+/// Splits the causal queue into consecutive batches whose accumulated Write
+/// content stays within `limit` bytes. Pure prefix cuts — arrival order is
+/// preserved inside and across batches, so the Phase 0 causality invariant
+/// holds. A single write larger than the limit forms a batch of its own (a
+/// file cannot be split across commits — its chunks land together). `limit`
+/// 0 disables batching (single batch).
+pub(crate) fn split_batches(changes: Vec<SyncOp>, limit: u64) -> Vec<Vec<SyncOp>> {
+    if limit == 0 || changes.is_empty() {
+        return vec![changes];
+    }
+    let mut batches = Vec::new();
+    let mut current: Vec<SyncOp> = Vec::new();
+    let mut acc = 0u64;
+    for op in changes {
+        let len = op_content_len(&op);
+        if !current.is_empty() && acc.saturating_add(len) > limit {
+            batches.push(std::mem::take(&mut current));
+            acc = 0;
+        }
+        acc = acc.saturating_add(len);
+        current.push(op);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// Publishes every commit missing on the remote, one push per commit (bounded
+/// packs). Progress heartbeats go to the status (tray stays alive during long
+/// uploads). Returns `true` when the remote reached the local tip.
+fn publish_progressive(
+    repo_path: &Path,
+    branch: &str,
+    remote: &str,
+    token: &Option<String>,
+    status: &StatusState,
+) -> bool {
+    let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("push: error opening repo: {}", e);
+            return false;
+        }
+    };
+    // Throttled transfer heartbeat: a single pack can take minutes on a slow
+    // uplink; without touches the tray goes gray at 180 s of silence.
+    let last_touch = std::cell::Cell::new(std::time::Instant::now());
+    let result = git::push_progressive(&repo, branch, remote, token.as_deref(), &|ev| {
+        match ev {
+            git::PushProgress::Transfer => {
+                if last_touch.get().elapsed() >= Duration::from_secs(30) {
+                    last_touch.set(std::time::Instant::now());
+                    status.touch();
+                }
+            }
+            git::PushProgress::CommitPushed { done, total } => {
+                log::info!("push: {} catch-up {}/{} ok", remote, done, total);
+                status.set_unpushed(total - done);
+            }
+        }
+    });
+    match result {
+        Ok(0) => {
+            log::info!("push: {} up to date", remote);
+            status.set_unpushed(0);
+            true
+        }
+        Ok(n) => {
+            log::info!("push: {} ok ({} commit(s) published)", remote, n);
+            status.set_unpushed(0);
+            true
+        }
+        Err(e) => {
+            log::error!("push: error on {}: {}", remote, e);
+            false
+        }
     }
 }
 
@@ -938,26 +1096,6 @@ fn commit_batch(
     }
 }
 
-fn push_batch(repo_path: &Path, branch: &str, remote: &str, token: &Option<String>) -> bool {
-    let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
-        Ok(r) => r,
-        Err(e) => {
-            log::error!("push: error opening repo: {}", e);
-            return false;
-        }
-    };
-    match git::push_to_remote(&repo, branch, remote, token.as_deref()) {
-        Ok(_) => {
-            log::info!("push: {} ok", remote);
-            true
-        }
-        Err(e) => {
-            log::error!("push: error on {}: {}", remote, e);
-            false
-        }
-    }
-}
-
 /// The push failed (usually non-FF). Does fetch + pull_and_merge + a single push
 /// retry. Returns `true` if the retry succeeded (implies the working tree changed
 /// and the caller must signal a refresh to the FUSE layer).
@@ -1022,15 +1160,16 @@ fn reconcile_and_retry_push(
         }
     }
 
-    match git::push_to_remote(&repo, branch, remote, token.as_deref()) {
-        Ok(_) => {
-            log::info!("push: retry on {} ok", remote);
-            true
-        }
-        Err(e) => {
-            log::error!("push: retry failed again: {}", e);
-            false
-        }
+    // The retry is progressive too: after a merge, the missing history can
+    // span many batch commits — pushing the tip here would rebuild the very
+    // giant pack that failed in the first place.
+    drop(repo);
+    if publish_progressive(repo_path, branch, remote, token, status) {
+        log::info!("push: retry on {} ok", remote);
+        true
+    } else {
+        log::error!("push: retry failed again");
+        false
     }
 }
 
@@ -1677,6 +1816,72 @@ mod tests {
     /// Wraps bytes in WriteContent::Mem for the queue tests.
     fn wc(bytes: &[u8]) -> WriteContent {
         WriteContent::Mem(Arc::new(bytes.to_vec()))
+    }
+
+    fn write_op(path: &str, size: usize) -> SyncOp {
+        SyncOp::Write {
+            path: path.to_string(),
+            content: wc(&vec![b'x'; size]),
+        }
+    }
+
+    #[test]
+    fn split_batches_zero_limit_keeps_single_batch() {
+        let ops = vec![write_op("a", 10), write_op("b", 10)];
+        let batches = split_batches(ops, 0);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 2);
+    }
+
+    #[test]
+    fn split_batches_cuts_by_accumulated_content() {
+        let ops = vec![
+            write_op("a", 60),
+            write_op("b", 60), // 120 > 100 -> cut before b
+            write_op("c", 30),
+            write_op("d", 30), // 60+30+30... b(60)+c(30)=90, +d(30)=120 -> cut before d
+        ];
+        let batches = split_batches(ops, 100);
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].len(), 1, "a alone (60)");
+        assert_eq!(batches[1].len(), 2, "b + c (90)");
+        assert_eq!(batches[2].len(), 1, "d");
+        // Arrival order preserved across batches.
+        let flat: Vec<&str> = batches
+            .iter()
+            .flatten()
+            .map(|op| op.primary_path())
+            .collect();
+        assert_eq!(flat, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn split_batches_oversized_write_gets_own_batch() {
+        let ops = vec![write_op("small", 10), write_op("huge", 500), write_op("tail", 10)];
+        let batches = split_batches(ops, 100);
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[1][0].primary_path(), "huge");
+        assert_eq!(batches[1].len(), 1, "oversized write is alone in its batch");
+    }
+
+    #[test]
+    fn split_batches_metadata_ops_are_free_and_never_cut() {
+        let ops = vec![
+            write_op("a", 90),
+            SyncOp::Mkdir { path: "dir".into() },
+            SyncOp::Rename {
+                from: "a".into(),
+                to: "dir/a".into(),
+            },
+            SyncOp::Delete { path: "old".into() },
+        ];
+        let batches = split_batches(ops, 100);
+        assert_eq!(
+            batches.len(),
+            1,
+            "metadata ops carry no content and ride with the current batch"
+        );
+        assert_eq!(batches[0].len(), 4);
     }
 
     #[test]

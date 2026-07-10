@@ -86,8 +86,13 @@ pub fn evaluate(
             lines.push("push failed — changes not published".to_string());
         }
         TrayState::Attention
-    } else if s.pending_ops > 0 {
-        lines.push(format!("{} pending op(s)", s.pending_ops));
+    } else if s.pending_ops > 0 || s.unpushed > 0 {
+        if s.pending_ops > 0 {
+            lines.push(format!("{} pending op(s)", s.pending_ops));
+        }
+        if s.unpushed > 0 {
+            lines.push(format!("{} commit(s) waiting to publish", s.unpushed));
+        }
         TrayState::Busy
     } else {
         match &s.last_drain {
@@ -317,6 +322,15 @@ mod tests {
         s.pending_ops = 3;
         let (state, _) = evaluate(Some(&s), 1_010, Some(true));
         assert_eq!(state, TrayState::Busy);
+    }
+
+    #[test]
+    fn evaluate_busy_with_unpushed_commits() {
+        let mut s = base_status();
+        s.unpushed = 7;
+        let (state, lines) = evaluate(Some(&s), 1_010, Some(true));
+        assert_eq!(state, TrayState::Busy);
+        assert!(lines.iter().any(|l| l.contains("7 commit(s) waiting to publish")));
     }
 
     #[test]

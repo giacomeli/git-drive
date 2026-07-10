@@ -30,6 +30,10 @@ fn default_encryption_enabled() -> bool {
     false
 }
 
+fn default_commit_batch_mb() -> u64 {
+    256
+}
+
 fn default_log_max_mb() -> u64 {
     50
 }
@@ -63,6 +67,14 @@ pub struct Config {
     /// Maximum size of each chunk, in MiB.
     #[serde(default = "default_chunk_size_mb")]
     pub chunk_size_mb: u64,
+    /// Maximum content bytes (in MiB) per drain batch: the causal queue is
+    /// split into size-bounded batches, each becoming its own commit, and
+    /// commits are published one by one (bounded push packs — a single 24 GB
+    /// pack is what GitHub aborted in the 2026-07-10 incident). A single file
+    /// larger than the limit forms a batch of its own. `0` disables batching
+    /// (whole drain = one commit).
+    #[serde(default = "default_commit_batch_mb")]
+    pub commit_batch_mb: u64,
     /// At-rest encryption (Phase 2.7): content and names encrypted in the repo.
     /// Enabling/disabling triggers an automatic migration on the next drain.
     /// WARNING: Git history from before enabling remains in cleartext.
@@ -101,6 +113,7 @@ impl Default for Config {
             large_file_threshold_mb: default_large_file_threshold_mb(),
             chunk_threshold_mb: default_chunk_threshold_mb(),
             chunk_size_mb: default_chunk_size_mb(),
+            commit_batch_mb: default_commit_batch_mb(),
             encryption_enabled: false,
             encryption_key_file: None,
             user_name: None,
@@ -203,6 +216,17 @@ mod tests {
         let cfg = Config::load_from(&path);
         assert_eq!(cfg.chunk_threshold_mb, 0, "0 disables chunking");
         assert_eq!(cfg.chunk_size_mb, 40);
+    }
+
+    #[test]
+    fn load_from_default_commit_batch_is_256_and_overridable() {
+        let (_dir, path) = write_config("{}");
+        let cfg = Config::load_from(&path);
+        assert_eq!(cfg.commit_batch_mb, 256);
+
+        let (_dir2, path2) = write_config(r#"{"commit_batch_mb": 0}"#);
+        let cfg2 = Config::load_from(&path2);
+        assert_eq!(cfg2.commit_batch_mb, 0, "0 disables batching");
     }
 
     #[test]

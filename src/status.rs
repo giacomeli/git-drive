@@ -24,6 +24,10 @@ pub struct SyncStatus {
     #[serde(default)]
     pub stopped_at: Option<u64>,
     pub pending_ops: usize,
+    /// Local commits still awaiting publication to the remote (progressive
+    /// push catch-up in flight or interrupted). 0 = remote at the local tip.
+    #[serde(default)]
+    pub unpushed: usize,
     pub last_drain: Option<DrainInfo>,
     pub last_pull: Option<PullInfo>,
     /// Conflicted copies created in this session (paths of the `*.conflict-*` copies).
@@ -139,6 +143,27 @@ impl StatusState {
         self.persist(&snapshot);
     }
 
+    /// Commits still awaiting publication (progressive push). Doubles as a
+    /// heartbeat: every call refreshes `updated_at`.
+    pub fn set_unpushed(&self, n: usize) {
+        let mut s = self.inner.lock();
+        s.updated_at = now_unix();
+        s.unpushed = n;
+        let snapshot = s.clone();
+        drop(s);
+        self.persist(&snapshot);
+    }
+
+    /// Pure heartbeat: refreshes `updated_at` so long operations (a multi-minute
+    /// pack upload) don't read as a dead daemon in the tray.
+    pub fn touch(&self) {
+        let mut s = self.inner.lock();
+        s.updated_at = now_unix();
+        let snapshot = s.clone();
+        drop(s);
+        self.persist(&snapshot);
+    }
+
     pub fn record_pull(&self, outcome: &str) {
         let now = now_unix();
         let mut s = self.inner.lock();
@@ -248,6 +273,12 @@ pub fn format_status(s: &SyncStatus, now: u64, alive: Option<bool>) -> String {
         out.push_str("  warning: no update in over 10 min — check the logs\n");
     }
     out.push_str(&format!("  pending ops: {}\n", s.pending_ops));
+    if s.unpushed > 0 {
+        out.push_str(&format!(
+            "  unpushed commits: {} (publishing in bounded batches)\n",
+            s.unpushed
+        ));
+    }
     match &s.last_drain {
         Some(d) => {
             let commit = d.commit.as_deref().unwrap_or("none");
@@ -371,6 +402,40 @@ mod tests {
     #[test]
     fn read_from_missing_file_errors() {
         assert!(read_from(Path::new("/nonexistent/status.json")).is_err());
+    }
+
+    #[test]
+    fn unpushed_roundtrips_and_defaults_to_zero() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let state = StatusState::new();
+        state.enable_file(path.clone());
+        state.set_unpushed(12);
+        assert_eq!(read_from(&path).unwrap().unpushed, 12);
+
+        // Old status.json without the field still parses (serde default).
+        std::fs::write(&path, r#"{"pid":1,"repo":"r","branch":"main","started_at":0,"updated_at":0,"pending_ops":0,"last_drain":null,"last_pull":null,"conflicts":[]}"#).unwrap();
+        assert_eq!(read_from(&path).unwrap().unpushed, 0);
+    }
+
+    #[test]
+    fn format_status_shows_unpushed_when_positive() {
+        let mut s = sample();
+        s.unpushed = 5;
+        let text = format_status(&s, 2_000, Some(true));
+        assert!(text.contains("unpushed commits: 5"), "{}", text);
+        s.unpushed = 0;
+        let text = format_status(&s, 2_000, Some(true));
+        assert!(!text.contains("unpushed"), "{}", text);
+    }
+
+    #[test]
+    fn touch_refreshes_updated_at() {
+        let state = StatusState::new();
+        state.record_boot("/r", "main");
+        let before = state.snapshot().updated_at;
+        state.touch();
+        assert!(state.snapshot().updated_at >= before);
     }
 
     #[test]

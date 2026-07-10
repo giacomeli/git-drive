@@ -231,6 +231,119 @@ pub fn push_to_remote(
     Ok(())
 }
 
+/// Progress events emitted by `push_progressive`.
+pub enum PushProgress {
+    /// Pack bytes are flowing to the remote (raw transfer heartbeat).
+    Transfer,
+    /// One intermediate commit was accepted by the remote.
+    CommitPushed { done: usize, total: usize },
+}
+
+/// Publishes every commit the remote is missing, ONE PUSH PER COMMIT
+/// (`<sha>:refs/heads/<branch>`, oldest first along the first-parent chain).
+///
+/// `git push` packs EVERYTHING missing on the remote into a single pack — with
+/// a mass copy that was a 24 GB pack, which GitHub aborts mid-transfer
+/// (2026-07-10 incident). Pushing commit by commit bounds every pack to about
+/// one drain batch, each step is a fast-forward by construction, and a failure
+/// midway leaves the remote on an intermediate commit — the next cycle resumes
+/// from exactly there (self-healing catch-up).
+///
+/// Returns the number of commits published (0 = already up to date).
+/// `Err` when the remote tip is unknown locally (another machine moved the
+/// branch — the caller reconciles with fetch + merge and retries).
+pub fn push_progressive(
+    repo: &Repository,
+    branch: &str,
+    remote_name: &str,
+    token: Option<&str>,
+    on_progress: &dyn Fn(PushProgress),
+) -> Result<usize, Error> {
+    let local_tip = repo.refname_to_id(&format!("refs/heads/{}", branch))?;
+
+    // Remote tip via fetch + remote-tracking ref. (`Remote::list()` on an
+    // EMPTY advertisement hits a null-pointer `from_raw_parts` inside git2
+    // 0.18 — aborts under the strict UB checks.) A failed fetch (empty
+    // remote, branch not born yet, offline) leaves the tip unknown and we
+    // attempt a from-root catch-up: if the remote actually has history, the
+    // first push is rejected as non-FF and lands in the reconcile path.
+    let _ = fetch_remote(repo, branch, remote_name, token);
+    let remote_tip = repo
+        .refname_to_id(&format!("refs/remotes/{}/{}", remote_name, branch))
+        .ok();
+
+    if remote_tip == Some(local_tip) {
+        return Ok(0);
+    }
+    if let Some(tip) = remote_tip {
+        // The tip must be an ancestor — otherwise another machine moved the
+        // branch and a plain push would be non-FF anyway: merge first.
+        if !repo.graph_descendant_of(local_tip, tip)? {
+            return Err(Error::from_str(
+                "remote branch is not an ancestor of the local branch — merge required",
+            ));
+        }
+    }
+
+    // Missing commits, oldest first, along the first-parent chain (merge
+    // commits ride with their first parent; the second parent's history is
+    // already on the remote or comes inside that single pack).
+    let mut walk = repo.revwalk()?;
+    walk.push(local_tip)?;
+    if let Some(tip) = remote_tip {
+        walk.hide(tip)?;
+    }
+    walk.simplify_first_parent()?;
+    walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
+    let commits: Vec<git2::Oid> = walk.collect::<Result<_, _>>()?;
+    let total = commits.len();
+
+    for (i, oid) in commits.iter().enumerate() {
+        let mut remote = repo.find_remote(remote_name)?;
+        let mut callbacks = git2::RemoteCallbacks::new();
+        let token_owned = token.map(|t| t.to_string());
+        callbacks.credentials(move |_url, username_from_url, _allowed| {
+            credential_callback(token_owned.as_deref(), username_from_url)
+        });
+        // Same server-side rejection collection as `push_to_remote` (GH001 &
+        // friends only surface through this callback, never as Err).
+        let rejections: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let rejections_cb = rejections.clone();
+        callbacks.push_update_reference(move |refname, status| {
+            if let Some(msg) = status {
+                rejections_cb
+                    .borrow_mut()
+                    .push(format!("{}: {}", refname, msg));
+            }
+            Ok(())
+        });
+        let transfer_cb = on_progress;
+        callbacks.push_transfer_progress(move |_current, _total, _bytes| {
+            transfer_cb(PushProgress::Transfer);
+        });
+        let mut push_opts = git2::PushOptions::new();
+        push_opts.remote_callbacks(callbacks);
+        let refspec = format!("{}:refs/heads/{}", oid, branch);
+        remote.push(&[&refspec], Some(&mut push_opts))?;
+        let rejected = rejections.borrow();
+        if !rejected.is_empty() {
+            return Err(Error::from_str(&format!(
+                "push rejected by remote at commit {}/{}: {}",
+                i + 1,
+                total,
+                rejected.join("; ")
+            )));
+        }
+        drop(rejected);
+        on_progress(PushProgress::CommitPushed {
+            done: i + 1,
+            total,
+        });
+    }
+    Ok(total)
+}
+
 /// Runs `git fetch` against the given remote (only the required branch).
 /// Reuses the same credential strategy as `push_to_remote`.
 pub fn fetch_remote(
@@ -814,6 +927,86 @@ mod tests {
         let branch = current_branch_name(&repo).unwrap();
         push_to_remote(&repo, &branch, "origin", None).unwrap();
         (dir, repo, bare)
+    }
+
+    #[test]
+    fn push_progressive_publishes_each_missing_commit() {
+        let (_local, repo, bare) = setup_local_with_bare_remote();
+        let branch = current_branch_name(&repo).unwrap();
+        commit_file(&repo, "a.txt", b"a");
+        commit_file(&repo, "b.txt", b"b");
+        commit_file(&repo, "c.txt", b"c");
+
+        let events = std::cell::RefCell::new(Vec::new());
+        let n = push_progressive(&repo, &branch, "origin", None, &|ev| {
+            if let PushProgress::CommitPushed { done, total } = ev {
+                events.borrow_mut().push((done, total));
+            }
+        })
+        .unwrap();
+        assert_eq!(n, 3, "three missing commits published one by one");
+        assert_eq!(*events.borrow(), vec![(1, 3), (2, 3), (3, 3)]);
+
+        // Remote tip reached the local tip.
+        let bare_repo = Repository::open(bare.path()).unwrap();
+        let remote_tip = bare_repo
+            .refname_to_id(&format!("refs/heads/{}", branch))
+            .unwrap();
+        let local_tip = repo
+            .refname_to_id(&format!("refs/heads/{}", branch))
+            .unwrap();
+        assert_eq!(remote_tip, local_tip);
+
+        // Idempotent: nothing more to publish.
+        let n2 = push_progressive(&repo, &branch, "origin", None, &|_| {}).unwrap();
+        assert_eq!(n2, 0);
+    }
+
+    #[test]
+    fn push_progressive_to_empty_remote_pushes_from_root() {
+        let (_dir, repo) = init_repo_with_commit();
+        let bare = tempdir().unwrap();
+        Repository::init_bare(bare.path()).unwrap();
+        let url = format!("file://{}", bare.path().to_str().unwrap());
+        repo.remote("origin", &url).unwrap();
+        let branch = current_branch_name(&repo).unwrap();
+        commit_file(&repo, "x.txt", b"x");
+
+        let n = push_progressive(&repo, &branch, "origin", None, &|_| {}).unwrap();
+        assert_eq!(n, 2, "root commit + x.txt, one push each");
+        let bare_repo = Repository::open(bare.path()).unwrap();
+        assert_eq!(
+            bare_repo
+                .refname_to_id(&format!("refs/heads/{}", branch))
+                .unwrap(),
+            repo.refname_to_id(&format!("refs/heads/{}", branch))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn push_progressive_errors_when_remote_moved_by_another_machine() {
+        let (_local_a, repo_a, bare) = setup_local_with_bare_remote();
+        // Machine B moves the remote branch without A knowing.
+        let dir_b = tempdir().unwrap();
+        let repo_b = Repository::clone(
+            &format!("file://{}", bare.path().to_str().unwrap()),
+            dir_b.path(),
+        )
+        .unwrap();
+        {
+            let mut cfg = repo_b.config().unwrap();
+            cfg.set_str("user.name", "Bob").unwrap();
+            cfg.set_str("user.email", "b@x.com").unwrap();
+        }
+        commit_file(&repo_b, "from_b.txt", b"hi");
+        let branch = current_branch_name(&repo_b).unwrap();
+        push_to_remote(&repo_b, &branch, "origin", None).unwrap();
+
+        // A has a local commit too; the remote tip is unknown to A.
+        commit_file(&repo_a, "from_a.txt", b"oi");
+        let err = push_progressive(&repo_a, &branch, "origin", None, &|_| {});
+        assert!(err.is_err(), "unknown remote tip must trigger reconcile");
     }
 
     #[test]

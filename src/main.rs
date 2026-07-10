@@ -322,6 +322,9 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
         config.chunk_threshold_mb * 1024 * 1024,
         config.chunk_size_mb * 1024 * 1024,
     );
+    // Size-bounded drain batches: a mass copy becomes N bounded commits
+    // published one by one, instead of a single giant pack (2026-07-10).
+    sync.set_batching(config.commit_batch_mb * 1024 * 1024);
     // Observable status (read by `drive-sync status` and by the tray)
     sync.enable_status_file(status_file);
     sync.status_state()
@@ -513,6 +516,24 @@ fn clear_stale_mount(mount: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `drive-sync status`: reads the status.json written by the daemon and formats it.
+fn run_status(file: &Path) -> anyhow::Result<()> {
+    use drive_sync::status;
+    match status::read_from(file) {
+        Ok(s) => {
+            let alive = status::pid_alive(s.pid);
+            print!("{}", status::format_status(&s, status::now_unix(), alive));
+        }
+        Err(e) => {
+            println!("No status available ({}).", e);
+            println!(
+                "Mount a repository first: drive-sync -r <repo> -m <mount> — the daemon writes status.json to the log dir (default: logs/ of the directory it was launched from). Use --file to point to another path."
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod mount_tests {
     use super::mount_line_present;
@@ -531,22 +552,4 @@ mod mount_tests {
         ));
         assert!(!mount_line_present("", "/x", "/x"));
     }
-}
-
-/// `drive-sync status`: reads the status.json written by the daemon and formats it.
-fn run_status(file: &Path) -> anyhow::Result<()> {
-    use drive_sync::status;
-    match status::read_from(file) {
-        Ok(s) => {
-            let alive = status::pid_alive(s.pid);
-            print!("{}", status::format_status(&s, status::now_unix(), alive));
-        }
-        Err(e) => {
-            println!("No status available ({}).", e);
-            println!(
-                "Mount a repository first: drive-sync -r <repo> -m <mount> — the daemon writes status.json to the log dir (default: logs/ of the directory it was launched from). Use --file to point to another path."
-            );
-        }
-    }
-    Ok(())
 }
