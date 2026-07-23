@@ -1,9 +1,15 @@
-# git-drive
+# git-drive — mount a Git repository as a Dropbox-style drive
 
 [![CI](https://github.com/giacomeli/git-drive/actions/workflows/ci.yml/badge.svg)](https://github.com/giacomeli/git-drive/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](#requirements)
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](#requirements)
+
+<p align="center">
+  <img src="./promo-assets/git-drive-social-preview-1280x640.png"
+       alt="git-drive banner: turn any Git repo into a Dropbox-style drive — FUSE filesystem in Rust with automatic bidirectional sync and optional encryption at rest"
+       width="720">
+</p>
 
 A FUSE filesystem in Rust that mounts a Git repository as a virtual filesystem, with automatic
 bidirectional synchronization. Local writes become commits + pushes, remote changes arrive via
@@ -24,7 +30,7 @@ simple idea: what happens when Git's own building blocks — commits, branches, 
 become the engine of an ordinary filesystem? Everything you drop on the mounted drive is
 versioned Git data underneath, and it syncs with any Git server, including GitHub.
 
-Main capabilities:
+## Features
 
 - Bidirectional sync with a causal queue (kernel ordering preserved), 3-way merge with
   conflicted copies, and automatic retry of rejected pushes.
@@ -44,7 +50,7 @@ Main capabilities:
 - A local Git repository (with a checked-out branch) to mount
 - Optional: `origin` configured for remote synchronization
 
-## Build & Run
+## Installation
 
 ```bash
 cargo build
