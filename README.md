@@ -1,4 +1,9 @@
-# drive-sync
+# git-drive
+
+[![CI](https://github.com/giacomeli/git-drive/actions/workflows/ci.yml/badge.svg)](https://github.com/giacomeli/git-drive/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](#requirements)
+[![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](#requirements)
 
 A FUSE filesystem in Rust that mounts a Git repository as a virtual filesystem, with automatic
 bidirectional synchronization. Local writes become commits + pushes, remote changes arrive via
@@ -6,7 +11,15 @@ periodic pull. It works like a Dropbox-style drive whose remote is a Git reposit
 GitHub repositories) — with optional encryption at rest that lets you use even a **public repo as
 a private drive**.
 
-drive-sync is **open source** under the [MIT license](./LICENSE). It was created to explore a
+> [!WARNING]
+> **git-drive is experimental software — use at your own risk.** It is a young project under
+> active development, and it sits between your files and a filesystem kernel interface: bugs here
+> can mean lost or corrupted data. Always keep an independent backup of anything you place on the
+> drive, and try it on a disposable repository first. The author assumes no responsibility for
+> lost data; the software is provided "as is", without warranty of any kind (see the
+> [MIT license](./LICENSE)).
+
+git-drive is **open source** under the [MIT license](./LICENSE). It was created to explore a
 simple idea: what happens when Git's own building blocks — commits, branches, history, remotes —
 become the engine of an ordinary filesystem? Everything you drop on the mounted drive is
 versioned Git data underneath, and it syncs with any Git server, including GitHub.
@@ -66,7 +79,7 @@ The mount directory must exist before running.
 
 ## Configuration
 
-Optional. `~/.config/drive-sync/config.json` (a `./config.json` in the current directory takes
+Optional. `~/.config/git-drive/config.json` (a `./config.json` in the current directory takes
 precedence in the dev flow):
 
 ```json
@@ -94,7 +107,7 @@ precedence in the dev flow):
 | `chunk_threshold_mb` | `95` | Above this, the file becomes a manifest + chunks in `.chunks/` (GitHub's 100 MB limit). `0` disables it. |
 | `chunk_size_mb` | `80` | Maximum size of each chunk. |
 | `encryption_enabled` | `false` | Encryption at rest: opaque repo (content + names), plaintext drive. Changing the value migrates automatically. |
-| `encryption_key_file` | `null` | Key file (default `~/.config/drive-sync/drive.key`). Generate it with `drive-sync key generate`. **Lost key = lost data.** |
+| `encryption_key_file` | `null` | Key file (default `~/.config/git-drive/drive.key`). Generate it with `git-drive key generate`. **Lost key = lost data.** |
 | `user_name` | `null` | Commit identity. If absent, commits are skipped. |
 | `user_email` | `null` | Same as above. |
 | `remote_token` | `null` | HTTPS token (e.g. a GitHub PAT). If absent, uses ssh-agent / the system credential helper. **Plain text.** |
@@ -102,7 +115,7 @@ precedence in the dev flow):
 If the file is missing or invalid, defaults are applied with a warning log.
 
 > **Security:** `config.json` may contain a plain-text `remote_token` and the encryption key
-> lives right next to it — keep `~/.config/drive-sync/` out of any repo and back up the key in a
+> lives right next to it — keep `~/.config/git-drive/` out of any repo and back up the key in a
 > safe place. When enabling encryption on a pre-existing repo, the previous Git history remains
 > readable on the remote; for a public repo, start from a fresh repo.
 
@@ -144,10 +157,20 @@ Portuguese versions of all docs live under [docs/pt-br/](./docs/pt-br/).
 
 ## Contributing
 
-Contributions are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md). In short: read
-[AGENTS.md](./AGENTS.md) for the project invariants, make sure `cargo test` and
-`cargo clippy --all-targets` pass, and open a PR. AI-assisted contributions are accepted,
-provided commits stay concise and every behavioral change ships with tests.
+Contributions of any size are welcome — bug reports, docs, tests, features. The short version:
+
+1. Read [AGENTS.md](./AGENTS.md) first — the invariants there encode real incidents (data
+   corruption, silent data loss), and PRs that violate one will not be merged.
+2. For anything non-trivial, open an issue to discuss the approach first — an early
+   conversation avoids wasted work.
+3. Make sure `cargo test` and `cargo clippy --all-targets` pass — the CI mirrors exactly the
+   local verification commands.
+4. Open a PR with a concise, imperative description. Every behavioral change ships with tests
+   that fail without it.
+
+AI-assisted contributions are accepted: you remain the author, commits stay concise, and no AI
+attribution goes into commits or PRs. The full guide — including good first contributions and
+how to report security issues privately — is in [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 ## License
 

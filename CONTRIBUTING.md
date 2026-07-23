@@ -1,8 +1,25 @@
-# Contributing to drive-sync
+# Contributing to git-drive
 
-Thanks for your interest in contributing. drive-sync is open source under the
+Thanks for your interest in contributing. git-drive is open source under the
 [MIT license](./LICENSE); contributions of any size are welcome — bug reports,
 docs, tests, features.
+
+## Ways to contribute
+
+- **Bug reports.** Open an issue with: what you did, what you expected, what
+  happened, the output of `git-drive status`, the relevant excerpt from
+  `~/Library/Logs/git-drive/`, and your macOS + macFUSE versions. If the bug
+  involves sync, say whether the remote is GitHub, and whether encryption or
+  chunking were enabled.
+- **Documentation.** English docs in `docs/` are canonical; the Portuguese
+  mirror in `docs/pt-br/` often lags behind — syncing it is a great
+  contribution. So are new troubleshooting entries in `docs/usage.md` for
+  problems you actually hit.
+- **Tests.** The suite runs without a FUSE mount, so improving coverage of the
+  pure `apply_*` logic is low-friction and highly valued.
+- **Features.** For anything non-trivial, open an issue describing the
+  approach before writing code — priorities move, and an early conversation
+  avoids wasted work.
 
 ## Getting started
 
@@ -16,6 +33,10 @@ cargo test          # full suite (unit + integration), no FUSE mount required
 macFUSE (`brew install macfuse`) is only needed to mount a drive for manual
 end-to-end testing — the suite exercises all the logic through pure `apply_*`
 methods without touching the kernel.
+
+git-drive is experimental and sits between the kernel and your data: when
+testing a mount manually, always use a **disposable repository**, never the
+only copy of anything you care about.
 
 ## Before opening a PR
 
@@ -35,6 +56,25 @@ grep -rnE 'GITHUB_' src/ tests/                  # must be empty
 ```
 
 The CI mirrors exactly these commands on macOS and Linux.
+
+## Opening the PR
+
+- Fork, create a branch off `main`, and keep the PR focused on one change —
+  small PRs get reviewed fast, mixed ones stall.
+- Use an imperative title in the commit style below (`fix: ...`, `feat: ...`).
+- In the description, state the behavior change and point at the tests that
+  cover it. Link the issue if one exists.
+- CI must be green; a PR that touches an invariant documented in
+  [AGENTS.md](./AGENTS.md) should say so explicitly and justify it.
+
+## Good first contributions
+
+- Sync a `docs/pt-br/` page that fell behind its English counterpart.
+- Add a troubleshooting entry to `docs/usage.md` for a failure mode you hit.
+- Extend test coverage of edge cases in the pure logic (chunking boundaries,
+  path resolution, merge conflict naming).
+- The Linux runtime port is the standing big feature (the test suite already
+  passes on Linux) — open an issue first to coordinate.
 
 ## Use of AI
 
@@ -61,5 +101,7 @@ enforced in review:
 
 ## Reporting security issues
 
-Do not open a public issue for an exploitable vulnerability. Reach out to the
-maintainer privately first (see the commit history for contact).
+Do not open a public issue for an exploitable vulnerability. Use GitHub's
+[private vulnerability reporting](https://github.com/giacomeli/git-drive/security/advisories/new)
+(Security tab > Report a vulnerability), or reach out to the maintainer
+privately (see the commit history for contact). See [SECURITY.md](./SECURITY.md).
