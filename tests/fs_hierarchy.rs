@@ -1,8 +1,8 @@
 mod common;
 
 use common::{commit_file, init_repo};
-use drive_sync::fs::GitDriveFS;
-use drive_sync::sync::SyncManager;
+use git_drive::fs::GitDriveFS;
+use git_drive::sync::SyncManager;
 use fuser::FileType;
 
 fn new_fs(repo_path: &str, branch: &str) -> GitDriveFS {
@@ -207,7 +207,7 @@ async fn apply_create_queues_initial_empty_write() {
     let ops = fs.sync_snapshot_for_test();
     // there must be a Write { path: "novo.txt", content: [] }
     assert!(ops.iter().any(|op| matches!(op,
-        drive_sync::sync::SyncOp::Write { path, content }
+        git_drive::sync::SyncOp::Write { path, content }
             if path == "novo.txt" && content.is_empty()
     )));
 }
@@ -252,7 +252,7 @@ async fn apply_unlink_queues_delete_op() {
     fs.apply_unlink(1, "a.txt").unwrap();
     let ops = fs.sync_snapshot_for_test();
     assert!(ops.iter().any(|op| matches!(op,
-        drive_sync::sync::SyncOp::Delete { path } if path == "a.txt"
+        git_drive::sync::SyncOp::Delete { path } if path == "a.txt"
     )));
 }
 
@@ -307,7 +307,7 @@ async fn apply_mkdir_queues_mkdir_op() {
     fs.apply_mkdir(1, "pasta").unwrap();
     let ops = fs.sync_snapshot_for_test();
     assert!(ops.iter().any(|op| matches!(op,
-        drive_sync::sync::SyncOp::Mkdir { path } if path == "pasta"
+        git_drive::sync::SyncOp::Mkdir { path } if path == "pasta"
     )));
 }
 
@@ -345,7 +345,7 @@ async fn apply_rmdir_queues_rmdir_op() {
     let ops = fs.sync_snapshot_for_test();
     // After mkdir + rmdir on the same key, the buffer holds only Rmdir (last one wins).
     assert!(ops.iter().any(|op| matches!(op,
-        drive_sync::sync::SyncOp::Rmdir { path } if path == "pasta"
+        git_drive::sync::SyncOp::Rmdir { path } if path == "pasta"
     )));
 }
 
@@ -427,7 +427,7 @@ async fn apply_rename_of_file_queues_write_plus_delete() {
     let ops = fs.sync_snapshot_for_test();
     assert!(
         ops.iter().any(|op| matches!(op,
-            drive_sync::sync::SyncOp::Write { path, content }
+            git_drive::sync::SyncOp::Write { path, content }
                 if path == "b.txt" && content.to_vec() == b"hello"
         )),
         "expected Write(b.txt) with the original content, got {:?}",
@@ -435,7 +435,7 @@ async fn apply_rename_of_file_queues_write_plus_delete() {
     );
     assert!(
         ops.iter().any(|op| matches!(op,
-            drive_sync::sync::SyncOp::Delete { path } if path == "a.txt"
+            git_drive::sync::SyncOp::Delete { path } if path == "a.txt"
         )),
         "expected Delete(a.txt), got {:?}",
         ops
@@ -539,7 +539,7 @@ async fn apply_truncate_smaller_preserves_prefix() {
     let ops = fs.sync_snapshot_for_test();
     assert!(
         ops.iter().any(|op| matches!(op,
-            drive_sync::sync::SyncOp::Write { path, content }
+            git_drive::sync::SyncOp::Write { path, content }
                 if path == "a.txt" && content.to_vec() == b"hell"
         )),
         "expected truncated Write(a.txt), got {:?}",
@@ -589,7 +589,7 @@ async fn flush_after_write_enqueues_once() {
     let ops = fs.sync_snapshot_for_test();
     assert!(
         ops.iter().any(|op| matches!(op,
-            drive_sync::sync::SyncOp::Write { path, content }
+            git_drive::sync::SyncOp::Write { path, content }
                 if path == "a.txt" && content.to_vec() == b"hello world"
         )),
         "expected Write(a.txt) with the full content, got {:?}",
@@ -756,7 +756,7 @@ async fn dir_rename_to_ephemeral_queues_recursive_removal() {
     fs.apply_rename(1, "d", 1, "._d").unwrap();
 
     let ops = fs.sync_snapshot_for_test();
-    use drive_sync::sync::SyncOp;
+    use git_drive::sync::SyncOp;
     assert!(
         !ops.iter().any(|op| matches!(op, SyncOp::Rename { .. })),
         "there must be no Rename in the queue, got {:?}",
@@ -788,7 +788,7 @@ async fn dir_rename_from_ephemeral_materializes_content() {
     fs.apply_rename(1, "._hidden", 1, "visible").unwrap();
 
     let ops = fs.sync_snapshot_for_test();
-    use drive_sync::sync::SyncOp;
+    use git_drive::sync::SyncOp;
     let pos_mkdir = ops.iter().position(|op| matches!(op, SyncOp::Mkdir { path } if path == "visible"));
     let pos_write = ops.iter().position(|op| matches!(op,
         SyncOp::Write { path, content } if path == "visible/f.txt" && content.to_vec() == b"segredo"));
@@ -808,7 +808,7 @@ async fn file_rename_to_ephemeral_queues_only_delete() {
     fs.apply_rename(1, "a.txt", 1, "._a.txt").unwrap();
 
     let ops = fs.sync_snapshot_for_test();
-    use drive_sync::sync::SyncOp;
+    use git_drive::sync::SyncOp;
     assert_eq!(ops.len(), 1, "expected only the Delete, got {:?}", ops);
     assert!(matches!(&ops[0], SyncOp::Delete { path } if path == "a.txt"));
 }
@@ -827,7 +827,7 @@ async fn file_rename_from_ephemeral_materializes_write() {
     fs.apply_rename(1, "._tmp.txt", 1, "real.txt").unwrap();
 
     let ops = fs.sync_snapshot_for_test();
-    use drive_sync::sync::SyncOp;
+    use git_drive::sync::SyncOp;
     assert_eq!(ops.len(), 1, "expected only the Write, got {:?}", ops);
     assert!(matches!(&ops[0], SyncOp::Write { path, content }
         if path == "real.txt" && content.to_vec() == b"data"));
@@ -851,7 +851,7 @@ async fn apply_exchange_swaps_contents_by_name() {
     assert_eq!(fs.read_content_for_test(ino_a).as_deref(), Some(b"conteudo-b".as_slice()));
     assert_eq!(fs.read_content_for_test(ino_b).as_deref(), Some(b"conteudo-a".as_slice()));
     let ops = fs.sync_snapshot_for_test();
-    use drive_sync::sync::SyncOp;
+    use git_drive::sync::SyncOp;
     assert!(ops.iter().any(|op| matches!(op, SyncOp::Write { path, content }
         if path == "a.txt" && content.to_vec() == b"conteudo-b")));
     assert!(ops.iter().any(|op| matches!(op, SyncOp::Write { path, content }
@@ -986,7 +986,7 @@ async fn apply_symlink_creates_entry_and_enqueues_op() {
     let snap = fs.sync_snapshot_for_test();
     assert_eq!(snap.len(), 1);
     assert!(
-        matches!(&snap[0], drive_sync::sync::SyncOp::Symlink { path, target }
+        matches!(&snap[0], git_drive::sync::SyncOp::Symlink { path, target }
             if path == "alias.txt" && target == "real.txt"),
         "expected SyncOp::Symlink, got {:?}",
         snap
@@ -1013,7 +1013,7 @@ async fn apply_unlink_of_symlink_queues_delete() {
     assert_eq!(fs.find_inode("alias.txt"), None);
     let snap = fs.sync_snapshot_for_test();
     assert!(
-        matches!(&snap[..], [drive_sync::sync::SyncOp::Delete { path }] if path == "alias.txt"),
+        matches!(&snap[..], [git_drive::sync::SyncOp::Delete { path }] if path == "alias.txt"),
         "expected Delete of the symlink, got {:?}",
         snap
     );
@@ -1082,7 +1082,7 @@ async fn ignored_file_delete_removes_and_queues() {
     assert_eq!(fs.find_inode("app.log"), None);
     let snap = fs.sync_snapshot_for_test();
     assert!(
-        matches!(&snap[..], [drive_sync::sync::SyncOp::Delete { path }] if path == "app.log"),
+        matches!(&snap[..], [git_drive::sync::SyncOp::Delete { path }] if path == "app.log"),
         "a local-only delete goes through the normal queue: {:?}",
         snap
     );
@@ -1177,7 +1177,7 @@ async fn flush_shares_buffer_arc_with_queued_op() {
     let buf = fs.buffer_arc_for_test(ino).expect("buffer alive after flush");
     let snap = fs.sync_snapshot_for_test();
     let shared = snap.iter().any(|op| matches!(op,
-        drive_sync::sync::SyncOp::Write { content: drive_sync::sync::WriteContent::Mem(arc), .. }
+        git_drive::sync::SyncOp::Write { content: git_drive::sync::WriteContent::Mem(arc), .. }
             if std::sync::Arc::ptr_eq(arc, &buf)));
     assert!(shared, "the enqueued op must share the buffer's Arc: {:?}", snap);
 }
@@ -1315,7 +1315,7 @@ async fn persistent_read_handle_sees_new_head_after_refresh() {
 
 // ---- Phase 2.6: transparent reads of chunked files ----
 
-use drive_sync::chunk::{chunk_reader_into_repo, shard_rel_path, Manifest};
+use git_drive::chunk::{chunk_reader_into_repo, shard_rel_path, Manifest};
 
 /// Materializes the payload as manifest + chunks in the working tree and commits everything.
 fn commit_chunked(repo: &git2::Repository, rel: &str, payload: &[u8], chunk_size: u64) -> Manifest {
@@ -1418,7 +1418,7 @@ async fn write_to_chunked_file_roundtrip_via_buffer() {
     let content_len = snap
         .iter()
         .find_map(|op| match op {
-            drive_sync::sync::SyncOp::Write { path, content } if path == "big.bin" => {
+            git_drive::sync::SyncOp::Write { path, content } if path == "big.bin" => {
                 Some(content.to_vec().len())
             }
             _ => None,
@@ -1441,7 +1441,7 @@ async fn rename_chunked_file_queues_manifest_not_expanded_content() {
     let write_bytes = snap
         .iter()
         .find_map(|op| match op {
-            drive_sync::sync::SyncOp::Write { path, content } if path == "renomeado.bin" => {
+            git_drive::sync::SyncOp::Write { path, content } if path == "renomeado.bin" => {
                 Some(content.to_vec())
             }
             _ => None,
@@ -1452,7 +1452,7 @@ async fn rename_chunked_file_queues_manifest_not_expanded_content() {
         "renaming a chunked file enqueues the MANIFEST (small), not the expanded content"
     );
     assert!(snap.iter().any(|op| matches!(op,
-        drive_sync::sync::SyncOp::Delete { path } if path == "big.bin")));
+        git_drive::sync::SyncOp::Delete { path } if path == "big.bin")));
 
     // And the new path stays readable (chunks intact)
     let ino2 = fs.find_inode("renomeado.bin").unwrap();
@@ -1481,7 +1481,7 @@ async fn chunked_view_survives_refresh() {
 
 // ---- Phase 2.7: cleartext FUSE view over an encrypted repo ----
 
-use drive_sync::crypt::Crypto;
+use git_drive::crypt::Crypto;
 use std::sync::Arc as StdArc;
 
 fn fs_crypto() -> StdArc<Crypto> {
@@ -1610,7 +1610,7 @@ async fn encrypted_chunked_file_reads_reassembled_plaintext() {
     let workdir = test.repo.workdir().unwrap();
     let payload: Vec<u8> = (0..250u32).map(|i| (i % 251) as u8).collect();
     let seal = |plain: &[u8]| crypto.seal(plain);
-    let manifest = drive_sync::chunk::chunk_reader_into_repo_with(
+    let manifest = git_drive::chunk::chunk_reader_into_repo_with(
         &mut payload.as_slice(),
         100,
         workdir,

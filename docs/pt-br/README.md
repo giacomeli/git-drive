@@ -1,4 +1,4 @@
-# Documentação técnica — drive-sync
+# Documentação técnica — git-drive
 
 > English version: [../README.md](../README.md)
 

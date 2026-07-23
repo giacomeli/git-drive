@@ -10,8 +10,12 @@ use std::process::Command;
 
 use crate::paths;
 
-pub const LABEL: &str = "dev.giacomeli.drive-sync";
-pub const TRAY_LABEL: &str = "dev.giacomeli.drive-sync.tray";
+pub const LABEL: &str = "dev.giacomeli.git-drive";
+pub const TRAY_LABEL: &str = "dev.giacomeli.git-drive.tray";
+
+/// Pre-rename labels (project was called drive-sync until 2026-07). Agents
+/// registered under these are taken down and their plists removed on install.
+const LEGACY_LABELS: [&str; 2] = ["dev.giacomeli.drive-sync", "dev.giacomeli.drive-sync.tray"];
 
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
@@ -148,16 +152,20 @@ pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
     std::fs::create_dir_all(&app_support)?;
     std::fs::create_dir_all(&log_dir)?;
 
-    // Migration (2026-07-06): config/key moved out of Application Support to
-    // ~/.config/drive-sync. If the new path does not exist and the legacy one
-    // does, move it.
+    // Migration: config/key moved twice (Application Support -> ~/.config/
+    // drive-sync on 2026-07-06, then to ~/.config/git-drive with the rename).
+    // If the new path does not exist and a legacy one does, move the most
+    // recent generation.
     let _ = std::fs::create_dir_all(paths::config_dir());
-    for (legacy, new) in [
-        (paths::legacy_config_path(), paths::standard_config_path()),
-        (paths::legacy_key_path(), paths::standard_key_path()),
+    for (legacies, new) in [
+        (paths::legacy_config_paths(), paths::standard_config_path()),
+        (paths::legacy_key_paths(), paths::standard_key_path()),
     ] {
-        if !new.exists() && legacy.exists() {
-            match std::fs::rename(&legacy, &new) {
+        if new.exists() {
+            continue;
+        }
+        if let Some(legacy) = legacies.iter().find(|p| p.exists()) {
+            match std::fs::rename(legacy, &new) {
                 Ok(_) => println!("migrated: {} -> {}", legacy.display(), new.display()),
                 Err(e) => eprintln!("warning: failed to migrate {}: {}", legacy.display(), e),
             }
@@ -191,6 +199,12 @@ pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
     }
     std::fs::write(&plist_path, plist)?;
 
+    // Pre-rename agents: take down and remove so they never race the new ones.
+    for legacy in LEGACY_LABELS {
+        let _ = launchctl(&["bootout", &format!("{}/{}", gui_domain(), legacy)]);
+        let _ = std::fs::remove_file(launch_agents_dir().join(format!("{legacy}.plist")));
+    }
+
     // Idempotent re-install: takes down the previous instance (if any) before
     // registering again. bootout of a nonexistent agent fails — ignored.
     let _ = launchctl(&["bootout", &format!("{}/{}", gui_domain(), LABEL)]);
@@ -210,7 +224,7 @@ pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
         let out = launchctl(&["bootstrap", &gui_domain(), tray_path.to_str().unwrap()])?;
         if !out.status.success() {
             log::error!(
-                "install: tray bootstrap failed ({}) — run `drive-sync tray` manually",
+                "install: tray bootstrap failed ({}) — run `git-drive tray` manually",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         } else {
@@ -224,7 +238,7 @@ pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
     println!("  mount:  {}", mount.display());
     println!("  config: {}", config.display());
     println!("  logs:   {}", log_dir.display());
-    println!("  status: {} (drive-sync status finds it on its own)", status_file.display());
+    println!("  status: {} (git-drive status finds it on its own)", status_file.display());
     Ok(())
 }
 
@@ -262,15 +276,15 @@ mod tests {
     #[test]
     fn render_plist_contains_program_arguments_in_order() {
         let plist = render_plist(
-            Path::new("/usr/local/bin/drive-sync"),
+            Path::new("/usr/local/bin/git-drive"),
             Path::new("/Users/x/repo"),
             Path::new("/Users/x/GitDrive"),
-            Path::new("/Users/x/Library/Application Support/drive-sync/config.json"),
-            Path::new("/Users/x/Library/Logs/drive-sync"),
-            Path::new("/Users/x/Library/Application Support/drive-sync/status.json"),
+            Path::new("/Users/x/Library/Application Support/git-drive/config.json"),
+            Path::new("/Users/x/Library/Logs/git-drive"),
+            Path::new("/Users/x/Library/Application Support/git-drive/status.json"),
         );
-        assert!(plist.contains("<string>dev.giacomeli.drive-sync</string>"));
-        let bin = plist.find("<string>/usr/local/bin/drive-sync</string>").unwrap();
+        assert!(plist.contains("<string>dev.giacomeli.git-drive</string>"));
+        let bin = plist.find("<string>/usr/local/bin/git-drive</string>").unwrap();
         let repo = plist.find("<string>/Users/x/repo</string>").unwrap();
         let mount = plist.find("<string>/Users/x/GitDrive</string>").unwrap();
         assert!(bin < repo && repo < mount, "argument order must be preserved");
@@ -282,7 +296,7 @@ mod tests {
     #[test]
     fn render_plist_escapes_xml_in_paths() {
         let plist = render_plist(
-            Path::new("/bin/drive-sync"),
+            Path::new("/bin/git-drive"),
             Path::new("/Users/x/repo & <stuff>"),
             Path::new("/mnt"),
             Path::new("/cfg.json"),

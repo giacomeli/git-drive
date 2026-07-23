@@ -3,7 +3,7 @@
 //! Rule (decision 10 of Phase 2): without a flag, everything stays relative
 //! to the CWD (compatible with the `cargo run` dev flow from the project
 //! root). The standard macOS paths only come in via explicit flags — the
-//! `drive-sync install` command writes those flags into the LaunchAgent
+//! `git-drive install` command writes those flags into the LaunchAgent
 //! plist, so the plist is the readable source of truth for where config,
 //! log and status live.
 
@@ -15,32 +15,32 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
-/// `~/Library/Application Support/drive-sync` (config + status when running via launchd).
+/// `~/Library/Application Support/git-drive` (config + status when running via launchd).
 pub fn app_support_dir() -> PathBuf {
     app_support_dir_from(&home_dir())
 }
 
 pub(crate) fn app_support_dir_from(home: &Path) -> PathBuf {
-    home.join("Library/Application Support/drive-sync")
+    home.join("Library/Application Support/git-drive")
 }
 
-/// `~/Library/Logs/drive-sync` (logs when running via launchd).
+/// `~/Library/Logs/git-drive` (logs when running via launchd).
 pub fn standard_log_dir() -> PathBuf {
     standard_log_dir_from(&home_dir())
 }
 
 pub(crate) fn standard_log_dir_from(home: &Path) -> PathBuf {
-    home.join("Library/Logs/drive-sync")
+    home.join("Library/Logs/git-drive")
 }
 
-/// `~/.config/drive-sync` — canonical config + key directory (user decision
+/// `~/.config/git-drive` — canonical config + key directory (user decision
 /// on 2026-07-06; also aligns with XDG for the future Linux port).
 pub fn config_dir() -> PathBuf {
     config_dir_from(&home_dir())
 }
 
 pub(crate) fn config_dir_from(home: &Path) -> PathBuf {
-    home.join(".config/drive-sync")
+    home.join(".config/git-drive")
 }
 
 pub fn standard_config_path() -> PathBuf {
@@ -60,62 +60,74 @@ pub(crate) fn standard_key_path_from(home: &Path) -> PathBuf {
     config_dir_from(home).join("drive.key")
 }
 
-/// Old locations (pre 2026-07-06), kept as a READ fallback for existing
-/// installations.
-pub fn legacy_config_path() -> PathBuf {
-    app_support_dir().join("config.json")
+/// Old locations, kept as READ/migration fallbacks for existing
+/// installations. Two generations: the project was named drive-sync until
+/// 2026-07 (both dirs), and before 2026-07-06 config lived in Application
+/// Support instead of `~/.config`.
+fn legacy_xdg_config_dir() -> PathBuf {
+    home_dir().join(".config/drive-sync")
 }
 
-pub fn legacy_key_path() -> PathBuf {
-    app_support_dir().join("drive.key")
+fn legacy_app_support_dir() -> PathBuf {
+    home_dir().join("Library/Application Support/drive-sync")
+}
+
+/// Legacy config locations, most recent generation first.
+pub fn legacy_config_paths() -> Vec<PathBuf> {
+    vec![
+        legacy_xdg_config_dir().join("config.json"),
+        legacy_app_support_dir().join("config.json"),
+    ]
+}
+
+/// Legacy key locations, most recent generation first.
+pub fn legacy_key_paths() -> Vec<PathBuf> {
+    vec![
+        legacy_xdg_config_dir().join("drive.key"),
+        legacy_app_support_dir().join("drive.key"),
+    ]
 }
 
 /// Config for READING: explicit flag > `./config.json` (dev flow) >
-/// `~/.config/drive-sync/config.json` > legacy location (Application Support).
+/// `~/.config/git-drive/config.json` > legacy locations (old names/dirs).
 /// If none exists, the default is the XDG path (the "not found" message
 /// points at the canonical location).
 pub fn resolve_config_for_read(flag: Option<&str>) -> PathBuf {
-    resolve_config_for_read_from(
-        flag,
-        Path::new("config.json"),
-        &standard_config_path(),
-        &legacy_config_path(),
-    )
+    let mut candidates = vec![PathBuf::from("config.json"), standard_config_path()];
+    candidates.extend(legacy_config_paths());
+    resolve_config_for_read_from(flag, &candidates)
 }
 
-fn resolve_config_for_read_from(
-    flag: Option<&str>,
-    dev: &Path,
-    xdg: &Path,
-    legacy: &Path,
-) -> PathBuf {
+/// `candidates[1]` (the canonical XDG path) is the default when nothing exists.
+fn resolve_config_for_read_from(flag: Option<&str>, candidates: &[PathBuf]) -> PathBuf {
     if let Some(f) = flag {
         return PathBuf::from(f);
     }
-    for candidate in [dev, xdg, legacy] {
+    for candidate in candidates {
         if candidate.exists() {
-            return candidate.to_path_buf();
+            return candidate.clone();
         }
     }
-    xdg.to_path_buf()
+    candidates[1].clone()
 }
 
-/// Key for READING: explicit value from the config > XDG > legacy location.
+/// Key for READING: explicit value from the config > XDG > legacy locations.
 pub fn resolve_key_for_read(explicit: Option<&str>) -> PathBuf {
-    resolve_key_for_read_from(explicit, &standard_key_path(), &legacy_key_path())
+    let mut candidates = vec![standard_key_path()];
+    candidates.extend(legacy_key_paths());
+    resolve_key_for_read_from(explicit, &candidates)
 }
 
-fn resolve_key_for_read_from(explicit: Option<&str>, xdg: &Path, legacy: &Path) -> PathBuf {
+fn resolve_key_for_read_from(explicit: Option<&str>, candidates: &[PathBuf]) -> PathBuf {
     if let Some(e) = explicit {
         return PathBuf::from(e);
     }
-    if xdg.exists() {
-        return xdg.to_path_buf();
+    for candidate in candidates {
+        if candidate.exists() {
+            return candidate.clone();
+        }
     }
-    if legacy.exists() {
-        return legacy.to_path_buf();
-    }
-    xdg.to_path_buf()
+    candidates[0].clone()
 }
 
 pub fn standard_status_path() -> PathBuf {
@@ -148,15 +160,15 @@ mod tests {
         let home = Path::new("/Users/test");
         assert_eq!(
             app_support_dir_from(home),
-            PathBuf::from("/Users/test/Library/Application Support/drive-sync")
+            PathBuf::from("/Users/test/Library/Application Support/git-drive")
         );
         assert_eq!(
             standard_log_dir_from(home),
-            PathBuf::from("/Users/test/Library/Logs/drive-sync")
+            PathBuf::from("/Users/test/Library/Logs/git-drive")
         );
         assert_eq!(
             config_dir_from(home),
-            PathBuf::from("/Users/test/.config/drive-sync")
+            PathBuf::from("/Users/test/.config/git-drive")
         );
     }
 
@@ -165,65 +177,71 @@ mod tests {
         let home = Path::new("/Users/test");
         assert_eq!(
             standard_config_path_from(home),
-            PathBuf::from("/Users/test/.config/drive-sync/config.json")
+            PathBuf::from("/Users/test/.config/git-drive/config.json")
         );
         assert_eq!(
             standard_key_path_from(home),
-            PathBuf::from("/Users/test/.config/drive-sync/drive.key")
+            PathBuf::from("/Users/test/.config/git-drive/drive.key")
         );
     }
 
     #[test]
-    fn resolve_config_order_flag_dev_xdg_legacy() {
+    fn resolve_config_order_flag_dev_xdg_legacies() {
         let dir = tempdir().unwrap();
         let dev = dir.path().join("config.json");
         let xdg = dir.path().join("xdg/config.json");
-        let legacy = dir.path().join("legacy/config.json");
+        let legacy_xdg = dir.path().join("legacy-xdg/config.json");
+        let legacy_as = dir.path().join("legacy-as/config.json");
+        let candidates = vec![
+            dev.clone(),
+            xdg.clone(),
+            legacy_xdg.clone(),
+            legacy_as.clone(),
+        ];
 
         // flag wins over everything
         assert_eq!(
-            resolve_config_for_read_from(Some("/x/c.json"), &dev, &xdg, &legacy),
+            resolve_config_for_read_from(Some("/x/c.json"), &candidates),
             PathBuf::from("/x/c.json")
         );
         // nothing exists -> default is the XDG path (the "not found" message
         // points at the new canonical location)
-        assert_eq!(
-            resolve_config_for_read_from(None, &dev, &xdg, &legacy),
-            xdg
-        );
-        // legacy exists -> legacy (smooth migration)
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        std::fs::write(&legacy, b"{}").unwrap();
-        assert_eq!(
-            resolve_config_for_read_from(None, &dev, &xdg, &legacy),
-            legacy
-        );
-        // XDG exists -> XDG wins over legacy
+        assert_eq!(resolve_config_for_read_from(None, &candidates), xdg);
+        // oldest legacy (Application Support) exists -> found
+        std::fs::create_dir_all(legacy_as.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_as, b"{}").unwrap();
+        assert_eq!(resolve_config_for_read_from(None, &candidates), legacy_as);
+        // pre-rename XDG exists -> wins over Application Support
+        std::fs::create_dir_all(legacy_xdg.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_xdg, b"{}").unwrap();
+        assert_eq!(resolve_config_for_read_from(None, &candidates), legacy_xdg);
+        // XDG exists -> XDG wins over every legacy
         std::fs::create_dir_all(xdg.parent().unwrap()).unwrap();
         std::fs::write(&xdg, b"{}").unwrap();
-        assert_eq!(resolve_config_for_read_from(None, &dev, &xdg, &legacy), xdg);
+        assert_eq!(resolve_config_for_read_from(None, &candidates), xdg);
         // dev (CWD) exists -> dev wins (cargo run flow in the project)
         std::fs::write(&dev, b"{}").unwrap();
-        assert_eq!(resolve_config_for_read_from(None, &dev, &xdg, &legacy), dev);
+        assert_eq!(resolve_config_for_read_from(None, &candidates), dev);
     }
 
     #[test]
-    fn resolve_key_order_explicit_xdg_legacy() {
+    fn resolve_key_order_explicit_xdg_legacies() {
         let dir = tempdir().unwrap();
         let xdg = dir.path().join("xdg/drive.key");
         let legacy = dir.path().join("legacy/drive.key");
+        let candidates = vec![xdg.clone(), legacy.clone()];
 
         assert_eq!(
-            resolve_key_for_read_from(Some("/k/drive.key"), &xdg, &legacy),
+            resolve_key_for_read_from(Some("/k/drive.key"), &candidates),
             PathBuf::from("/k/drive.key")
         );
-        assert_eq!(resolve_key_for_read_from(None, &xdg, &legacy), xdg);
+        assert_eq!(resolve_key_for_read_from(None, &candidates), xdg);
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, b"k").unwrap();
-        assert_eq!(resolve_key_for_read_from(None, &xdg, &legacy), legacy);
+        assert_eq!(resolve_key_for_read_from(None, &candidates), legacy);
         std::fs::create_dir_all(xdg.parent().unwrap()).unwrap();
         std::fs::write(&xdg, b"k").unwrap();
-        assert_eq!(resolve_key_for_read_from(None, &xdg, &legacy), xdg);
+        assert_eq!(resolve_key_for_read_from(None, &candidates), xdg);
     }
 
     #[test]

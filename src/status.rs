@@ -1,5 +1,5 @@
 //! Observable daemon state, written to `logs/status.json` and read by the
-//! `drive-sync status` subcommand. Timestamps are unix seconds (u64) — human
+//! `git-drive status` subcommand. Timestamps are unix seconds (u64) — human
 //! formatting happens only in the CLI (decision 10 of Phase 1).
 
 use parking_lot::Mutex;
@@ -252,7 +252,7 @@ fn format_ago(now: u64, then: u64) -> String {
 /// the pid check so it can be tested without a real process.
 pub fn format_status(s: &SyncStatus, now: u64, alive: Option<bool>) -> String {
     let mut out = String::new();
-    out.push_str(&format!("drive-sync — branch {}\n", s.branch));
+    out.push_str(&format!("git-drive — branch {}\n", s.branch));
     out.push_str(&format!("  repo: {}\n", s.repo));
     let daemon_line = if let Some(stopped) = s.stopped_at {
         format!("stopped cleanly {}", format_ago(now, stopped))

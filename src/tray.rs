@@ -1,4 +1,4 @@
-//! Menu bar status icon (`drive-sync tray`).
+//! Menu bar status icon (`git-drive tray`).
 //!
 //! Separate process from the daemon (decision 1 of Phase 2): polls
 //! `status.json` and reflects the state in the icon and menu. Crates
@@ -145,12 +145,12 @@ fn icon_rgba(color: [u8; 4], size: u32) -> Vec<u8> {
 }
 
 /// Version + build identifier of the running binary, for the tray menu.
-/// `DRIVE_SYNC_BUILD` is injected by `build.rs`.
+/// `GIT_DRIVE_BUILD` is injected by `build.rs`.
 fn build_line() -> String {
     format!(
         "build v{} · {}",
         env!("CARGO_PKG_VERSION"),
-        env!("DRIVE_SYNC_BUILD")
+        env!("GIT_DRIVE_BUILD")
     )
 }
 
@@ -178,7 +178,7 @@ fn open_in_file_manager(path: &str) {
 /// works cross-platform, replacing the macOS-only `osascript`/Terminal hack.
 /// Uses the current executable so it does not depend on PATH.
 fn spawn_viewer(status_path: &Path) {
-    let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("drive-sync"));
+    let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("git-drive"));
     let _ = std::process::Command::new(bin)
         .arg("viewer")
         .arg("--file")
@@ -202,7 +202,7 @@ pub fn run(status_path: PathBuf) -> anyhow::Result<()> {
     }
 
     // Menu: summary lines (disabled) + actions.
-    let header = MenuItem::new("drive-sync", false, None);
+    let header = MenuItem::new("git-drive", false, None);
     let build = MenuItem::new(build_line(), false, None);
     let line1 = MenuItem::new("loading status...", false, None);
     let line2 = MenuItem::new("", false, None);
@@ -241,7 +241,7 @@ pub fn run(status_path: PathBuf) -> anyhow::Result<()> {
                     TrayIconBuilder::new()
                         .with_menu(Box::new(menu.clone()))
                         .with_icon(make_icon(TrayState::Stopped))
-                        .with_tooltip("drive-sync")
+                        .with_tooltip("git-drive")
                         .build()
                         .expect("create tray icon"),
                 );
@@ -255,13 +255,13 @@ pub fn run(status_path: PathBuf) -> anyhow::Result<()> {
             let alive = current.as_ref().and_then(|s| status::pid_alive(s.pid));
             let (state, lines) = evaluate(current.as_ref(), status::now_unix(), alive);
 
-            header.set_text(format!("drive-sync — {}", state.label()));
+            header.set_text(format!("git-drive — {}", state.label()));
             line1.set_text(lines.first().cloned().unwrap_or_default());
             line2.set_text(lines.get(1).cloned().unwrap_or_default());
             line3.set_text(lines.get(2).cloned().unwrap_or_default());
             if let Some(t) = &tray {
                 let _ = t.set_icon(Some(make_icon(state)));
-                let _ = t.set_tooltip(Some(format!("drive-sync — {}", state.label())));
+                let _ = t.set_tooltip(Some(format!("git-drive — {}", state.label())));
             }
         }
 

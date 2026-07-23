@@ -9,7 +9,7 @@ The `SyncManager` decouples three different cadences: (a) receiving operations f
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'primaryColor':'#E3F2FD','primaryTextColor':'#0D47A1','primaryBorderColor':'#1976D2','lineColor':'#546E7A'}}}%%
 sequenceDiagram
-    accTitle: drive-sync synchronization flow
+    accTitle: git-drive synchronization flow
     accDescr: FUSE operations enter the causal queue; the debounce watcher drains it, applies to disk, commits and pushes under the repo lock; the pull watcher fetches remote changes under the same lock, only with a clean working tree.
 
     participant User as User / App
@@ -102,7 +102,7 @@ pub struct SyncManager {
 - `refresh_flag` — `AtomicBool` set when HEAD advances via pull or reconcile; consumed by `GitDriveFS::refresh_if_needed`.
 - `commit_generation` — `AtomicU64` incremented on every commit created by the drain; `GitDriveFS` compares it with the last value it observed to discard write buffers whose content is already in HEAD.
 - `repo_lock` — serializes the complete drain and pull cycles. The atomic unit is the cycle, not the individual git call: a commit landing between the pull's fetch and its checkout was the race window.
-- `status` — observable state (`src/status.rs`): boot/drain/pull events and the session's conflicted copies, persisted atomically to `logs/status.json` when `enable_status_file` is called (main enables it at boot). Read by the `drive-sync status` subcommand.
+- `status` — observable state (`src/status.rs`): boot/drain/pull events and the session's conflicted copies, persisted atomically to `logs/status.json` when `enable_status_file` is called (main enables it at boot). Read by the `git-drive status` subcommand.
 
 ### `SyncOp` and the causal queue
 
@@ -120,7 +120,7 @@ pub enum SyncOp {
 
 `WriteContent` has two forms: `Mem(Arc<Vec<u8>>)` — the SAME `Arc` as the inode's write buffer,
 with no copy at flush time — and `Spooled(PathBuf)` — a snapshot in a spool file
-(`.git/drive-sync-spool/`) for buffers above `large_file_threshold_mb`, applied at drain time with
+(`.git/git-drive-spool/`) for buffers above `large_file_threshold_mb`, applied at drain time with
 a `rename` (never passing through RAM).
 
 The queue preserves **arrival order** — the FUSE kernel's order is the causal order. The only coalescing allowed (`push_coalescing`): a `Write` replaces in-place the most recent `Write` for the same path, as long as no op after it touches a related path (equal or ancestor/descendant) — `Rename`, `Delete`, `Mkdir`, `Rmdir` and `Symlink` act as barriers. A replaced spooled snapshot has its file removed immediately. Correctness never depends on coalescing; it only avoids redundant content during write storms.
@@ -145,7 +145,7 @@ Flow, see `src/sync.rs::spawn_watcher`:
 3. Under the `inner` lock: if `last_op.elapsed() >= debounce` and the queue is not empty, `mem::take` the queue; otherwise keeps waiting.
 4. Acquires `repo_lock` (held for the entire cycle; there is no `.await` within the guard's scope).
 5. Iterates the batch **in queue order**, calling `apply_op_to_disk` for each `SyncOp`. With encryption enabled, the plaintext->ciphertext path translation and content sealing happen at THIS materialization (the queue works 100% in plaintext). Then, with chunking enabled (`chunk_threshold_mb > 0`), the scan converts any raw file above the threshold into manifest + `.chunks/` (with encryption, each chunk is sealed and the hash is of the ciphertext); the migration scans conform the worktree to the config state (encrypt everything or decrypt everything, with a warning that history stays as it was); and the GC removes chunks that no manifest references (requires the key when manifests are sealed — never collects blindly).
-6. If `user_name`/`user_email` are present, `commit_batch` builds the message `drive-sync: <N> changes (...)` and calls `git::commit_working_tree` (`add_all` with `IndexAddOption::DEFAULT` — files matching the mounted repo's `.gitignore` stay out of the commit by specification; in the mount they become visible local-only files). A created commit increments `commit_generation`.
+6. If `user_name`/`user_email` are present, `commit_batch` builds the message `git-drive: <N> changes (...)` and calls `git::commit_working_tree` (`add_all` with `IndexAddOption::DEFAULT` — files matching the mounted repo's `.gitignore` stay out of the commit by specification; in the mount they become visible local-only files). A created commit increments `commit_generation`.
 7. If a commit happened and `remote_name` is configured, `push_batch` calls `git::push_to_remote`. A rejected push (typically non-FF) triggers `reconcile_and_retry_push`: fetch + `pull_and_merge` + one push retry. Recovery sets `refresh_flag`. The local commit is never reverted.
 8. At the end of the cycle, `status.record_drain` records the applied ops, the commit oid, the push result and any ops still pending in the queue — and persists `status.json`.
 
@@ -218,7 +218,7 @@ Errors are logged and the batch proceeds — the remaining files are still attem
 
 `src/sync.rs::build_commit_message`:
 
-- Format: `drive-sync: <N> changes (<p1>, <p2>, <p3>[, +M more])`
+- Format: `git-drive: <N> changes (<p1>, <p2>, <p3>[, +M more])`
 - Up to 3 paths inline; beyond that, `+<M> more` is appended.
 - `<path>` comes from `SyncOp::primary_path`.
 

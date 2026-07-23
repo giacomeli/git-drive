@@ -1,8 +1,8 @@
 use clap::{Arg, ArgMatches, Command};
-use drive_sync::config::Config;
-use drive_sync::fs::GitDriveFS;
-use drive_sync::git;
-use drive_sync::sync::SyncManager;
+use git_drive::config::Config;
+use git_drive::fs::GitDriveFS;
+use git_drive::git;
+use git_drive::sync::SyncManager;
 use fuser::MountOption;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -29,7 +29,7 @@ fn install_panic_hook() {
 }
 
 fn cli() -> Command {
-    Command::new("drive-sync")
+    Command::new("git-drive")
         .version("0.1.0")
         .about("Git-backed versioned filesystem")
         .subcommand_negates_reqs(true)
@@ -80,7 +80,7 @@ fn cli() -> Command {
                             Arg::new("out")
                                 .long("out")
                                 .value_name("PATH")
-                                .help("Where to write the key (default: ~/.config/drive-sync/drive.key)"),
+                                .help("Where to write the key (default: ~/.config/git-drive/drive.key)"),
                         )
                         .arg(
                             Arg::new("force")
@@ -143,7 +143,7 @@ fn cli() -> Command {
             Arg::new("config")
                 .long("config")
                 .value_name("PATH")
-                .help("Path to config.json (default: ./config.json, then ~/.config/drive-sync/config.json)"),
+                .help("Path to config.json (default: ./config.json, then ~/.config/git-drive/config.json)"),
         )
         .arg(
             Arg::new("log-dir")
@@ -168,47 +168,47 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(sub) = matches.subcommand_matches("status") {
         let file =
-            drive_sync::paths::resolve_status_for_read(sub.get_one::<String>("file").map(String::as_str));
+            git_drive::paths::resolve_status_for_read(sub.get_one::<String>("file").map(String::as_str));
         return run_status(&file);
     }
     if let Some(sub) = matches.subcommand_matches("install") {
-        return drive_sync::launchd::install(
+        return git_drive::launchd::install(
             sub.get_one::<String>("repo").unwrap(),
             sub.get_one::<String>("mount").unwrap(),
             sub.get_flag("with-tray"),
         );
     }
     if matches.subcommand_matches("uninstall").is_some() {
-        return drive_sync::launchd::uninstall();
+        return git_drive::launchd::uninstall();
     }
     if let Some(sub) = matches.subcommand_matches("key") {
         if let Some(gen) = sub.subcommand_matches("generate") {
             let out = gen
                 .get_one::<String>("out")
                 .map(PathBuf::from)
-                .unwrap_or_else(drive_sync::paths::standard_key_path);
-            drive_sync::crypt::generate_key_file(&out, gen.get_flag("force"))?;
+                .unwrap_or_else(git_drive::paths::standard_key_path);
+            git_drive::crypt::generate_key_file(&out, gen.get_flag("force"))?;
             println!("key generated at: {}", out.display());
             println!("IMPORTANT: without this key the encrypted data is UNRECOVERABLE — back it up outside the repo.");
             return Ok(());
         }
-        anyhow::bail!("usage: drive-sync key generate [--out <path>] [--force]");
+        anyhow::bail!("usage: git-drive key generate [--out <path>] [--force]");
     }
     if let Some(sub) = matches.subcommand_matches("tray") {
         let file =
-            drive_sync::paths::resolve_status_for_read(sub.get_one::<String>("file").map(String::as_str));
+            git_drive::paths::resolve_status_for_read(sub.get_one::<String>("file").map(String::as_str));
         // The tray takes over the main thread with the AppKit event loop —
         // that is why the dispatch happens before any tokio runtime.
-        return drive_sync::tray::run(file);
+        return git_drive::tray::run(file);
     }
     if let Some(sub) = matches.subcommand_matches("viewer") {
-        let file = drive_sync::paths::resolve_status_for_read(
+        let file = git_drive::paths::resolve_status_for_read(
             sub.get_one::<String>("file").map(String::as_str),
         );
         let log = sub.get_one::<String>("log").map(PathBuf::from);
         // Like the tray, the viewer owns the main thread (eframe event loop),
         // so it dispatches before any tokio runtime is created.
-        return drive_sync::viewer::run(file, log);
+        return git_drive::viewer::run(file, log);
     }
 
     run_mount(&matches)
@@ -218,7 +218,7 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     let repo_path = matches.get_one::<String>("repo").unwrap().clone();
     let mount_path = matches.get_one::<String>("mount").unwrap().clone();
     let verbose = matches.get_flag("verbose");
-    let config_path = drive_sync::paths::resolve_config_for_read(
+    let config_path = git_drive::paths::resolve_config_for_read(
         matches.get_one::<String>("config").map(String::as_str),
     )
     .to_string_lossy()
@@ -240,7 +240,7 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     // `log` output). `--verbose` mirrors every record to stderr, like the old
     // tee. The handle must stay alive for the whole run. `log_path` is the
     // active (current) file, announced on `/dev/tty` and published in status.
-    let (_log_handle, log_path) = drive_sync::init_logging(
+    let (_log_handle, log_path) = git_drive::init_logging(
         verbose,
         &log_dir,
         &config.log_level,
@@ -285,28 +285,28 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     // At-rest encryption (Phase 2.7): enabled without a readable key ABORTS
     // the boot — degrading to cleartext would publish plaintext while
     // believing it encrypts.
-    let crypto: Option<std::sync::Arc<drive_sync::crypt::Crypto>> = if config.encryption_enabled {
+    let crypto: Option<std::sync::Arc<git_drive::crypt::Crypto>> = if config.encryption_enabled {
         let key_path =
-            drive_sync::paths::resolve_key_for_read(config.encryption_key_file.as_deref());
-        let master = drive_sync::crypt::load_key_file(&key_path).map_err(|e| {
+            git_drive::paths::resolve_key_for_read(config.encryption_key_file.as_deref());
+        let master = git_drive::crypt::load_key_file(&key_path).map_err(|e| {
             anyhow::anyhow!(
-                "encryption enabled in config but the key could not be loaded: {} — generate one with `drive-sync key generate`",
+                "encryption enabled in config but the key could not be loaded: {} — generate one with `git-drive key generate`",
                 e
             )
         })?;
         log::info!("boot: encryption ENABLED (key: {})", key_path.display());
         Some(std::sync::Arc::new(
-            drive_sync::crypt::Crypto::from_master_key(&master),
+            git_drive::crypt::Crypto::from_master_key(&master),
         ))
     } else {
         // Disabled in config: if the key exists, it stays available ONLY for
         // the migration back to cleartext (the worktree may still be encrypted).
         let key_path =
-            drive_sync::paths::resolve_key_for_read(config.encryption_key_file.as_deref());
+            git_drive::paths::resolve_key_for_read(config.encryption_key_file.as_deref());
         if key_path.exists() {
-            if let Ok(master) = drive_sync::crypt::load_key_file(&key_path) {
+            if let Ok(master) = git_drive::crypt::load_key_file(&key_path) {
                 sync.set_migration_crypto(Some(std::sync::Arc::new(
-                    drive_sync::crypt::Crypto::from_master_key(&master),
+                    git_drive::crypt::Crypto::from_master_key(&master),
                 )));
                 log::info!(
                     "boot: encryption disabled; key present — migration to cleartext active"
@@ -325,7 +325,7 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     // Size-bounded drain batches: a mass copy becomes N bounded commits
     // published one by one, instead of a single giant pack (2026-07-10).
     sync.set_batching(config.commit_batch_mb * 1024 * 1024);
-    // Observable status (read by `drive-sync status` and by the tray)
+    // Observable status (read by `git-drive status` and by the tray)
     sync.enable_status_file(status_file);
     sync.status_state()
         .set_runtime_info(&mount_path, &log_path.to_string_lossy());
@@ -343,7 +343,7 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     // - `local`: treats the volume as a local disk instead of a network share.
     //   Without it, Finder caches listings and does not react to changes it
     //   just made itself (known bug with mounts flagged as "remote").
-    // - `volname=drive-sync`: friendly name in Finder instead of "macFUSE Volume 0".
+    // - `volname=git-drive`: friendly name in Finder instead of "macFUSE Volume 0".
     // - `noappledouble`: the kernel does not generate `._*` (AppleDouble) files
     //   on the mount. Reinforces our ephemeral filter in sync, as a native fallback.
     #[allow(unused_mut)]
@@ -357,7 +357,7 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
         options.push(MountOption::AutoUnmount);
         options.push(MountOption::AllowOther);
         options.push(MountOption::CUSTOM("local".to_string()));
-        options.push(MountOption::CUSTOM("volname=drive-sync".to_string()));
+        options.push(MountOption::CUSTOM("volname=git-drive".to_string()));
         options.push(MountOption::CUSTOM("noappledouble".to_string()));
         // macFUSE's default daemon_timeout is 60s. When pasting a folder with
         // many subfolders/files, the CREATE+WRITE+FLUSH+RELEASE cycle can
@@ -378,7 +378,7 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     sync_handle.enable_notifications();
     sync_handle
         .notifier()
-        .notify(drive_sync::notify::NotifyEvent::Mounted {
+        .notify(git_drive::notify::NotifyEvent::Mounted {
             mount: mount_path.clone(),
         });
 
@@ -419,7 +419,7 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     sync_handle.status_state().record_stopped();
     sync_handle
         .notifier()
-        .notify(drive_sync::notify::NotifyEvent::Stopped);
+        .notify(git_drive::notify::NotifyEvent::Stopped);
     log::info!("shutdown: clean stop completed");
 
     Ok(())
@@ -525,9 +525,9 @@ fn clear_stale_mount(mount: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `drive-sync status`: reads the status.json written by the daemon and formats it.
+/// `git-drive status`: reads the status.json written by the daemon and formats it.
 fn run_status(file: &Path) -> anyhow::Result<()> {
-    use drive_sync::status;
+    use git_drive::status;
     match status::read_from(file) {
         Ok(s) => {
             let alive = status::pid_alive(s.pid);
@@ -536,7 +536,7 @@ fn run_status(file: &Path) -> anyhow::Result<()> {
         Err(e) => {
             println!("No status available ({}).", e);
             println!(
-                "Mount a repository first: drive-sync -r <repo> -m <mount> — the daemon writes status.json to the log dir (default: logs/ of the directory it was launched from). Use --file to point to another path."
+                "Mount a repository first: git-drive -r <repo> -m <mount> — the daemon writes status.json to the log dir (default: logs/ of the directory it was launched from). Use --file to point to another path."
             );
         }
     }

@@ -2,7 +2,7 @@
 //! is always identifiable (shown in the tray menu).
 //!
 //! Resolution order:
-//! 1. `DRIVE_SYNC_BUILD` env at build time (set by the deploy step — works even
+//! 1. `GIT_DRIVE_BUILD` env at build time (set by the deploy step — works even
 //!    when the source was rsync'd without a `.git`, e.g. the Arch build tree).
 //! 2. `git rev-parse --short HEAD` (+ `-dirty`) when built inside a git repo.
 //! 3. `unknown` as a last resort.
@@ -10,15 +10,15 @@
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=DRIVE_SYNC_BUILD");
+    println!("cargo:rerun-if-env-changed=GIT_DRIVE_BUILD");
 
-    let build = std::env::var("DRIVE_SYNC_BUILD")
+    let build = std::env::var("GIT_DRIVE_BUILD")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .or_else(git_describe)
         .unwrap_or_else(|| "unknown".to_string());
 
-    println!("cargo:rustc-env=DRIVE_SYNC_BUILD={build}");
+    println!("cargo:rustc-env=GIT_DRIVE_BUILD={build}");
 }
 
 fn git_describe() -> Option<String> {

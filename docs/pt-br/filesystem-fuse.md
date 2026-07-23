@@ -201,7 +201,7 @@ ler o path novo antes do commit caía num blob inexistente no HEAD e retornava `
 5. **Escritas não-commitadas são perdidas em crash** antes do debounce drenar.
 6. **Swap implícito exige exatamente um arquivo-filho** no diretório de origem — ambiguidade retorna `EXDEV` e o app degrada para o fluxo de cópia.
 7. **Cache de blobs não cobre arquivos maiores que o orçamento** (`read_cache_mb`) — leituras deles vão ao repo a cada syscall, mas por um handle persistente (uma abertura por mount, não uma por syscall).
-8. **Write buffers acima de `large_file_threshold_mb` vivem em spool** (`.git/drive-sync-spool/`) com acesso randômico — pico de RAM limitado ao limiar; snapshot da fila é aplicado no drain com `rename`.
+8. **Write buffers acima de `large_file_threshold_mb` vivem em spool** (`.git/git-drive-spool/`) com acesso randômico — pico de RAM limitado ao limiar; snapshot da fila é aplicado no drain com `rename`.
 9. **Arquivos ignorados pelo `.gitignore` do repo são local-only visíveis** — aparecem no mount, persistem no working tree entre remounts e nunca entram em commit/push.
 10. **Repo cifrado é transparente** — com `encryption_enabled`, índices nascem dos nomes decifrados, leituras abrem AEAD (chave errada/blob adulterado = `EIO`), readlink apresenta alvo claro e conflicted copies mostram o prefixo decifrado. Ignore/local-only ficam desativados nesse modo.
 11. **Arquivos chunkados são transparentes** — path com manifest expõe tamanho real e leitura remontada por chunk (sha256 verificado, mismatch = `EIO`); `.chunks/` é invisível no mount.

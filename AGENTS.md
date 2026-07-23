@@ -38,15 +38,15 @@ cargo run -- key generate [--out <path>] [--force]  # at-rest encryption key
 ```
 
 Mount-mode flags: `--config`, `--log-dir`, `--status-file`. Config resolution without the flag:
-`./config.json` (dev) > `~/.config/drive-sync/config.json` (canonical, with the encryption key
-next to it) > legacy location in `~/Library/Application Support/drive-sync/` (`install` migrates).
-Status stays in `~/Library/Application Support/drive-sync/`, logs in `~/Library/Logs/drive-sync/`.
+`./config.json` (dev) > `~/.config/git-drive/config.json` (canonical, with the encryption key
+next to it) > legacy location in `~/Library/Application Support/git-drive/` (`install` migrates).
+Status stays in `~/Library/Application Support/git-drive/`, logs in `~/Library/Logs/git-drive/`.
 
 Requires macFUSE on macOS (`brew install macfuse`). The mount directory must exist before the command.
 
 ## Overview
 
-drive-sync is a FUSE filesystem in Rust that exposes files of a Git repository as a mountable
+git-drive is a FUSE filesystem in Rust that exposes files of a Git repository as a mountable
 filesystem, with bidirectional sync via Git: local writes become automatic commits + pushes and
 remote changes arrive via periodic pull. It behaves like a "Dropbox-style" drive where the remote
 is a Git repository (including GitHub).
@@ -64,7 +64,7 @@ is a Git repository (including GitHub).
 | `src/notify.rs` | macOS notifications via `osascript`: pure formatting, `Notifier` off by default, `RateLimiter` (first + 1/h) for persistent events. |
 | `src/tray.rs` | Menu bar icon (`tray-icon` + `tao`): status.json polling, 4 visual states mapped by `evaluate` (pure), menu with Finder/log tail/status/quit. |
 | `src/lib.rs` | Re-exports modules to enable integration tests (`tests/*.rs`). |
-| `src/fs.rs` | `GitDriveFS` implements `fuser::Filesystem`. Hierarchical model with `FileEntry`/`DirEntry` (kind Regular/Symlink and local-only flag), atomic inode allocator, `apply_*` functions for pure testable logic (includes `apply_write`/`apply_truncate`/`apply_flush`/`apply_readlink`/`apply_symlink`). Write buffers initialized from HEAD with a per-inode dirty flag — copy-on-write RAM (`Arc` shared with the queue) below `large_file_threshold_mb`, spool file in `.git/drive-sync-spool/` above; gc of clean buffers when `commit_generation` advances or on post-pull refresh. Ignored working-tree files appear as visible local-only entries (boot/refresh/gc). mtime derived from the last commit per path (`derived_times`); reads on cache miss use a persistent repo handle. `setattr` + in-memory xattrs (`mode_overrides`, `times`, `xattrs`). |
+| `src/fs.rs` | `GitDriveFS` implements `fuser::Filesystem`. Hierarchical model with `FileEntry`/`DirEntry` (kind Regular/Symlink and local-only flag), atomic inode allocator, `apply_*` functions for pure testable logic (includes `apply_write`/`apply_truncate`/`apply_flush`/`apply_readlink`/`apply_symlink`). Write buffers initialized from HEAD with a per-inode dirty flag — copy-on-write RAM (`Arc` shared with the queue) below `large_file_threshold_mb`, spool file in `.git/git-drive-spool/` above; gc of clean buffers when `commit_generation` advances or on post-pull refresh. Ignored working-tree files appear as visible local-only entries (boot/refresh/gc). mtime derived from the last commit per path (`derived_times`); reads on cache miss use a persistent repo handle. `setattr` + in-memory xattrs (`mode_overrides`, `times`, `xattrs`). |
 | `src/git.rs` | Wrapper over `git2`. Besides reads (`list_files_at_commit` returns `ListedFile` with `FileKind` Regular/Symlink via filemode 120000), exposes `current_branch_name`, `list_dirs_at_commit`, `list_ignored_files` (local-only candidates), `commit_times_by_path` (single mtime revwalk with a ceiling), `commit_working_tree` (the `add_all` with `DEFAULT` honors the mounted repo's `.gitignore` — specified and tested behavior), `push_to_remote`, `fetch_remote`, `merge_ff_only`, `pull_and_merge` (3-way + conflicted copy), `is_working_tree_clean` (pull guard; ignored files do not block) and the `MergeOutcome` enum (`NoOp`/`FastForwarded`/`Merged`/`Conflicted`). |
 | `src/sync.rs` | `SyncManager` with the `SyncOp` enum (Write/Delete/Mkdir/Rmdir/Rename/Symlink) and a causal queue in arrival order (`push_coalescing`: Write coalesces in-place; rename/delete/mkdir/rmdir/symlink are barriers). `SyncOp::Write` carries `WriteContent` — `Mem(Arc)` shared with the write buffer or `Spooled(PathBuf)` applied by rename at drain. Debounce watcher applies operations + commit + push; the periodic pull watcher signals refresh via `AtomicBool`. The two cycles are serialized by `repo_lock`; pull requires a clean working tree (`is_working_tree_clean`). Filters ephemeral macOS paths (`._*`, `.DS_Store`, `.Spotlight-V100`, `.Trashes`, etc.) in `enqueue`. |
 | `src/config.rs` | `Config::load_from` loads `config.json` with silent fallback to defaults. Fields: `write_debounce_secs`, `pull_interval_secs`, `read_cache_mb`, `large_file_threshold_mb`, `chunk_threshold_mb`, `chunk_size_mb`, `commit_batch_mb`, `user_name`, `user_email`, `remote_token`, `log_max_mb`, `log_keep_files`, `log_level`. |
@@ -93,8 +93,8 @@ is a Git repository (including GitHub).
 | `chunk_size_mb` | `u64` | `80` | Maximum size of each chunk. |
 | `commit_batch_mb` | `u64` | `256` | Maximum content bytes per drain batch: the causal queue is split into size-bounded batches, each its own commit, published one push per commit (bounded packs — a single giant pack is what GitHub aborts). A single file larger than the limit forms a batch of its own. `0` disables batching. |
 | `encryption_enabled` | `bool` | `false` | At-rest encryption: content AND names encrypted in the repo (FUSE presents plaintext). Changing the value migrates the worktree on the next drain — prior history stays as it was. Enabled without a readable key ABORTS boot. |
-| `encryption_key_file` | `Option<String>` | `None` | Master key file (64 hex, 0600). Absent = `~/.config/drive-sync/drive.key` (read fallback in the legacy location). Generate with `drive-sync key generate`. LOSING THE KEY = LOSING THE DATA. |
-| `large_file_threshold_mb` | `u64` | `64` | Threshold above which write buffers go to a disk spool file (`.git/drive-sync-spool/`) instead of RAM. `0` disables the spool. |
+| `encryption_key_file` | `Option<String>` | `None` | Master key file (64 hex, 0600). Absent = `~/.config/git-drive/drive.key` (read fallback in the legacy location). Generate with `git-drive key generate`. LOSING THE KEY = LOSING THE DATA. |
+| `large_file_threshold_mb` | `u64` | `64` | Threshold above which write buffers go to a disk spool file (`.git/git-drive-spool/`) instead of RAM. `0` disables the spool. |
 | `user_name` | `Option<String>` | `None` | Identity used in commits. If absent, commits are skipped (the working tree keeps updating). |
 | `user_email` | `Option<String>` | `None` | Same treatment as `user_name`. |
 | `remote_token` | `Option<String>` | `None` | HTTPS token (e.g., GitHub PAT). If absent, uses the system ssh-agent/credential helper. **Plain text — keep `config.json` in `.gitignore`.** |
@@ -108,7 +108,7 @@ is a Git repository (including GitHub).
 2. `flush` -> `apply_flush`: enqueues `SyncOp::Write` in the `SyncManager` **only if dirty** (closing a read-only fd is a no-op) and clears the mark. The content is a shared snapshot (`Arc`) or a disk-to-disk copy of the spool — never a full in-RAM copy.
 3. The debounce watcher drains the queue after `write_debounce_secs` of idleness and holds `repo_lock` for the whole cycle.
 4. Each `SyncOp` is applied to the working tree **in arrival order** (`fs::write` or spool rename, `fs::rename`, `mkdir -p + .gitkeep`, real symlink, etc.). After application, the chunking sweep converts any raw file above `chunk_threshold_mb` into manifest + `.chunks/` and the GC removes chunks no manifest references.
-5. If an identity is present, `git::commit_working_tree` creates **1 commit** with message `drive-sync: N changes (p1, p2, p3[, +M more])` and increments `commit_generation`. Paths matching the mounted repo's `.gitignore` stay out of the commit — in the mount they remain visible as local-only.
+5. If an identity is present, `git::commit_working_tree` creates **1 commit** with message `git-drive: N changes (p1, p2, p3[, +M more])` and increments `commit_generation`. Paths matching the mounted repo's `.gitignore` stay out of the commit — in the mount they remain visible as local-only.
 6. If `remote_name` is present, `git::push_to_remote` publishes to the branch. Failure triggers `reconcile_and_retry_push` (fetch + `pull_and_merge` + retry). The local commit is never reverted.
 7. In parallel, the pull watcher every `pull_interval_secs` — under `repo_lock` and **only with a clean working tree** — runs `git::fetch_remote` + `git::pull_and_merge` (or `merge_ff_only` when identity-less). On any outcome that touches the tree (FF/Merged/Conflicted), it sets `refresh_flag`.
 8. `GitDriveFS::refresh_if_needed` (called in `lookup`/`getattr`/`readdir`) discards non-dirty buffers when `commit_generation` advanced or on post-pull refresh, and rebuilds indices preserving inodes of still-existing paths.
@@ -134,7 +134,7 @@ The suite covers ~253 tests: 110 unit (`config`, `git` — including symlink/ign
 
 ## Known limitations
 
-1. **Automatic `.gitkeep` on `mkdir`.** Git does not track empty directories; drive-sync creates/removes `.gitkeep` to keep the illusion.
+1. **Automatic `.gitkeep` on `mkdir`.** Git does not track empty directories; git-drive creates/removes `.gitkeep` to keep the illusion.
 2. **Plain-text credentials** in `config.json`. `.gitignore` covers the file by default. A keychain mechanism is future work.
 3. **3-way merge with conflicted copy.** Pull uses `pull_and_merge` when an identity is configured: FF if possible, otherwise 3-way merge; on conflict, the local version goes to `<path>.conflict-<host>-<ts>` and the remote one becomes canonical (merge commit with 2 parents). Identity-less, it degrades to `merge_ff_only` (stalls on divergence).
     **Pull requires a clean working tree.** With uncommitted changes, the iteration is skipped — in identity-less mode (commits skipped), the first local write blocks pull until a manual commit or identity configuration. Sync becomes effectively unidirectional in that mode.
@@ -145,7 +145,7 @@ The suite covers ~253 tests: 110 unit (`config`, `git` — including symlink/ign
 7. **Permission metadata in memory.** Exposed `uid`/`gid` are those of the process that mounted FUSE (via `libc::getuid()`/`getgid()`). `chmod` is accepted and stored in `mode_overrides` (per-inode) but **does not persist** across mounts — Git only tracks `0o644`/`0o755`. `chown` is silently accepted and ignored.
 8. **mtime derived from history; session touches in memory.** An untouched file exposes the timestamp of the last commit that touched the path (single revwalk at boot/refresh, 4096-commit ceiling, the remainder falls back to HEAD's timestamp); `touch` in `flush`/`setattr` takes precedence and does not persist across mounts. `atime`/`ctime`/`crtime` mirror the available mtime. Local-only entries and directories use `boot_time`. Stable mtime across `getattr`s is what unblocks saving in macOS apps that detect "external modification" via stat.
 9. **xattrs in memory.** `setxattr`/`getxattr`/`listxattr`/`removexattr` store in `HashMap<u64, HashMap<OsString, Vec<u8>>>`. Lost on remount — macOS Versions only works while the mount is alive. Git does not store arbitrary xattrs.
-10. **Detached HEAD aborts boot.** drive-sync requires a named branch.
+10. **Detached HEAD aborts boot.** git-drive requires a named branch.
 11. **The blob cache does not cover files larger than the budget** (`read_cache_mb`) — for them every read goes to the repo, but via the persistent handle (one open per mount). Write buffers above `large_file_threshold_mb` live in an on-disk spool.
 12. **Refresh only triggers on `lookup`/`getattr`/`readdir`.** If the kernel caches `getattr` (1s TTL), remote changes can take up to that TTL to appear.
 13. **Ambiguous implicit swap** (more than one file at the origin) returns `EXDEV` and the app degrades to a copy.

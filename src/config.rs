@@ -81,7 +81,7 @@ pub struct Config {
     #[serde(default = "default_encryption_enabled")]
     pub encryption_enabled: bool,
     /// File holding the master key (64 hex, permission 0600). Absent = the
-    /// platform's default path. Generate it with `drive-sync key generate`.
+    /// platform's default path. Generate it with `git-drive key generate`.
     #[serde(default)]
     pub encryption_key_file: Option<String>,
     #[serde(default)]

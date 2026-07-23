@@ -1,4 +1,4 @@
-# Technical documentation — drive-sync
+# Technical documentation — git-drive
 
 Architectural documentation for the project. For build/run and a high-level overview, see the
 root [README](../README.md); for agent/contributor guidance, [AGENTS.md](../AGENTS.md).

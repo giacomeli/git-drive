@@ -436,7 +436,9 @@ impl GitDriveFS {
         }
 
         // Large buffer spool: leftovers from a previous crash are garbage.
-        let spool_dir = std::path::Path::new(repo_path).join(".git/drive-sync-spool");
+        // The pre-rename dir (drive-sync-spool) is the same garbage.
+        let _ = std::fs::remove_dir_all(std::path::Path::new(repo_path).join(".git/drive-sync-spool"));
+        let spool_dir = std::path::Path::new(repo_path).join(".git/git-drive-spool");
         let _ = std::fs::remove_dir_all(&spool_dir);
         let _ = std::fs::create_dir_all(&spool_dir);
 
@@ -1139,7 +1141,7 @@ impl GitDriveFS {
     }
 
     /// Creates a symlink `parent/name -> target`. The target is opaque text
-    /// (never resolved by drive-sync); the committed blob is the text itself.
+    /// (never resolved by git-drive); the committed blob is the text itself.
     pub fn apply_symlink(
         &mut self,
         parent: u64,

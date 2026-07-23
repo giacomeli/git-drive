@@ -201,7 +201,7 @@ this, reading the new path before the commit hit a blob that did not exist at HE
 5. **Uncommitted writes are lost on a crash** before the debounce drains.
 6. **The implicit swap requires exactly one child file** in the source directory — ambiguity returns `EXDEV` and the app degrades to the copy flow.
 7. **The blob cache does not cover files larger than the budget** (`read_cache_mb`) — their reads go to the repo on every syscall, but through a persistent handle (one open per mount, not one per syscall).
-8. **Write buffers above `large_file_threshold_mb` live in a spool** (`.git/drive-sync-spool/`) with random access — RAM peak bounded by the threshold; the queue snapshot is applied at drain with `rename`.
+8. **Write buffers above `large_file_threshold_mb` live in a spool** (`.git/git-drive-spool/`) with random access — RAM peak bounded by the threshold; the queue snapshot is applied at drain with `rename`.
 9. **Files ignored by the repo's `.gitignore` are visible local-only** — they appear in the mount, persist in the working tree across remounts and never enter a commit/push.
 10. **An encrypted repo is transparent** — with `encryption_enabled`, indexes are born from the decrypted names, reads open AEAD (wrong key/tampered blob = `EIO`), readlink presents the plaintext target and conflicted copies show the decrypted prefix. Ignore/local-only are disabled in this mode.
 11. **Chunked files are transparent** — a path with a manifest exposes the real size and reads reassembled per chunk (sha256 verified, mismatch = `EIO`); `.chunks/` is invisible in the mount.

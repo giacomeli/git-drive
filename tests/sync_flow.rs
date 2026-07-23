@@ -1,7 +1,7 @@
 mod common;
 
 use common::{commit_file, file_exists, init_bare_remote, init_repo, read_file};
-use drive_sync::sync::SyncManager;
+use git_drive::sync::SyncManager;
 use git2::Repository;
 use std::time::Duration;
 
@@ -51,7 +51,7 @@ async fn sync_flow_writes_file_and_commits() {
     assert_eq!(read_file(test.dir.path(), "a.txt"), b"hello");
     let head = test.repo.head().unwrap().peel_to_commit().unwrap();
     let msg = head.message().unwrap();
-    assert!(msg.starts_with("drive-sync:"), "msg={}", msg);
+    assert!(msg.starts_with("git-drive:"), "msg={}", msg);
     assert!(msg.contains("a.txt"), "msg={}", msg);
 }
 
@@ -181,7 +181,7 @@ async fn pull_watcher_raises_refresh_flag_after_remote_change() {
     let bare_url = format!("file://{}", bare.path().to_str().unwrap());
     test.repo.remote("origin", &bare_url).unwrap();
     // publish the initial commit to the remote
-    drive_sync::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
+    git_drive::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
 
     // Start the SyncManager with a low pull_interval
     let sync = SyncManager::new_full_with_pull(
@@ -214,7 +214,7 @@ async fn pull_watcher_raises_refresh_flag_after_remote_change() {
     repo_b
         .commit(Some("HEAD"), &sig, &sig, "from B", &tree, &[&parent])
         .unwrap();
-    drive_sync::git::push_to_remote(&repo_b, "main", "origin", None).unwrap();
+    git_drive::git::push_to_remote(&repo_b, "main", "origin", None).unwrap();
 
     // wait for at least 2 pull cycles (1s each)
     tokio::time::sleep(Duration::from_millis(3500)).await;
@@ -230,9 +230,9 @@ async fn refresh_if_needed_rebuilds_index_after_pull() {
     let bare = init_bare_remote();
     let bare_url = format!("file://{}", bare.path().to_str().unwrap());
     test.repo.remote("origin", &bare_url).unwrap();
-    drive_sync::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
+    git_drive::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
 
-    let sync = drive_sync::sync::SyncManager::new_full_with_pull(
+    let sync = git_drive::sync::SyncManager::new_full_with_pull(
         test.dir.path().to_str().unwrap(),
         "main".to_string(),
         60,
@@ -242,7 +242,7 @@ async fn refresh_if_needed_rebuilds_index_after_pull() {
         None,
         1,
     );
-    let mut fs = drive_sync::fs::GitDriveFS::new(
+    let mut fs = git_drive::fs::GitDriveFS::new(
         test.dir.path().to_str().unwrap(),
         "main".to_string(),
         sync,
@@ -268,7 +268,7 @@ async fn refresh_if_needed_rebuilds_index_after_pull() {
     repo_b
         .commit(Some("HEAD"), &sig, &sig, "from B", &tree, &[&parent])
         .unwrap();
-    drive_sync::git::push_to_remote(&repo_b, "main", "origin", None).unwrap();
+    git_drive::git::push_to_remote(&repo_b, "main", "origin", None).unwrap();
 
     tokio::time::sleep(Duration::from_millis(3500)).await;
 
@@ -371,7 +371,7 @@ async fn clean_buffers_dropped_after_local_commit_dirty_survives() {
         "main",
         Some(("Alice", "a@x.com")),
     );
-    let mut fs = drive_sync::fs::GitDriveFS::new(
+    let mut fs = git_drive::fs::GitDriveFS::new(
         test.dir.path().to_str().unwrap(),
         "main".to_string(),
         sync,
@@ -417,7 +417,7 @@ async fn remote_update_visible_after_refresh_despite_local_buffer() {
     let bare_url = format!("file://{}", bare.path().to_str().unwrap());
     test.repo.remote("origin", &bare_url).unwrap();
     commit_file(&test.repo, "hi.txt", b"local-v1", "add hi");
-    drive_sync::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
+    git_drive::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
 
     let sync = SyncManager::new_full_with_pull(
         test.dir.path().to_str().unwrap(),
@@ -429,7 +429,7 @@ async fn remote_update_visible_after_refresh_despite_local_buffer() {
         None,
         1,
     );
-    let mut fs = drive_sync::fs::GitDriveFS::new(
+    let mut fs = git_drive::fs::GitDriveFS::new(
         test.dir.path().to_str().unwrap(),
         "main".to_string(),
         sync,
@@ -461,7 +461,7 @@ async fn remote_update_visible_after_refresh_despite_local_buffer() {
     repo_b
         .commit(Some("HEAD"), &sig, &sig, "v3 from B", &tree, &[&parent])
         .unwrap();
-    drive_sync::git::push_to_remote(&repo_b, "main", "origin", None).unwrap();
+    git_drive::git::push_to_remote(&repo_b, "main", "origin", None).unwrap();
 
     // wait for the pull watcher to bring in the FF
     tokio::time::sleep(Duration::from_millis(3500)).await;
@@ -571,7 +571,7 @@ async fn pull_watcher_skips_when_working_tree_dirty() {
     let bare_url = format!("file://{}", bare.path().to_str().unwrap());
     test.repo.remote("origin", &bare_url).unwrap();
     commit_file(&test.repo, "hi.txt", b"v1", "add hi");
-    drive_sync::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
+    git_drive::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
 
     // Local change NOT committed (dirty working tree)
     std::fs::write(test.dir.path().join("hi.txt"), b"local-edit").unwrap();
@@ -607,7 +607,7 @@ async fn pull_watcher_skips_when_working_tree_dirty() {
     repo_b
         .commit(Some("HEAD"), &sig, &sig, "v2 from B", &tree, &[&parent])
         .unwrap();
-    drive_sync::git::push_to_remote(&repo_b, "main", "origin", None).unwrap();
+    git_drive::git::push_to_remote(&repo_b, "main", "origin", None).unwrap();
 
     // wait for more than one pull cycle
     tokio::time::sleep(Duration::from_millis(3500)).await;
@@ -642,7 +642,7 @@ async fn status_file_updated_after_drain() {
     sync.queue_write("a.txt", b"hello".to_vec());
     wait_flush().await;
 
-    let status = drive_sync::status::read_from(&status_path).unwrap();
+    let status = git_drive::status::read_from(&status_path).unwrap();
     assert_eq!(status.branch, "main");
     assert_eq!(status.pending_ops, 0);
     let drain = status.last_drain.expect("drain should have been recorded");
@@ -657,7 +657,7 @@ async fn status_file_records_pull_outcome() {
     let bare = init_bare_remote();
     let bare_url = format!("file://{}", bare.path().to_str().unwrap());
     test.repo.remote("origin", &bare_url).unwrap();
-    drive_sync::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
+    git_drive::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
 
     let status_dir = tempfile::tempdir().unwrap();
     let status_path = status_dir.path().join("status.json");
@@ -677,7 +677,7 @@ async fn status_file_records_pull_outcome() {
     // wait for at least one pull cycle (nothing new on the remote)
     tokio::time::sleep(Duration::from_millis(2500)).await;
 
-    let status = drive_sync::status::read_from(&status_path).unwrap();
+    let status = git_drive::status::read_from(&status_path).unwrap();
     let pull = status.last_pull.expect("pull should have been recorded");
     assert_eq!(pull.outcome, "up to date");
 }
@@ -752,7 +752,7 @@ async fn sync_flow_symlink_materializes_and_commits_as_120000() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn symlink_roundtrip_created_in_fs_read_back_by_new_mount() {
-    use drive_sync::fs::GitDriveFS;
+    use git_drive::fs::GitDriveFS;
     use fuser::FileType;
 
     let test = init_repo();
@@ -778,7 +778,7 @@ async fn symlink_roundtrip_created_in_fs_read_back_by_new_mount() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn ignored_file_stays_visible_and_out_of_commits() {
-    use drive_sync::fs::GitDriveFS;
+    use git_drive::fs::GitDriveFS;
 
     let test = init_repo();
     commit_file(&test.repo, ".gitignore", b"*.log\n", "add gitignore");
@@ -819,7 +819,7 @@ async fn ignored_file_stays_visible_and_out_of_commits() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn spooled_write_drains_and_commits_correct_content() {
-    use drive_sync::fs::GitDriveFS;
+    use git_drive::fs::GitDriveFS;
 
     let test = init_repo();
     commit_file(&test.repo, "seed.txt", b"x", "seed");
@@ -855,7 +855,7 @@ async fn spooled_write_drains_and_commits_correct_content() {
 
 // ---- Phase 2.6: chunking in the drain (conversion, pre-commit sweep, GC) ----
 
-use drive_sync::chunk::{shard_rel_path, Manifest};
+use git_drive::chunk::{shard_rel_path, Manifest};
 
 /// No RAW blob above the limit in the HEAD tree — manifests are exempt
 /// (at test scale the manifest may exceed the tiny threshold; in production
@@ -1039,7 +1039,7 @@ async fn chunking_skips_ignored_local_only_files() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn sweep_conversion_raises_refresh_so_mount_sees_new_chunked_file() {
-    use drive_sync::fs::GitDriveFS;
+    use git_drive::fs::GitDriveFS;
 
     let test = init_repo();
     commit_file(&test.repo, "seed.txt", b"x", "seed");
@@ -1068,7 +1068,7 @@ async fn sweep_conversion_raises_refresh_so_mount_sees_new_chunked_file() {
 
 // ---- Phase 2.7: encryption at rest in the drain ----
 
-use drive_sync::crypt::Crypto;
+use git_drive::crypt::Crypto;
 use std::sync::Arc;
 
 fn test_crypto() -> Arc<Crypto> {
@@ -1229,7 +1229,7 @@ async fn encrypted_chunking_seals_chunks_and_manifest() {
     for h in &manifest.hashes {
         let sealed_chunk = std::fs::read(test.dir.path().join(shard_rel_path(h))).unwrap();
         assert_eq!(
-            &drive_sync::chunk::sha256_hex(&sealed_chunk),
+            &git_drive::chunk::sha256_hex(&sealed_chunk),
             h,
             "chunk hash is over the ciphertext (GC/integrity without the key)"
         );

@@ -1,8 +1,8 @@
-# Guia de uso: drive-sync passo a passo
+# Guia de uso: git-drive passo a passo
 
 > English version: [../usage.md](../usage.md)
 
-Este guia mostra, na ordem em que você deve executar, como preparar o ambiente, configurar credenciais, montar um repositório Git como filesystem FUSE e usar o drive-sync no dia a dia. Para a visão arquitetural, consulte [arquitetura.md](./arquitetura.md). Para mecânica interna de sincronização, [fluxo-de-sincronizacao.md](./fluxo-de-sincronizacao.md).
+Este guia mostra, na ordem em que você deve executar, como preparar o ambiente, configurar credenciais, montar um repositório Git como filesystem FUSE e usar o git-drive no dia a dia. Para a visão arquitetural, consulte [arquitetura.md](./arquitetura.md). Para mecânica interna de sincronização, [fluxo-de-sincronizacao.md](./fluxo-de-sincronizacao.md).
 
 ## Sumário
 
@@ -59,25 +59,25 @@ flowchart LR
 Clone e compile uma vez antes do primeiro uso.
 
 ```bash
-git clone <url-deste-repo> drive-sync
-cd drive-sync
+git clone <url-deste-repo> git-drive
+cd git-drive
 cargo build                    # primeiro build baixa deps (fuser, git2, tokio...)
 cargo test                     # opcional, valida toolchain (~256 testes)
 ```
 
-O binário fica em `target/debug/drive-sync`. Para build otimizada (recomendado após estabilizar seu fluxo):
+O binário fica em `target/debug/git-drive`. Para build otimizada (recomendado após estabilizar seu fluxo):
 
 ```bash
-cargo build --release          # binario em target/release/drive-sync
+cargo build --release          # binario em target/release/git-drive
 ```
 
-O restante deste guia usa `cargo run -- ...`, que funciona para debug e release. Se preferir chamar o binário diretamente, substitua `cargo run --` por `./target/release/drive-sync`.
+O restante deste guia usa `cargo run -- ...`, que funciona para debug e release. Se preferir chamar o binário diretamente, substitua `cargo run --` por `./target/release/git-drive`.
 
 ---
 
 ## 3. Escolher o repositório a montar
 
-drive-sync monta **um branch checked-out** de um repo Git comum. Três situações típicas:
+git-drive monta **um branch checked-out** de um repo Git comum. Três situações típicas:
 
 ### 3.1. Repo já clonado
 
@@ -88,7 +88,7 @@ cd ~/Projects/meu-repo
 git rev-parse --abbrev-ref HEAD   # precisa ser um branch nomeado, nao "HEAD"
 ```
 
-Se o resultado for literalmente `HEAD`, você está em **detached HEAD** e o drive-sync aborta no boot. Faça `git checkout <branch>` antes.
+Se o resultado for literalmente `HEAD`, você está em **detached HEAD** e o git-drive aborta no boot. Faça `git checkout <branch>` antes.
 
 ### 3.2. Clonar agora
 
@@ -109,13 +109,13 @@ git add README.md
 git -c user.email=voce@example.com -c user.name="Voce" commit -m "init"
 ```
 
-Sem `origin`, o drive-sync ainda funciona: commits locais são criados, apenas `push` e o pull watcher não têm para onde apontar (logs avisam).
+Sem `origin`, o git-drive ainda funciona: commits locais são criados, apenas `push` e o pull watcher não têm para onde apontar (logs avisam).
 
 ---
 
 ## 4. Criar o ponto de montagem
 
-FUSE exige que o diretório de montagem **já exista** e esteja **vazio**. O drive-sync não cria por você.
+FUSE exige que o diretório de montagem **já exista** e esteja **vazio**. O git-drive não cria por você.
 
 ```bash
 mkdir -p /tmp/gitmount
@@ -128,7 +128,7 @@ ls -la /tmp/gitmount           # tem que estar vazio
 
 ## 5. Configurar credenciais do remote
 
-drive-sync usa a seguinte ordem de preferência para autenticar `git push` / `git fetch`:
+git-drive usa a seguinte ordem de preferência para autenticar `git push` / `git fetch`:
 
 1. **`remote_token` do `config.json`** (HTTPS, PAT plain-text) — se presente, vira `Cred::userpass_plaintext("git", <token>)`.
 2. **ssh-agent / credential helper do sistema** — fallback quando `remote_token` é `null`.
@@ -152,7 +152,7 @@ Se a URL do remote já é `git@github.com:...` e o agent tem a chave, deixe `rem
    # origin  https://github.com/usuario/meu-drive.git (fetch)
    ```
 
-3. Coloque o token em `config.json` (passo 6). **Nunca** comite esse arquivo — `.gitignore` do drive-sync já cobre.
+3. Coloque o token em `config.json` (passo 6). **Nunca** comite esse arquivo — `.gitignore` do git-drive já cobre.
 
 ### 5.3. Sem remote
 
@@ -162,7 +162,7 @@ Se o repo é local-only (`git init` sem `git remote add`), ignore esta etapa int
 
 ## 6. Ajustar `config.json`
 
-`config.json` fica em **`~/.config/drive-sync/config.json`** (junto da chave da criptografia; um
+`config.json` fica em **`~/.config/git-drive/config.json`** (junto da chave da criptografia; um
 `./config.json` no CWD tem precedência no fluxo dev). Ausente → defaults silenciosos; inválido →
 defaults com log de aviso. Instalações antigas (Application Support) são migradas pelo `install`.
 
@@ -193,8 +193,8 @@ defaults com log de aviso. Instalações antigas (Application Support) são migr
 | `chunk_threshold_mb` | Arquivo acima disso (default `95`) é sincronizado como manifest + chunks de até `chunk_size_mb` em `.chunks/` — abaixo do limite de 100 MB por arquivo do GitHub. `0` desativa (pushes de arquivos grandes voltam a ser rejeitados pelo GitHub). |
 | `chunk_size_mb` | Tamanho máximo de cada chunk (default `80`). |
 | `encryption_enabled` | Criptografia em repouso (ver seção 8.10). Default `false`. |
-| `encryption_key_file` | Path do arquivo de chave. Default: `~/.config/drive-sync/drive.key`. |
-| `user_name` / `user_email` | Se qualquer um for `null`, drive-sync **aplica as mudanças no working tree mas não commita**. Deixe ambos preenchidos para ter histórico. |
+| `encryption_key_file` | Path do arquivo de chave. Default: `~/.config/git-drive/drive.key`. |
+| `user_name` / `user_email` | Se qualquer um for `null`, git-drive **aplica as mudanças no working tree mas não commita**. Deixe ambos preenchidos para ter histórico. |
 | `remote_token` | PAT para HTTPS. `null` cai para ssh-agent / credential helper. |
 
 ### 6.2. Receita rápida por cenário
@@ -260,7 +260,7 @@ O processo fica **em primeiro plano** — a chamada a `fuser::mount2` é bloquea
 sequenceDiagram
     autonumber
     participant U as Voce (terminal 1)
-    participant M as drive-sync (main.rs)
+    participant M as git-drive (main.rs)
     participant C as Config
     participant S as SyncManager
     participant F as GitDriveFS
@@ -301,7 +301,7 @@ echo "mais uma linha" >> /tmp/gitmount/hello.txt
 Edições usam o mesmo caminho. O commit final tem mensagem:
 
 ```text
-drive-sync: 1 changes (hello.txt)
+git-drive: 1 changes (hello.txt)
 ```
 
 ### 8.3. Criar diretório
@@ -310,7 +310,7 @@ drive-sync: 1 changes (hello.txt)
 mkdir /tmp/gitmount/notas
 ```
 
-Como Git não rastreia diretórios vazios, drive-sync cria um `.gitkeep` dentro. Quando o primeiro arquivo real chega, o `.gitkeep` é removido automaticamente.
+Como Git não rastreia diretórios vazios, git-drive cria um `.gitkeep` dentro. Quando o primeiro arquivo real chega, o `.gitkeep` é removido automaticamente.
 
 ### 8.4. Arquivos em subdiretórios
 
@@ -325,7 +325,7 @@ echo "abr/24" > /tmp/gitmount/notas/2026/entrada.md
 mv /tmp/gitmount/hello.txt /tmp/gitmount/notas/hello.txt
 ```
 
-O kernel emite `rename`; drive-sync enfileira `SyncOp::Rename` que, no working tree, vira delete + create (Git detecta rename por heurística no commit).
+O kernel emite `rename`; git-drive enfileira `SyncOp::Rename` que, no working tree, vira delete + create (Git detecta rename por heurística no commit).
 
 ### 8.6. Remover arquivo ou diretório
 
@@ -337,7 +337,7 @@ rmdir /tmp/gitmount/notas/2026   # precisa estar vazio
 ### 8.7. Symlinks
 
 `ln -s alvo link` funciona: o symlink é commitado como entrada `120000` (mesma representação do
-Git puro) e chega ao remote. O alvo é texto opaco — drive-sync nunca o resolve nem valida; um
+Git puro) e chega ao remote. O alvo é texto opaco — git-drive nunca o resolve nem valida; um
 symlink com alvo absoluto criado numa máquina fica quebrado em outra, exatamente como em um clone
 comum.
 
@@ -355,7 +355,7 @@ vira um **manifest** texto pequeno e o conteúdo vai para `.chunks/<2 hex>/<sha2
 abaixo do limite de 100 MB por arquivo do GitHub. **No drive você não percebe nada** — o arquivo
 aparece inteiro, com o tamanho real, e a leitura é remontada com verificação de integridade.
 
-O que um clone Git puro (sem drive-sync) vê: o manifest e o diretório `.chunks/`. Recuperação
+O que um clone Git puro (sem git-drive) vê: o manifest e o diretório `.chunks/`. Recuperação
 manual de um arquivo:
 
 ```bash
@@ -363,7 +363,7 @@ manual de um arquivo:
 grep '^sha256 ' arquivo.zip | awk '{print ".chunks/" substr($2,1,2) "/" $2}' | xargs cat > arquivo-recuperado.zip
 ```
 
-Não crie conteúdo próprio dentro de `.chunks/` — o diretório é reservado e o GC do drive-sync
+Não crie conteúdo próprio dentro de `.chunks/` — o diretório é reservado e o GC do git-drive
 remove o que nenhum manifest referencia.
 
 ### 8.10. Criptografia em repouso (repo público como drive)
@@ -376,7 +376,7 @@ Passo a passo:
 
 ```bash
 # 1. Gere a chave (uma vez; faça backup DELA fora do repo — sem ela os dados são irrecuperáveis)
-drive-sync key generate
+git-drive key generate
 
 # 2. Habilite no config.json
 #    "encryption_enabled": true
@@ -388,7 +388,7 @@ drive-sync key generate
 | --- | --- |
 | Migração | Mudar `encryption_enabled` migra o worktree automaticamente no próximo drain, nos dois sentidos. |
 | História antiga | Habilitar depois NÃO protege o passado: commits antigos continuam legíveis no remote. Para repo público, comece de um repo novo. |
-| Multi-máquina | Copie o arquivo de chave (`~/.config/drive-sync/drive.key`) para a outra máquina, com permissão 0600. |
+| Multi-máquina | Copie o arquivo de chave (`~/.config/git-drive/drive.key`) para a outra máquina, com permissão 0600. |
 | Chave perdida | Dados irrecuperáveis — não existe backdoor. |
 | O que continua visível | Tamanhos aproximados, quantidade de arquivos/pastas, profundidade da árvore e cadência de commits. Quem já possui um arquivo idêntico consegue confirmar que ele está no repo (cifra convergente, necessária para o Git). |
 | `.gitignore`/local-only | Desativados no modo cifrado (regras casariam contra nomes cifrados). |
@@ -410,7 +410,7 @@ drive-sync key generate
 
 ### 9.1. Logs do processo
 
-Os logs da sessão ficam em `logs/drive-sync-<timestamp>.log` (o path é anunciado no boot; use `-v` para espelhar no terminal). Cada ciclo de drain imprime:
+Os logs da sessão ficam em `logs/git-drive-<timestamp>.log` (o path é anunciado no boot; use `-v` para espelhar no terminal). Cada ciclo de drain imprime:
 
 ```text
 [14:32:07.101] drain: sincronizando alterações
@@ -425,19 +425,19 @@ Quando o pull watcher roda:
 [14:33:05.220] pull: fast-forward aplicado
 ```
 
-### 9.1.1. `drive-sync status`
+### 9.1.1. `git-drive status`
 
 Resumo do estado sem ler log cru — rode do mesmo diretório de onde o daemon foi lançado (ou aponte com `--file`):
 
 ```bash
-drive-sync status
-drive-sync status --file /outro/caminho/status.json
+git-drive status
+git-drive status --file /outro/caminho/status.json
 ```
 
 Saída típica:
 
 ```text
-drive-sync — branch main
+git-drive — branch main
   repo: /Users/voce/Projects/meu-drive
   daemon: rodando (pid 4242)
   iniciado há 2 h 10 min | atualizado há 12 s
@@ -452,13 +452,13 @@ O daemon grava o `status.json` (escrita atômica) a cada evento de boot, drain, 
 ### 9.1.2. Tray na barra de menus
 
 ```bash
-drive-sync tray
+git-drive tray
 ```
 
 Ícone circular com o estado do drive: verde (sincronizado), laranja (ops pendentes), vermelho
 (conflito ou push falho), cinza (daemon parado ou status stale). O menu traz o resumo do status,
 "Abrir drive no Finder", "Ver log em tempo real" (Terminal com `tail -f`), "Status detalhado" e
-"Sair da tray". Instale junto do daemon com `drive-sync install ... --with-tray` para subir no login.
+"Sair da tray". Instale junto do daemon com `git-drive install ... --with-tray` para subir no login.
 
 ### 9.1.3. Notificações
 
@@ -469,20 +469,20 @@ bloqueado por working tree sujo (no máximo uma por hora enquanto persistir).
 ## 10. Montar automaticamente no login (launchd)
 
 ```bash
-drive-sync install -r ~/Projects/meu-drive -m ~/GitDrive --with-tray
+git-drive install -r ~/Projects/meu-drive -m ~/GitDrive --with-tray
 ```
 
-O install grava `~/Library/LaunchAgents/dev.giacomeli.drive-sync.plist` (RunAtLoad + KeepAlive),
-copia o `config.json` do diretório atual para `~/Library/Application Support/drive-sync/` (se ainda
-não existir) e passa os paths padrão por flags — logs em `~/Library/Logs/drive-sync/`, status em
-`~/Library/Application Support/drive-sync/status.json` (o `drive-sync status` acha sozinho de
+O install grava `~/Library/LaunchAgents/dev.giacomeli.git-drive.plist` (RunAtLoad + KeepAlive),
+copia o `config.json` do diretório atual para `~/Library/Application Support/git-drive/` (se ainda
+não existir) e passa os paths padrão por flags — logs em `~/Library/Logs/git-drive/`, status em
+`~/Library/Application Support/git-drive/status.json` (o `git-drive status` acha sozinho de
 qualquer diretório).
 
 - **Parada limpa:** SIGTERM (launchctl, logout) ou eject no Finder drenam a fila pendente (commit +
   push) antes de sair — nada se perde. Parada limpa não é ressuscitada pelo KeepAlive.
 - **Crash:** o launchd religa o daemon, que detecta e recupera mount zumbi deixado pelo processo
   morto.
-- **Remover:** `drive-sync uninstall` (para o daemon, desmonta e remove os agentes, inclusive a tray).
+- **Remover:** `git-drive uninstall` (para o daemon, desmonta e remove os agentes, inclusive a tray).
 
 ## 11. Lixeira do Finder
 
@@ -520,7 +520,7 @@ Qualquer uma das formas abaixo faz **parada limpa**: o volume desmonta, a fila p
 ```bash
 # no terminal do mount: Ctrl-C
 # ou de fora:
-pkill -TERM -f 'drive-sync -r'
+pkill -TERM -f 'git-drive -r'
 ```
 
 ### 12.2. Eject no Finder / `umount` externo
@@ -535,11 +535,11 @@ file descriptors abertos no mount (`lsof ~/GitDrive`).
 ### 12.3. Via launchd
 
 ```bash
-drive-sync uninstall           # para de vez (remove os agentes)
-launchctl kill TERM gui/$UID/dev.giacomeli.drive-sync   # para só a instância (KeepAlive NÃO religa exit 0)
+git-drive uninstall           # para de vez (remove os agentes)
+launchctl kill TERM gui/$UID/dev.giacomeli.git-drive   # para só a instância (KeepAlive NÃO religa exit 0)
 ```
 
-Confirme com `drive-sync status` — deve mostrar "encerrado de forma limpa".
+Confirme com `git-drive status` — deve mostrar "encerrado de forma limpa".
 
 ---
 
@@ -554,7 +554,7 @@ git init -b main
 git -c user.email=eu@ex.com -c user.name=Eu commit --allow-empty -m "init"
 cd -
 
-# 2. config.json (raiz do drive-sync)
+# 2. config.json (raiz do git-drive)
 cat > config.json <<'EOF'
 {
   "write_debounce_secs": 2,
@@ -573,7 +573,7 @@ cargo run -- -r ~/drives/notas -m /tmp/notas-mount
 echo "ola" > /tmp/notas-mount/primeira.md
 # ...aguardar ~2s...
 git -C ~/drives/notas log --oneline
-# drive-sync: 1 changes (primeira.md)
+# git-drive: 1 changes (primeira.md)
 # init
 ```
 
@@ -626,7 +626,7 @@ cat > config.json <<'EOF'
   "remote_token": "github_pat_xxxxxxxxxxxxxxxxxxxxxxxx"
 }
 EOF
-# .gitignore do drive-sync ja protege config.json
+# .gitignore do git-drive ja protege config.json
 
 # 3. Montar
 mkdir -p /tmp/compartilhado
@@ -645,7 +645,7 @@ cargo run -- -r ~/drives/compartilhado -m /tmp/compartilhado
 | Escritas aparecem no drive mas não há commit | `user_name` ou `user_email` `null` no `config.json`. | Preencher ambos. |
 | Commit OK mas push falha com `authentication required` | `remote_token` ausente e ssh-agent sem chave. | Carregar chave (`ssh-add`) ou preencher `remote_token`. |
 | Push falha com `403` / `404` | PAT sem escopo `repo` ou URL errada. | Regerar PAT com escopo certo, conferir `git remote -v`. |
-| Pull watcher loga `not fast-forward` | Histórico divergiu (commit local + commit remoto paralelo). | Ctrl-C o drive-sync, resolver no repo real (`git pull --rebase`), remontar. |
+| Pull watcher loga `not fast-forward` | Histórico divergiu (commit local + commit remoto paralelo). | Ctrl-C o git-drive, resolver no repo real (`git pull --rebase`), remontar. |
 | Mudança no remote demora até ~1s para aparecer | Cache de `getattr` do kernel (TTL ~1s). | Aguardar, ou re-listar (`ls`) o diretório pai. |
 | "device busy" no `umount` | Processo com FD aberto no mount. | `lsof /tmp/gitmount` para achar e fechar. |
 | `cargo run` trava depois de Ctrl-C | Kernel não liberou o mount. | `umount /tmp/gitmount` manual; em último caso `diskutil unmount force`. |

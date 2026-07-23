@@ -1,8 +1,8 @@
-# Usage guide: drive-sync step by step
+# Usage guide: git-drive step by step
 
 > Portuguese version: [pt-br/uso.md](./pt-br/uso.md)
 
-This guide shows, in the order you should run them, how to prepare the environment, configure credentials, mount a Git repository as a FUSE filesystem, and use drive-sync day to day. For the architectural view, see [architecture.md](./architecture.md). For the internal sync mechanics, [sync-flow.md](./sync-flow.md).
+This guide shows, in the order you should run them, how to prepare the environment, configure credentials, mount a Git repository as a FUSE filesystem, and use git-drive day to day. For the architectural view, see [architecture.md](./architecture.md). For the internal sync mechanics, [sync-flow.md](./sync-flow.md).
 
 ## Table of contents
 
@@ -59,25 +59,25 @@ flowchart LR
 Clone and build once before first use.
 
 ```bash
-git clone <url-of-this-repo> drive-sync
-cd drive-sync
+git clone <url-of-this-repo> git-drive
+cd git-drive
 cargo build                    # first build downloads deps (fuser, git2, tokio...)
 cargo test                     # optional, validates the toolchain (~256 tests)
 ```
 
-The binary lands in `target/debug/drive-sync`. For an optimized build (recommended once your workflow stabilizes):
+The binary lands in `target/debug/git-drive`. For an optimized build (recommended once your workflow stabilizes):
 
 ```bash
-cargo build --release          # binary in target/release/drive-sync
+cargo build --release          # binary in target/release/git-drive
 ```
 
-The rest of this guide uses `cargo run -- ...`, which works for both debug and release. If you prefer calling the binary directly, replace `cargo run --` with `./target/release/drive-sync`.
+The rest of this guide uses `cargo run -- ...`, which works for both debug and release. If you prefer calling the binary directly, replace `cargo run --` with `./target/release/git-drive`.
 
 ---
 
 ## 3. Choose the repository to mount
 
-drive-sync mounts **one checked-out branch** of a regular Git repo. Three typical situations:
+git-drive mounts **one checked-out branch** of a regular Git repo. Three typical situations:
 
 ### 3.1. Repo already cloned
 
@@ -88,7 +88,7 @@ cd ~/Projects/my-repo
 git rev-parse --abbrev-ref HEAD   # must be a named branch, not "HEAD"
 ```
 
-If the result is literally `HEAD`, you are in **detached HEAD** state and drive-sync aborts at boot. Run `git checkout <branch>` first.
+If the result is literally `HEAD`, you are in **detached HEAD** state and git-drive aborts at boot. Run `git checkout <branch>` first.
 
 ### 3.2. Clone now
 
@@ -109,13 +109,13 @@ git add README.md
 git -c user.email=you@example.com -c user.name="You" commit -m "init"
 ```
 
-Without an `origin`, drive-sync still works: local commits are created; only `push` and the pull watcher have nowhere to point (the logs warn about it).
+Without an `origin`, git-drive still works: local commits are created; only `push` and the pull watcher have nowhere to point (the logs warn about it).
 
 ---
 
 ## 4. Create the mount point
 
-FUSE requires the mount directory to **already exist** and be **empty**. drive-sync does not create it for you.
+FUSE requires the mount directory to **already exist** and be **empty**. git-drive does not create it for you.
 
 ```bash
 mkdir -p /tmp/gitmount
@@ -128,7 +128,7 @@ ls -la /tmp/gitmount           # must be empty
 
 ## 5. Configure remote credentials
 
-drive-sync uses the following order of preference to authenticate `git push` / `git fetch`:
+git-drive uses the following order of preference to authenticate `git push` / `git fetch`:
 
 1. **`remote_token` from `config.json`** (HTTPS, plain-text PAT) — if present, it becomes `Cred::userpass_plaintext("git", <token>)`.
 2. **ssh-agent / system credential helper** — the fallback when `remote_token` is `null`.
@@ -152,7 +152,7 @@ If the remote URL is already `git@github.com:...` and the agent has the key, lea
    # origin  https://github.com/youruser/my-drive.git (fetch)
    ```
 
-3. Put the token in `config.json` (step 6). **Never** commit that file — drive-sync's `.gitignore` already covers it.
+3. Put the token in `config.json` (step 6). **Never** commit that file — git-drive's `.gitignore` already covers it.
 
 ### 5.3. No remote
 
@@ -162,7 +162,7 @@ If the repo is local-only (`git init` without `git remote add`), skip this entir
 
 ## 6. Adjust `config.json`
 
-`config.json` lives at **`~/.config/drive-sync/config.json`** (next to the encryption key; a
+`config.json` lives at **`~/.config/git-drive/config.json`** (next to the encryption key; a
 `./config.json` in the CWD takes precedence in the dev flow). Missing → silent defaults; invalid →
 defaults with a warning log. Old installations (Application Support) are migrated by `install`.
 
@@ -193,8 +193,8 @@ defaults with a warning log. Old installations (Application Support) are migrate
 | `chunk_threshold_mb` | A file above this (default `95`) is synced as a manifest + chunks of up to `chunk_size_mb` in `.chunks/` — under GitHub's 100 MB per-file limit. `0` disables it (pushes of large files go back to being rejected by GitHub). |
 | `chunk_size_mb` | Maximum size of each chunk (default `80`). |
 | `encryption_enabled` | Encryption at rest (see section 8.10). Default `false`. |
-| `encryption_key_file` | Path to the key file. Default: `~/.config/drive-sync/drive.key`. |
-| `user_name` / `user_email` | If either is `null`, drive-sync **applies the changes to the working tree but does not commit**. Fill in both to get history. |
+| `encryption_key_file` | Path to the key file. Default: `~/.config/git-drive/drive.key`. |
+| `user_name` / `user_email` | If either is `null`, git-drive **applies the changes to the working tree but does not commit**. Fill in both to get history. |
 | `remote_token` | PAT for HTTPS. `null` falls back to ssh-agent / credential helper. |
 
 ### 6.2. Quick recipe per scenario
@@ -260,7 +260,7 @@ The process stays **in the foreground** — the `fuser::mount2` call blocks. Ope
 sequenceDiagram
     autonumber
     participant U as You (terminal 1)
-    participant M as drive-sync (main.rs)
+    participant M as git-drive (main.rs)
     participant C as Config
     participant S as SyncManager
     participant F as GitDriveFS
@@ -301,7 +301,7 @@ echo "one more line" >> /tmp/gitmount/hello.txt
 Edits take the same path. The final commit message is:
 
 ```text
-drive-sync: 1 changes (hello.txt)
+git-drive: 1 changes (hello.txt)
 ```
 
 ### 8.3. Create a directory
@@ -310,7 +310,7 @@ drive-sync: 1 changes (hello.txt)
 mkdir /tmp/gitmount/notes
 ```
 
-Since Git does not track empty directories, drive-sync creates a `.gitkeep` inside. When the first real file arrives, the `.gitkeep` is removed automatically.
+Since Git does not track empty directories, git-drive creates a `.gitkeep` inside. When the first real file arrives, the `.gitkeep` is removed automatically.
 
 ### 8.4. Files in subdirectories
 
@@ -325,7 +325,7 @@ echo "apr/24" > /tmp/gitmount/notes/2026/entry.md
 mv /tmp/gitmount/hello.txt /tmp/gitmount/notes/hello.txt
 ```
 
-The kernel emits `rename`; drive-sync enqueues a `SyncOp::Rename` which, in the working tree, becomes delete + create (Git detects the rename heuristically at commit time).
+The kernel emits `rename`; git-drive enqueues a `SyncOp::Rename` which, in the working tree, becomes delete + create (Git detects the rename heuristically at commit time).
 
 ### 8.6. Remove a file or directory
 
@@ -337,7 +337,7 @@ rmdir /tmp/gitmount/notes/2026   # must be empty
 ### 8.7. Symlinks
 
 `ln -s target link` works: the symlink is committed as a `120000` entry (the same representation as
-plain Git) and reaches the remote. The target is opaque text — drive-sync never resolves or
+plain Git) and reaches the remote. The target is opaque text — git-drive never resolves or
 validates it; a symlink with an absolute target created on one machine is broken on another,
 exactly as in a regular clone.
 
@@ -356,7 +356,7 @@ becomes a small text **manifest** and the content goes to `.chunks/<2 hex>/<sha2
 below GitHub's 100 MB per-file limit. **In the drive you notice nothing** — the file appears
 whole, with its real size, and reads are reassembled with integrity verification.
 
-What a plain Git clone (without drive-sync) sees: the manifest and the `.chunks/` directory.
+What a plain Git clone (without git-drive) sees: the manifest and the `.chunks/` directory.
 Manual recovery of a file:
 
 ```bash
@@ -364,7 +364,7 @@ Manual recovery of a file:
 grep '^sha256 ' file.zip | awk '{print ".chunks/" substr($2,1,2) "/" $2}' | xargs cat > recovered-file.zip
 ```
 
-Do not create your own content inside `.chunks/` — the directory is reserved and drive-sync's GC
+Do not create your own content inside `.chunks/` — the directory is reserved and git-drive's GC
 removes anything no manifest references.
 
 ### 8.10. Encryption at rest (a public repo as a drive)
@@ -378,7 +378,7 @@ Step by step:
 
 ```bash
 # 1. Generate the key (once; back it up OUTSIDE the repo — without it the data is unrecoverable)
-drive-sync key generate
+git-drive key generate
 
 # 2. Enable it in config.json
 #    "encryption_enabled": true
@@ -390,7 +390,7 @@ drive-sync key generate
 | --- | --- |
 | Migration | Changing `encryption_enabled` migrates the worktree automatically on the next drain, in both directions. |
 | Old history | Enabling it later does NOT protect the past: old commits remain readable on the remote. For a public repo, start from a fresh repo. |
-| Multi-machine | Copy the key file (`~/.config/drive-sync/drive.key`) to the other machine, with 0600 permissions. |
+| Multi-machine | Copy the key file (`~/.config/git-drive/drive.key`) to the other machine, with 0600 permissions. |
 | Lost key | Data is unrecoverable — there is no backdoor. |
 | What remains visible | Approximate sizes, file/folder counts, tree depth, and commit cadence. Anyone who already has an identical file can confirm it is in the repo (convergent encryption, required for Git). |
 | `.gitignore`/local-only | Disabled in encrypted mode (rules would match against encrypted names). |
@@ -412,7 +412,7 @@ drive-sync key generate
 
 ### 9.1. Process logs
 
-Session logs live in `logs/drive-sync-<timestamp>.log` (the path is announced at boot; use `-v` to mirror them to the terminal). Each drain cycle prints:
+Session logs live in `logs/git-drive-<timestamp>.log` (the path is announced at boot; use `-v` to mirror them to the terminal). Each drain cycle prints:
 
 ```text
 [14:32:07.101] drain: syncing changes
@@ -427,19 +427,19 @@ When the pull watcher runs:
 [14:33:05.220] pull: fast-forward applied
 ```
 
-### 9.1.1. `drive-sync status`
+### 9.1.1. `git-drive status`
 
 A summary of the state without reading the raw log — run it from the same directory the daemon was launched from (or point at the file with `--file`):
 
 ```bash
-drive-sync status
-drive-sync status --file /other/path/status.json
+git-drive status
+git-drive status --file /other/path/status.json
 ```
 
 Typical output:
 
 ```text
-drive-sync — branch main
+git-drive — branch main
   repo: /Users/you/Projects/my-drive
   daemon: running (pid 4242)
   started 2 h 10 min ago | updated 12 s ago
@@ -454,13 +454,13 @@ The daemon writes `status.json` (atomic write) on every boot, drain, pull, and s
 ### 9.1.2. Menu bar tray
 
 ```bash
-drive-sync tray
+git-drive tray
 ```
 
 A circular icon with the drive state: green (synced), orange (pending ops), red (conflict or
 failed push), gray (daemon stopped or stale status). The menu offers the status summary,
 "Open drive in Finder", "View live log" (Terminal with `tail -f`), "Detailed status", and
-"Quit tray". Install it together with the daemon via `drive-sync install ... --with-tray` to start it at login.
+"Quit tray". Install it together with the daemon via `git-drive install ... --with-tray` to start it at login.
 
 ### 9.1.3. Notifications
 
@@ -471,20 +471,20 @@ blocked by a dirty working tree (at most once per hour while it persists).
 ## 10. Mount automatically at login (launchd)
 
 ```bash
-drive-sync install -r ~/Projects/my-drive -m ~/GitDrive --with-tray
+git-drive install -r ~/Projects/my-drive -m ~/GitDrive --with-tray
 ```
 
-The install writes `~/Library/LaunchAgents/dev.giacomeli.drive-sync.plist` (RunAtLoad + KeepAlive),
-copies the `config.json` from the current directory to `~/Library/Application Support/drive-sync/`
-(if not already there) and passes the default paths via flags — logs in `~/Library/Logs/drive-sync/`,
-status in `~/Library/Application Support/drive-sync/status.json` (`drive-sync status` finds it on
+The install writes `~/Library/LaunchAgents/dev.giacomeli.git-drive.plist` (RunAtLoad + KeepAlive),
+copies the `config.json` from the current directory to `~/Library/Application Support/git-drive/`
+(if not already there) and passes the default paths via flags — logs in `~/Library/Logs/git-drive/`,
+status in `~/Library/Application Support/git-drive/status.json` (`git-drive status` finds it on
 its own from any directory).
 
 - **Clean stop:** SIGTERM (launchctl, logout) or an eject in Finder drains the pending queue
   (commit + push) before exiting — nothing is lost. A clean stop is not resurrected by KeepAlive.
 - **Crash:** launchd restarts the daemon, which detects and recovers the zombie mount left by the
   dead process.
-- **Remove:** `drive-sync uninstall` (stops the daemon, unmounts, and removes the agents, including the tray).
+- **Remove:** `git-drive uninstall` (stops the daemon, unmounts, and removes the agents, including the tray).
 
 ## 11. Finder Trash
 
@@ -523,7 +523,7 @@ Any of the forms below performs a **clean stop**: the volume unmounts, the pendi
 ```bash
 # in the mount terminal: Ctrl-C
 # or from outside:
-pkill -TERM -f 'drive-sync -r'
+pkill -TERM -f 'git-drive -r'
 ```
 
 ### 12.2. Eject in Finder / external `umount`
@@ -538,11 +538,11 @@ processes holding open file descriptors on the mount (`lsof ~/GitDrive`).
 ### 12.3. Via launchd
 
 ```bash
-drive-sync uninstall           # stops it for good (removes the agents)
-launchctl kill TERM gui/$UID/dev.giacomeli.drive-sync   # stops just this instance (KeepAlive does NOT restart exit 0)
+git-drive uninstall           # stops it for good (removes the agents)
+launchctl kill TERM gui/$UID/dev.giacomeli.git-drive   # stops just this instance (KeepAlive does NOT restart exit 0)
 ```
 
-Confirm with `drive-sync status` — it should show "stopped cleanly".
+Confirm with `git-drive status` — it should show "stopped cleanly".
 
 ---
 
@@ -557,7 +557,7 @@ git init -b main
 git -c user.email=eu@ex.com -c user.name=Eu commit --allow-empty -m "init"
 cd -
 
-# 2. config.json (drive-sync root)
+# 2. config.json (git-drive root)
 cat > config.json <<'EOF'
 {
   "write_debounce_secs": 2,
@@ -576,7 +576,7 @@ cargo run -- -r ~/drives/notes -m /tmp/notes-mount
 echo "ola" > /tmp/notes-mount/first.md
 # ...wait ~2s...
 git -C ~/drives/notes log --oneline
-# drive-sync: 1 changes (first.md)
+# git-drive: 1 changes (first.md)
 # init
 ```
 
@@ -629,7 +629,7 @@ cat > config.json <<'EOF'
   "remote_token": "github_pat_xxxxxxxxxxxxxxxxxxxxxxxx"
 }
 EOF
-# drive-sync's .gitignore already protects config.json
+# git-drive's .gitignore already protects config.json
 
 # 3. Mount
 mkdir -p /tmp/compartilhado
@@ -648,7 +648,7 @@ cargo run -- -r ~/drives/compartilhado -m /tmp/compartilhado
 | Writes show up in the drive but there is no commit | `user_name` or `user_email` is `null` in `config.json`. | Fill in both. |
 | Commit OK but push fails with `authentication required` | `remote_token` missing and ssh-agent without the key. | Load the key (`ssh-add`) or set `remote_token`. |
 | Push fails with `403` / `404` | PAT without the `repo` scope, or wrong URL. | Regenerate the PAT with the right scope; check `git remote -v`. |
-| Pull watcher logs `not fast-forward` | History diverged (local commit + parallel remote commit). | Ctrl-C drive-sync, resolve it in the real repo (`git pull --rebase`), remount. |
+| Pull watcher logs `not fast-forward` | History diverged (local commit + parallel remote commit). | Ctrl-C git-drive, resolve it in the real repo (`git pull --rebase`), remount. |
 | A remote change takes up to ~1s to appear | Kernel `getattr` cache (TTL ~1s). | Wait, or re-list (`ls`) the parent directory. |
 | "device busy" on `umount` | A process with an open FD on the mount. | `lsof /tmp/gitmount` to find and close it. |
 | `cargo run` hangs after Ctrl-C | The kernel did not release the mount. | Manual `umount /tmp/gitmount`; as a last resort, `diskutil unmount force`. |

@@ -37,7 +37,7 @@ pub fn init_logging(
     std::fs::create_dir_all(log_dir)?;
 
     let mut logger = Logger::try_with_env_or_str(level)?
-        .log_to_file(FileSpec::default().directory(log_dir).basename("drive-sync"))
+        .log_to_file(FileSpec::default().directory(log_dir).basename("git-drive"))
         .format_for_files(flexi_logger::detailed_format)
         // Direct write keeps the tail (viewer / `tail -f`) live without waiting
         // for a periodic flush.
@@ -64,11 +64,11 @@ pub fn init_logging(
         keep_files
     );
     let current =
-        newest_log_file(log_dir).unwrap_or_else(|| log_dir.join("drive-sync_rCURRENT.log"));
+        newest_log_file(log_dir).unwrap_or_else(|| log_dir.join("git-drive_rCURRENT.log"));
     Ok((handle, current))
 }
 
-/// Newest `drive-sync*.log` in `dir` by modification time. At startup this is
+/// Newest `git-drive*.log` in `dir` by modification time. At startup this is
 /// the file flexi_logger just created (the active one), whatever its exact
 /// name.
 fn newest_log_file(dir: &Path) -> Option<PathBuf> {
@@ -79,7 +79,7 @@ fn newest_log_file(dir: &Path) -> Option<PathBuf> {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("drive-sync") && n.ends_with(".log"))
+                .is_some_and(|n| n.starts_with("git-drive") && n.ends_with(".log"))
         })
         .max_by_key(|p| {
             std::fs::metadata(p)

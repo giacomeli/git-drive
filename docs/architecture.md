@@ -4,7 +4,7 @@
 
 ## Overview
 
-drive-sync is a FUSE filesystem in Rust that mounts the contents of a Git repository (on the
+git-drive is a FUSE filesystem in Rust that mounts the contents of a Git repository (on the
 active branch) as a virtual filesystem and keeps bidirectional synchronization with the remote via
 Git: local writes become automatic commits + pushes, and remote changes arrive through a periodic
 pull watcher. The behavior is that of a "Dropbox-style" drive where the durable storage is a Git
@@ -21,7 +21,7 @@ whoever uses the mount:
 
 ```mermaid
 flowchart LR
-    CLI[CLI: main.rs] --> Config[Config::load_from<br/>~/.config/drive-sync/config.json]
+    CLI[CLI: main.rs] --> Config[Config::load_from<br/>~/.config/git-drive/config.json]
     Config --> Sync[SyncManager<br/>2 async watchers]
     Sync --> Write[Write watcher<br/>debounce -> ops -> chunking/crypto -> commit -> push]
     Sync --> Pull[Pull watcher<br/>fetch + FF or 3-way merge]
@@ -40,7 +40,7 @@ flowchart LR
 ## Directory Structure
 
 ```text
-drive-sync/
+git-drive/
 ├── Cargo.toml                    # fuser, git2, tokio, clap, serde, sha2, chacha20poly1305, hkdf...
 ├── AGENTS.md                     # invariants, pitfalls and guide for agents
 ├── README.md
@@ -61,7 +61,7 @@ drive-sync/
 │   ├── chunk.rs                  # manifest + content-addressed slicing (Phase 2.6)
 │   ├── crypt.rs                  # encryption at rest (Phase 2.7)
 │   ├── config.rs                 # config.json loader
-│   ├── paths.rs                  # path resolution (XDG ~/.config/drive-sync + legacy locations)
+│   ├── paths.rs                  # path resolution (XDG ~/.config/git-drive + legacy locations)
 │   ├── status.rs                 # atomic status.json + status subcommand
 │   ├── notify.rs                 # macOS notifications (osascript + rate limit)
 │   ├── tray.rs                   # menu bar icon
@@ -75,9 +75,9 @@ drive-sync/
 └── vendor/fuser/                 # fuser 0.14 with local patches (upstreaming is on the roadmap)
 ```
 
-The config and the encryption key live in `~/.config/drive-sync/` (with a read fallback to the
-legacy location in `~/Library/Application Support/drive-sync/`); status.json stays in Application
-Support and logs in `~/Library/Logs/drive-sync/`.
+The config and the encryption key live in `~/.config/git-drive/` (with a read fallback to the
+legacy location in `~/Library/Application Support/git-drive/`); status.json stays in Application
+Support and logs in `~/Library/Logs/git-drive/`.
 
 ---
 
@@ -201,7 +201,7 @@ pub struct Config {
 | # | Limitation | Origin |
 | --- | --- | --- |
 | 1 | Automatic `.gitkeep` on `mkdir`/`rmdir` | Git does not track empty directories — workaround in `src/sync.rs` |
-| 2 | Credentials and key in plain text on local disk | `~/.config/drive-sync/` (keychain is a future candidate) |
+| 2 | Credentials and key in plain text on local disk | `~/.config/git-drive/` (keychain is a future candidate) |
 | 3 | Merge conflicts become conflicted copies | 3-way `pull_and_merge`; without identity it degrades to FF-only |
 | 4 | Failed push is not reverted | the local commit remains; automatic reconcile + retry |
 | 5 | Detached HEAD aborts boot | `src/main.rs` |

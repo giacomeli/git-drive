@@ -1,10 +1,12 @@
 [package]
-name = "drive-sync"
+name = "git-drive"
 version = "0.1.0"
 edition = "2021"
 description = "Mount a Git repository as a filesystem: a FUSE drive with automatic bidirectional Git sync"
 license = "MIT"
 repository = "https://github.com/giacomeli/git-drive"
+keywords = ["git", "fuse", "filesystem", "sync", "encryption"]
+categories = ["filesystem", "command-line-utilities"]
 
 [dependencies]
 fuser = { version = "0.14", features = ["abi-7-21"] }

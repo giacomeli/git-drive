@@ -404,7 +404,7 @@ pub fn merge_ff_only(repo: &Repository, branch: &str) -> Result<bool, Error> {
     let local_ref_name = format!("refs/heads/{}", branch);
     let mut local_ref = repo.find_reference(&local_ref_name)?;
     let target_oid = fetch_commit.id();
-    local_ref.set_target(target_oid, "drive-sync: fast-forward")?;
+    local_ref.set_target(target_oid, "git-drive: fast-forward")?;
     repo.set_head(&local_ref_name)?;
     repo.checkout_head(Some(
         git2::build::CheckoutBuilder::default().force(),
@@ -466,7 +466,7 @@ pub fn pull_and_merge(
     if analysis.is_fast_forward() {
         let local_ref_name = format!("refs/heads/{}", branch);
         let mut local_ref = repo.find_reference(&local_ref_name)?;
-        local_ref.set_target(fetch_commit.id(), "drive-sync: fast-forward")?;
+        local_ref.set_target(fetch_commit.id(), "git-drive: fast-forward")?;
         repo.set_head(&local_ref_name)?;
         repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
         return Ok(MergeOutcome::FastForwarded);
@@ -544,10 +544,10 @@ pub fn pull_and_merge(
     let their_commit = repo.find_commit(fetch_commit.id())?;
 
     let message = if conflicted_paths.is_empty() {
-        format!("drive-sync: merge {}/{}", remote_name, branch)
+        format!("git-drive: merge {}/{}", remote_name, branch)
     } else {
         format!(
-            "drive-sync: merge {}/{} with {} conflict(s) - local versions preserved as *.{}",
+            "git-drive: merge {}/{} with {} conflict(s) - local versions preserved as *.{}",
             remote_name,
             branch,
             conflicted_paths.len(),
@@ -708,7 +708,7 @@ pub fn current_branch_name(repo: &Repository) -> Result<String, Error> {
     let head = repo.head()?;
     if !head.is_branch() {
         return Err(Error::from_str(
-            "HEAD is detached - drive-sync requires a named branch",
+            "HEAD is detached - git-drive requires a named branch",
         ));
     }
     head.shorthand()

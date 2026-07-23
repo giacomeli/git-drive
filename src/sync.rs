@@ -1275,7 +1275,7 @@ fn build_commit_message(ops: &[&SyncOp], redact_paths: bool) -> String {
     // commit message would leak every file name into the (unencrypted) git
     // history, defeating the name encryption. Count only.
     if redact_paths {
-        return format!("drive-sync: {} changes", n);
+        return format!("git-drive: {} changes", n);
     }
     let paths: Vec<&str> = ops.iter().map(|op| op.primary_path()).collect();
     let preview: Vec<&str> = paths.iter().take(3).copied().collect();
@@ -1284,7 +1284,7 @@ fn build_commit_message(ops: &[&SyncOp], redact_paths: bool) -> String {
     } else {
         String::new()
     };
-    format!("drive-sync: {} changes ({}{})", n, preview.join(", "), more)
+    format!("git-drive: {} changes ({}{})", n, preview.join(", "), more)
 }
 
 /// Sweeps the working tree and converts into manifest + chunks every regular
@@ -1365,7 +1365,7 @@ fn convert_file_to_chunks(
     // The manifest stays plaintext here; the state migration (right after,
     // in the same drain) seals it and moves it to the encrypted name when
     // encryption is active.
-    let tmp = full.with_extension("drive-sync-manifest.tmp");
+    let tmp = full.with_extension("git-drive-manifest.tmp");
     std::fs::write(&tmp, manifest.serialize())?;
     std::fs::rename(&tmp, full)?;
     Ok(manifest)
@@ -1465,7 +1465,7 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
                     // sealing the manifest is enough — falls through to the
                     // common path below.
                 } else {
-                let tmp = new_full.with_extension("drive-sync-rechunk.tmp");
+                let tmp = new_full.with_extension("git-drive-rechunk.tmp");
                 let expand = (|| -> std::io::Result<()> {
                     use std::io::Write;
                     let mut out = std::fs::File::create(&tmp)?;
@@ -1502,7 +1502,7 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
                 });
                 let _ = std::fs::remove_file(&tmp);
                 if let Ok(new_manifest) = rechunk {
-                    let tmp2 = new_full.with_extension("drive-sync-crypt.tmp");
+                    let tmp2 = new_full.with_extension("git-drive-crypt.tmp");
                     if std::fs::write(&tmp2, c.seal(&new_manifest.serialize())).is_ok()
                         && std::fs::rename(&tmp2, &new_full).is_ok()
                     {
@@ -1516,7 +1516,7 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
                 }
             }
         }
-        let tmp = new_full.with_extension("drive-sync-crypt.tmp");
+        let tmp = new_full.with_extension("git-drive-crypt.tmp");
         if std::fs::write(&tmp, c.seal(&plain)).is_ok()
             && std::fs::rename(&tmp, &new_full).is_ok()
         {
@@ -1601,7 +1601,7 @@ fn migrate_worktree_to_clear(repo_path: &Path, mk: &crate::crypt::Crypto) -> usi
             // Expand: reassembles the whole file by decrypting chunk by
             // chunk (streaming to disk; RAM bounded by one chunk).
             let Ok(manifest) = crate::chunk::Manifest::parse(&plain) else { continue };
-            let tmp = new_full.with_extension("drive-sync-expand.tmp");
+            let tmp = new_full.with_extension("git-drive-expand.tmp");
             let ok = (|| -> std::io::Result<()> {
                 use std::io::Write;
                 let mut out = std::fs::File::create(&tmp)?;
@@ -1623,7 +1623,7 @@ fn migrate_worktree_to_clear(repo_path: &Path, mk: &crate::crypt::Crypto) -> usi
             }
             continue;
         }
-        let tmp = new_full.with_extension("drive-sync-crypt.tmp");
+        let tmp = new_full.with_extension("git-drive-crypt.tmp");
         if std::fs::write(&tmp, &plain).is_ok() && std::fs::rename(&tmp, &new_full).is_ok() {
             if new_full != full {
                 let _ = std::fs::remove_file(&full);
@@ -1632,7 +1632,7 @@ fn migrate_worktree_to_clear(repo_path: &Path, mk: &crate::crypt::Crypto) -> usi
         }
     }
     // Every hashed entry has been resolved by now — drop the sidecars (a
-    // cleartext worktree carries no drive-sync metadata).
+    // cleartext worktree carries no git-drive metadata).
     for sc in sidecars_to_remove {
         let _ = std::fs::remove_file(sc);
     }
@@ -2287,7 +2287,7 @@ mod tests {
         // Encrypted repo: cleartext queue paths must NOT leak into the
         // (unencrypted) commit message.
         let m = build_commit_message(&ops, true);
-        assert_eq!(m, "drive-sync: 2 changes");
+        assert_eq!(m, "git-drive: 2 changes");
     }
 
     #[test]

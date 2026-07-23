@@ -54,7 +54,7 @@ pub fn format_event(event: &NotifyEvent) -> (String, String) {
                 String::new()
             };
             (
-                "drive-sync: merge conflict".to_string(),
+                "git-drive: merge conflict".to_string(),
                 format!(
                     "Local version preserved at {}{}. The remote one became canonical.",
                     list, more
@@ -62,19 +62,19 @@ pub fn format_event(event: &NotifyEvent) -> (String, String) {
             )
         }
         NotifyEvent::PushFailed => (
-            "drive-sync: push failed".to_string(),
-            "Changes committed locally but not published. Check network/credentials (drive-sync status).".to_string(),
+            "git-drive: push failed".to_string(),
+            "Changes committed locally but not published. Check network/credentials (git-drive status).".to_string(),
         ),
         NotifyEvent::Mounted { mount } => (
-            "drive-sync: drive mounted".to_string(),
+            "git-drive: drive mounted".to_string(),
             format!("Volume available at {}.", mount),
         ),
         NotifyEvent::Stopped => (
-            "drive-sync: drive unmounted".to_string(),
+            "git-drive: drive unmounted".to_string(),
             "Clean stop completed — nothing left pending.".to_string(),
         ),
         NotifyEvent::PullBlocked => (
-            "drive-sync: pull blocked".to_string(),
+            "git-drive: pull blocked".to_string(),
             "Uncommitted local changes are blocking the pull (identity-less mode?). Sync is one-way for now.".to_string(),
         ),
     }

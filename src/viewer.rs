@@ -1,5 +1,5 @@
 //! egui window showing daemon status + a live tail of the log
-//! (`drive-sync viewer`).
+//! (`git-drive viewer`).
 //!
 //! Runs as its own process, spawned by the tray (decision 10 of the
 //! observability plan): a separate process avoids clashing with the tray's
@@ -78,7 +78,7 @@ impl eframe::App for ViewerApp {
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.add_space(6.0);
-            ui.heading("drive-sync");
+            ui.heading("git-drive");
             ui.separator();
             ui.monospace(&self.status_text);
             ui.add_space(6.0);
@@ -136,11 +136,11 @@ pub fn run(status_path: PathBuf, log_path: Option<PathBuf>) -> anyhow::Result<()
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([900.0, 620.0])
-            .with_title("drive-sync"),
+            .with_title("git-drive"),
         ..Default::default()
     };
     eframe::run_native(
-        "drive-sync",
+        "git-drive",
         options,
         Box::new(move |_cc| Ok(Box::new(ViewerApp::new(status_path, log_path)))),
     )

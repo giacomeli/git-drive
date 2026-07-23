@@ -9,7 +9,7 @@ O `SyncManager` desacopla três tempos diferentes: (a) recebimento de operaçõe
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'primaryColor':'#E3F2FD','primaryTextColor':'#0D47A1','primaryBorderColor':'#1976D2','lineColor':'#546E7A'}}}%%
 sequenceDiagram
-    accTitle: Fluxo de sincronizacao do drive-sync
+    accTitle: Fluxo de sincronizacao do git-drive
     accDescr: Operacoes FUSE entram na fila causal; o watcher de debounce drena, aplica em disco, commita e faz push sob o lock de repo; o pull watcher busca mudancas remotas sob o mesmo lock, apenas com working tree limpo.
 
     participant User as Usuário / App
@@ -102,7 +102,7 @@ pub struct SyncManager {
 - `refresh_flag` — `AtomicBool` setado quando o HEAD avança por pull ou reconcile; consumido por `GitDriveFS::refresh_if_needed`.
 - `commit_generation` — `AtomicU64` incrementado a cada commit criado pelo drain; o `GitDriveFS` compara com o último valor visto para descartar write buffers cujo conteúdo já está no HEAD.
 - `repo_lock` — serializa os ciclos completos do drain e do pull. A unidade atômica é o ciclo, não a chamada git individual: um commit entrando entre o fetch e o checkout do pull era a janela de corrida.
-- `status` — estado observável (`src/status.rs`): eventos de boot/drain/pull e conflicted copies da sessão, persistidos atomicamente em `logs/status.json` quando `enable_status_file` é chamado (o main liga no boot). Lido pelo subcomando `drive-sync status`.
+- `status` — estado observável (`src/status.rs`): eventos de boot/drain/pull e conflicted copies da sessão, persistidos atomicamente em `logs/status.json` quando `enable_status_file` é chamado (o main liga no boot). Lido pelo subcomando `git-drive status`.
 
 ### `SyncOp` e a fila causal
 
@@ -119,7 +119,7 @@ pub enum SyncOp {
 ```
 
 `WriteContent` tem duas formas: `Mem(Arc<Vec<u8>>)` — o MESMO `Arc` do write buffer do inode, sem
-cópia no flush — e `Spooled(PathBuf)` — snapshot em arquivo de spool (`.git/drive-sync-spool/`)
+cópia no flush — e `Spooled(PathBuf)` — snapshot em arquivo de spool (`.git/git-drive-spool/`)
 para buffers acima de `large_file_threshold_mb`, aplicado no drain com `rename` (sem passar pela
 RAM).
 
@@ -145,7 +145,7 @@ Fluxo, ver `src/sync.rs::spawn_watcher`:
 3. Sob o lock de `inner`: se `last_op.elapsed() >= debounce` e a fila não está vazia, `mem::take` da fila; caso contrário continua esperando.
 4. Adquire `repo_lock` (segura pelo ciclo inteiro; não há `.await` no escopo do guard).
 5. Itera o lote **na ordem da fila** chamando `apply_op_to_disk` para cada `SyncOp`. Com criptografia habilitada, a tradução claro->cifrado de paths e a selagem de conteúdo acontecem NESTA materialização (a fila trabalha 100% em claro). Em seguida, com chunking habilitado (`chunk_threshold_mb > 0`), a varredura converte qualquer arquivo bruto acima do limiar em manifest + `.chunks/` (com criptografia, cada chunk é selado e o hash é do ciphertext); as varreduras de migração conformam o worktree ao estado do config (cifrar tudo ou decifrar tudo, com aviso de que a história permanece como era); e o GC remove chunks que nenhum manifest referencia (exige a chave quando os manifests estão selados — nunca coleta às cegas).
-6. Se `user_name`/`user_email` estão presentes, `commit_batch` gera a mensagem `drive-sync: <N> changes (...)` e chama `git::commit_working_tree` (`add_all` com `IndexAddOption::DEFAULT` — arquivos que casam com o `.gitignore` do repo montado ficam fora do commit por especificação; no mount eles viram local-only visíveis). Commit criado incrementa `commit_generation`.
+6. Se `user_name`/`user_email` estão presentes, `commit_batch` gera a mensagem `git-drive: <N> changes (...)` e chama `git::commit_working_tree` (`add_all` com `IndexAddOption::DEFAULT` — arquivos que casam com o `.gitignore` do repo montado ficam fora do commit por especificação; no mount eles viram local-only visíveis). Commit criado incrementa `commit_generation`.
 7. Se houve commit e `remote_name` está configurado, `push_batch` chama `git::push_to_remote`. Push rejeitado (tipicamente non-FF) dispara `reconcile_and_retry_push`: fetch + `pull_and_merge` + um retry de push. Recuperação seta `refresh_flag`. O commit local nunca é revertido.
 8. Ao final do ciclo, `status.record_drain` registra ops aplicadas, oid do commit, resultado do push e ops ainda pendentes na fila — e persiste o `status.json`.
 
@@ -217,7 +217,7 @@ Buffers **dirty** (escrita ainda não enfileirada) nunca são descartados.
 
 `src/sync.rs::build_commit_message`:
 
-- Formato: `drive-sync: <N> changes (<p1>, <p2>, <p3>[, +M more])`
+- Formato: `git-drive: <N> changes (<p1>, <p2>, <p3>[, +M more])`
 - Até 3 paths inline; mais que isso adiciona `+<M> more`.
 - `<path>` vem de `SyncOp::primary_path`.
 

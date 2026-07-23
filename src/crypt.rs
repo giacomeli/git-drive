@@ -16,6 +16,8 @@ use std::path::Path;
 
 /// First line of every encrypted blob (with `\n`): allows mixed state during
 /// migration — reads detect clear vs encrypted per file.
+/// Keeps the pre-rename project name (drive-sync): this header lives in
+/// committed blobs of existing repos, so renaming it would break them.
 pub const CONTENT_MAGIC: &[u8] = b"drive-sync-encrypted v1\n";
 
 const NONCE_LEN: usize = 24;
@@ -108,6 +110,8 @@ impl Crypto {
     /// Builds from the 32-byte master key, deriving domain-separated subkeys
     /// via HKDF-SHA256.
     pub fn from_master_key(master: &[u8; 32]) -> Crypto {
+        // Salt keeps the pre-rename project name (drive-sync): changing it
+        // would derive different keys and break every existing encrypted repo.
         let hk = Hkdf::<Sha256>::new(Some(b"drive-sync v1"), master);
         let mut content_key = [0u8; 32];
         let mut name_key = [0u8; 32];

@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 /// First line of every manifest. Carries the project and format version —
 /// a new version requires a new parser (parse rejects unknown ones).
+/// Keeps the pre-rename project name (drive-sync): this string lives in
+/// committed blobs of existing repos, so renaming it would break them.
 pub const MANIFEST_MAGIC: &str = "drive-sync-chunked v1";
 
 /// Reserved chunks directory, at the repo root.

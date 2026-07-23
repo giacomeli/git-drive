@@ -6,7 +6,7 @@ logs/
 # mount point used in manual tests -- never version mounted content
 gitmount/
 
-# drive-sync: config.json may contain remote_token in plain text --
+# git-drive: config.json may contain remote_token in plain text --
 # only remove this line if you are sure you will never commit credentials.
 config.json
 

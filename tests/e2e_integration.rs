@@ -1,8 +1,8 @@
 mod common;
 
 use common::{commit_file, file_exists, init_bare_remote, init_repo};
-use drive_sync::fs::GitDriveFS;
-use drive_sync::sync::SyncManager;
+use git_drive::fs::GitDriveFS;
+use git_drive::sync::SyncManager;
 use git2::Repository;
 use std::time::Duration;
 
@@ -47,7 +47,7 @@ async fn e2e_create_write_flush_commits_and_pushes() {
             &format!("file://{}", bare.path().to_str().unwrap()),
         )
         .unwrap();
-    drive_sync::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
+    git_drive::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
 
     let sync = new_sync_with_remote(
         test.dir.path().to_str().unwrap(),
@@ -92,7 +92,7 @@ async fn e2e_mkdir_rmdir_roundtrip() {
             &format!("file://{}", bare.path().to_str().unwrap()),
         )
         .unwrap();
-    drive_sync::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
+    git_drive::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
 
     let sync = new_sync_with_remote(
         test.dir.path().to_str().unwrap(),
@@ -141,7 +141,7 @@ async fn e2e_pull_brings_external_changes() {
     let bare = init_bare_remote();
     let bare_url = format!("file://{}", bare.path().to_str().unwrap());
     test.repo.remote("origin", &bare_url).unwrap();
-    drive_sync::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
+    git_drive::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
 
     let sync = new_sync_with_remote(
         test.dir.path().to_str().unwrap(),
@@ -175,7 +175,7 @@ async fn e2e_pull_brings_external_changes() {
     repo_b
         .commit(Some("HEAD"), &sig, &sig, "add externo", &tree, &[&parent])
         .unwrap();
-    drive_sync::git::push_to_remote(&repo_b, "main", "origin", None).unwrap();
+    git_drive::git::push_to_remote(&repo_b, "main", "origin", None).unwrap();
 
     // wait for at least 2 pull cycles
     tokio::time::sleep(Duration::from_millis(3500)).await;
