@@ -722,6 +722,26 @@ impl DrainCtx {
             // threshold is staged (per batch: no batch commit may contain an
             // oversized raw blob). Then the state migrations (Phase 2.7)
             // conform the worktree; the GC removes orphan chunks last.
+            //
+            // The sweeps are INCREMENTAL: a full pass over the working tree
+            // runs once per state (key/mode/threshold), then only files that
+            // changed since the last conforming HEAD are examined. Full passes
+            // on every drain opened and decrypted every file of the drive —
+            // minutes per save on a 157k-file worktree (2026-10-13, Mac).
+            let fingerprint = sweep_fingerprint(
+                crypto.as_deref(),
+                migration_crypto.as_deref(),
+                chunk_threshold,
+            );
+            let scope = sweep_scope(&self.repo_path, &fingerprint);
+            if let SweepScope::Full = scope {
+                log::info!("sweep: full pass over the working tree (first run for this state)");
+            }
+            let gc_needed = chunk_threshold > 0
+                && scope.may_orphan_chunks(
+                    &self.repo_path,
+                    crypto.as_deref().or(migration_crypto.as_deref()),
+                );
             let mut converted = 0usize;
             if chunk_threshold > 0 {
                 converted += convert_oversized_worktree_files(
@@ -729,10 +749,11 @@ impl DrainCtx {
                     chunk_threshold,
                     chunk_size,
                     crypto.as_deref(),
+                    &scope,
                 );
             }
             if let Some(c) = crypto.as_deref() {
-                let migrated = migrate_worktree_to_encrypted(&self.repo_path, c);
+                let migrated = migrate_worktree_to_encrypted(&self.repo_path, c, &scope);
                 if migrated > 0 {
                     log::warn!(
                         "crypto: {} item(s) migrated to encrypted. WARNING: the PREVIOUS Git history remains in cleartext on the remote — for a public repo, prefer starting from a fresh repo",
@@ -741,24 +762,27 @@ impl DrainCtx {
                 }
                 converted += migrated;
             } else if let Some(mk) = migration_crypto.as_deref() {
-                let migrated = migrate_worktree_to_clear(&self.repo_path, mk);
+                let migrated = migrate_worktree_to_clear(&self.repo_path, mk, &scope);
                 if migrated > 0 {
                     log::info!(
                         "crypto: {} item(s) decrypted back to cleartext",
                         migrated
                     );
                     if chunk_threshold > 0 {
+                        // Decrypted files got NEW (clear) paths, outside the
+                        // scope list — re-check the whole tree for size.
                         converted += convert_oversized_worktree_files(
                             &self.repo_path,
                             chunk_threshold,
                             chunk_size,
                             None,
+                            &SweepScope::Full,
                         );
                     }
                 }
                 converted += migrated;
             }
-            if chunk_threshold > 0 {
+            if gc_needed || (chunk_threshold > 0 && converted > 0) {
                 gc_orphan_chunks(
                     &self.repo_path,
                     crypto.as_deref().or(migration_crypto.as_deref()),
@@ -772,6 +796,18 @@ impl DrainCtx {
                 &ops,
                 crypto.is_some(),
             );
+            // The tree is conforming now: record it, so the next drain only
+            // sweeps what changes after this HEAD. Without a commit, only a
+            // clean tree (nothing to commit) proves HEAD itself conforms.
+            if commit_oid.is_some()
+                || (self.user_name.is_some()
+                    && self.user_email.is_some()
+                    && git::open_repo(self.repo_path.to_str().unwrap_or(""))
+                        .and_then(|r| git::is_working_tree_clean(&r))
+                        .unwrap_or(false))
+            {
+                write_sweep_marker(&self.repo_path, &fingerprint);
+            }
             if let Some(oid) = commit_oid {
                 commits_created += 1;
                 last_commit = Some(oid);
@@ -1547,6 +1583,7 @@ fn convert_oversized_worktree_files(
     threshold: u64,
     chunk_size: u64,
     crypto: Option<&crate::crypt::Crypto>,
+    scope: &SweepScope,
 ) -> usize {
     let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
         Ok(r) => r,
@@ -1556,7 +1593,7 @@ fn convert_oversized_worktree_files(
         }
     };
     let mut converted = 0usize;
-    for (full, rel) in walk_worktree_files(repo_path) {
+    for (full, rel) in scope.files(repo_path) {
         let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
         if !meta.is_file() || meta.len() <= threshold {
             continue;
@@ -1636,9 +1673,13 @@ fn file_starts_with_encrypted_magic(path: &Path) -> bool {
 /// `cleartext -> encrypted` migration: conforms every file/symlink in the
 /// working tree to the encrypted state (name AND content). Idempotent — a
 /// file already conforming is skipped. Returns how many items were converted.
-fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> usize {
-    let mut converted = repair_double_encrypted_conflicts(repo_path, c);
-    for (full, rel) in walk_worktree_files(repo_path) {
+fn migrate_worktree_to_encrypted(
+    repo_path: &Path,
+    c: &crate::crypt::Crypto,
+    scope: &SweepScope,
+) -> usize {
+    let mut converted = repair_double_encrypted_conflicts(repo_path, c, scope);
+    for (full, rel) in scope.files(repo_path) {
         let leaf = rel.rsplit('/').next().unwrap_or(&rel);
         // Long-name sidecars are our own metadata, never user files.
         if crate::crypt::is_long_sidecar(leaf) {
@@ -1782,7 +1823,9 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
             converted += 1;
         }
     }
-    prune_empty_dirs(repo_path);
+    if let SweepScope::Full = scope {
+        prune_empty_dirs(repo_path);
+    }
     converted
 }
 
@@ -1792,9 +1835,13 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
 /// so the drive showed the base32 name of the original. Detected by the
 /// sidecar decoding to a name that is itself a valid encrypted component;
 /// renamed to the canonical form of `<clear>.conflict-S`. Idempotent.
-fn repair_double_encrypted_conflicts(repo_path: &Path, c: &crate::crypt::Crypto) -> usize {
+fn repair_double_encrypted_conflicts(
+    repo_path: &Path,
+    c: &crate::crypt::Crypto,
+    scope: &SweepScope,
+) -> usize {
     let mut repaired = 0usize;
-    for (full, rel) in walk_worktree_files(repo_path) {
+    for (full, rel) in scope.files(repo_path) {
         let (dir, leaf) = match rel.rsplit_once('/') {
             Some((d, l)) => (Some(d), l),
             None => (None, rel.as_str()),
@@ -1837,14 +1884,18 @@ fn repair_double_encrypted_conflicts(repo_path: &Path, c: &crate::crypt::Crypto)
 /// `encrypted -> cleartext` migration: decrypts names and content; sealed
 /// manifests are expanded back into the whole file (the chunk sweep
 /// re-chunks it in cleartext right after, if still large).
-fn migrate_worktree_to_clear(repo_path: &Path, mk: &crate::crypt::Crypto) -> usize {
+fn migrate_worktree_to_clear(
+    repo_path: &Path,
+    mk: &crate::crypt::Crypto,
+    scope: &SweepScope,
+) -> usize {
     let mut converted = 0usize;
     // Long-name sidecars are decryption METADATA: they must survive until every
     // hashed (`dslong_`) entry has been resolved through them, and disappear
     // afterwards (a cleartext worktree has no sidecars). Deleting one before
     // its main entry is processed would leave the hash unresolvable.
     let mut sidecars_to_remove: Vec<PathBuf> = Vec::new();
-    for (full, rel) in walk_worktree_files(repo_path) {
+    for (full, rel) in scope.files(repo_path) {
         let leaf = rel.rsplit('/').next().unwrap_or(&rel);
         if crate::crypt::is_long_sidecar(leaf) {
             sidecars_to_remove.push(full);
@@ -2056,6 +2107,175 @@ fn gc_orphan_chunks(repo_path: &Path, key: Option<&crate::crypt::Crypto>) {
 
 /// Working tree files as (full path, relative path), skipping `.git` at any
 /// level and `.chunks` at the root. Does not follow symlinks.
+/// Which working-tree files the drain's sweeps (chunking, encryption
+/// migration, orphan-chunk GC) must examine.
+#[derive(Debug)]
+enum SweepScope {
+    /// Every file: first run for the current state, or after a change of
+    /// key, encryption mode or chunk threshold.
+    Full,
+    /// Only these on-disk relative paths: files dirty in the working tree
+    /// (this batch's ops, external edits) plus files changed between the last
+    /// conforming HEAD and the current one (pulls, merges).
+    Paths {
+        paths: Vec<String>,
+        /// HEAD recorded by the marker — its tree holds the previous version
+        /// of the paths changed since (for the GC trigger).
+        since: git2::Oid,
+    },
+}
+
+impl SweepScope {
+    /// The `(full, rel)` pairs to visit — same shape as `walk_worktree_files`.
+    fn files(&self, repo_path: &Path) -> Vec<(PathBuf, String)> {
+        match self {
+            SweepScope::Full => walk_worktree_files(repo_path),
+            SweepScope::Paths { paths, .. } => paths
+                .iter()
+                .filter(|rel| {
+                    !rel.starts_with(".git/")
+                        && !rel.starts_with(&format!("{}/", crate::chunk::CHUNKS_DIR))
+                })
+                .filter_map(|rel| {
+                    let full = repo_path.join(rel);
+                    let meta = std::fs::symlink_metadata(&full).ok()?;
+                    (meta.is_file() || meta.file_type().is_symlink()).then(|| (full, rel.clone()))
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether this drain can leave chunks without a manifest: always on a
+    /// full pass; otherwise only when a scoped path WAS a chunk manifest
+    /// (in HEAD or at the marker's HEAD) — a large file deleted or rewritten.
+    /// Keeps the O(worktree) GC off the path of ordinary saves.
+    fn may_orphan_chunks(&self, repo_path: &Path, key: Option<&crate::crypt::Crypto>) -> bool {
+        let SweepScope::Paths { paths, since } = self else {
+            return true;
+        };
+        let Ok(repo) = git::open_repo(repo_path.to_str().unwrap_or("")) else {
+            return true;
+        };
+        let mut trees = Vec::new();
+        if let Ok(t) = repo.head().and_then(|h| h.peel_to_tree()) {
+            trees.push(t);
+        }
+        if let Ok(t) = repo.find_commit(*since).and_then(|c| c.tree()) {
+            trees.push(t);
+        }
+        paths.iter().any(|rel| {
+            trees.iter().any(|tree| {
+                let Ok(entry) = tree.get_path(Path::new(rel)) else { return false };
+                let Ok(blob) = repo.find_blob(entry.id()) else { return false };
+                if blob.size() as u64 > crate::chunk::MANIFEST_MAX_BYTES {
+                    return false;
+                }
+                let bytes = blob.content();
+                if crate::crypt::Crypto::is_encrypted_bytes(bytes) {
+                    match key.and_then(|k| k.open(bytes).ok()) {
+                        Some(plain) => crate::chunk::Manifest::is_manifest_bytes(&plain),
+                        // Sealed and no key: cannot tell — be safe.
+                        None => true,
+                    }
+                } else {
+                    crate::chunk::Manifest::is_manifest_bytes(bytes)
+                }
+            })
+        })
+    }
+}
+
+const SWEEP_MARKER: &str = "git-drive-sweep";
+
+/// Identifies the state the sweeps conform the tree to: key (via a
+/// deterministic encrypted probe — never the key itself), mode and chunk
+/// threshold. A different fingerprint forces a full pass.
+fn sweep_fingerprint(
+    crypto: Option<&crate::crypt::Crypto>,
+    migration: Option<&crate::crypt::Crypto>,
+    chunk_threshold: u64,
+) -> String {
+    let probe = |c: &crate::crypt::Crypto| {
+        let disk = c.enc_component("git-drive sweep fingerprint").disk;
+        disk.chars().rev().take(24).collect::<String>()
+    };
+    match (crypto, migration) {
+        (Some(c), _) => format!("encrypted:{}:chunk={}", probe(c), chunk_threshold),
+        (None, Some(m)) => format!("clear-with-key:{}:chunk={}", probe(m), chunk_threshold),
+        (None, None) => format!("clear:chunk={}", chunk_threshold),
+    }
+}
+
+fn sweep_marker_path(repo_path: &Path) -> Option<PathBuf> {
+    git::open_repo(repo_path.to_str().unwrap_or(""))
+        .ok()
+        .map(|r| r.path().join(SWEEP_MARKER))
+}
+
+/// Records "the working tree at the current HEAD conforms to `fingerprint`".
+fn write_sweep_marker(repo_path: &Path, fingerprint: &str) {
+    let Ok(repo) = git::open_repo(repo_path.to_str().unwrap_or("")) else { return };
+    let Ok(head) = repo.head().and_then(|h| h.peel_to_commit()) else { return };
+    let path = repo.path().join(SWEEP_MARKER);
+    let tmp = path.with_extension("tmp");
+    let body = format!("v1\n{}\n{}\n", head.id(), fingerprint);
+    if std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+        log::warn!("sweep: could not write the marker — next drain does a full pass");
+    }
+}
+
+/// Decides the sweep scope for this drain (see `SweepScope`).
+fn sweep_scope(repo_path: &Path, fingerprint: &str) -> SweepScope {
+    let Some(marker) = sweep_marker_path(repo_path) else { return SweepScope::Full };
+    let Ok(body) = std::fs::read_to_string(marker) else { return SweepScope::Full };
+    let mut lines = body.lines();
+    let (Some("v1"), Some(head), Some(fp)) = (lines.next(), lines.next(), lines.next()) else {
+        return SweepScope::Full;
+    };
+    if fp != fingerprint {
+        return SweepScope::Full;
+    }
+    let Ok(since) = git2::Oid::from_str(head) else { return SweepScope::Full };
+    let Ok(repo) = git::open_repo(repo_path.to_str().unwrap_or("")) else {
+        return SweepScope::Full;
+    };
+    let mut paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let (Ok(old), Ok(cur)) = (
+        repo.find_commit(since),
+        repo.head().and_then(|h| h.peel_to_commit()),
+    ) else {
+        return SweepScope::Full;
+    };
+    if old.id() != cur.id() {
+        let diff = match (old.tree(), cur.tree()) {
+            (Ok(a), Ok(b)) => repo.diff_tree_to_tree(Some(&a), Some(&b), None),
+            _ => return SweepScope::Full,
+        };
+        let Ok(diff) = diff else { return SweepScope::Full };
+        for delta in diff.deltas() {
+            for f in [delta.old_file(), delta.new_file()] {
+                if let Some(p) = f.path().and_then(|p| p.to_str()) {
+                    paths.insert(p.to_string());
+                }
+            }
+        }
+    }
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false);
+    let Ok(statuses) = repo.statuses(Some(&mut opts)) else { return SweepScope::Full };
+    for entry in statuses.iter() {
+        if let Some(p) = entry.path() {
+            paths.insert(p.to_string());
+        }
+    }
+    SweepScope::Paths {
+        paths: paths.into_iter().collect(),
+        since,
+    }
+}
+
 fn walk_worktree_files(repo_path: &Path) -> Vec<(std::path::PathBuf, String)> {
     let mut out = Vec::new();
     let mut stack = vec![repo_path.to_path_buf()];
@@ -2626,7 +2846,7 @@ mod tests {
         let short = c.enc_path("ok.txt");
         std::fs::write(repo.join(&short), c.seal(b"fine")).unwrap();
 
-        let converted = migrate_worktree_to_encrypted(repo, &c);
+        let converted = migrate_worktree_to_encrypted(repo, &c, &SweepScope::Full);
         assert_eq!(converted, 1, "only the over-threshold entry migrates");
 
         // Old entry is gone; its dslong replacement + sidecar exist.
@@ -2645,7 +2865,95 @@ mod tests {
         assert_eq!(c.open(&std::fs::read(&new_full).unwrap()).unwrap(), b"payload");
 
         // Idempotent: second pass converts nothing.
-        assert_eq!(migrate_worktree_to_encrypted(repo, &c), 0);
+        assert_eq!(migrate_worktree_to_encrypted(repo, &c, &SweepScope::Full), 0);
+    }
+
+    fn repo_with_commit(files: &[(&str, &[u8])]) -> (tempfile::TempDir, git2::Repository) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        for (p, c) in files {
+            let full = dir.path().join(p);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, c).unwrap();
+        }
+        commit_all(&repo);
+        (dir, repo)
+    }
+
+    fn commit_all(repo: &git2::Repository) {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("T", "t@x").unwrap();
+        let parents: Vec<git2::Commit> = repo
+            .head()
+            .ok()
+            .and_then(|h| h.peel_to_commit().ok())
+            .into_iter()
+            .collect();
+        let refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &refs).unwrap();
+    }
+
+    #[test]
+    fn sweep_scope_is_full_without_marker_then_incremental() {
+        let (dir, repo) = repo_with_commit(&[("a.txt", b"a"), ("d/b.txt", b"b")]);
+        let root = dir.path();
+        assert!(matches!(sweep_scope(root, "fp1"), SweepScope::Full));
+
+        write_sweep_marker(root, "fp1");
+        match sweep_scope(root, "fp1") {
+            SweepScope::Paths { paths, .. } => assert!(paths.is_empty(), "clean tree -> nothing"),
+            other => panic!("expected Paths, got {:?}", other),
+        }
+        // A dirty file and a new untracked one enter the scope.
+        std::fs::write(root.join("a.txt"), b"changed").unwrap();
+        std::fs::write(root.join("d/new.txt"), b"n").unwrap();
+        match sweep_scope(root, "fp1") {
+            SweepScope::Paths { paths, .. } => {
+                assert_eq!(paths, vec!["a.txt".to_string(), "d/new.txt".to_string()])
+            }
+            other => panic!("{:?}", other),
+        }
+        // Paths changed by commits after the marker (a pull/merge) too.
+        commit_all(&repo);
+        match sweep_scope(root, "fp1") {
+            SweepScope::Paths { paths, .. } => assert!(paths.contains(&"d/new.txt".to_string())),
+            other => panic!("{:?}", other),
+        }
+        // Another key/mode/threshold: full pass again.
+        assert!(matches!(sweep_scope(root, "fp2"), SweepScope::Full));
+    }
+
+    #[test]
+    fn incremental_migration_only_touches_scoped_files() {
+        let c = crate::crypt::Crypto::from_master_key(&[9u8; 32]);
+        let (dir, _repo) = repo_with_commit(&[("old.txt", b"left alone")]);
+        let root = dir.path();
+        std::fs::write(root.join("new.txt"), b"fresh cleartext").unwrap();
+        let scope = SweepScope::Paths {
+            paths: vec!["new.txt".to_string()],
+            since: git2::Oid::zero(),
+        };
+        assert_eq!(migrate_worktree_to_encrypted(root, &c, &scope), 1);
+        assert!(root.join("old.txt").exists(), "outside the scope: not visited");
+        let enc = root.join(c.enc_path("new.txt"));
+        assert_eq!(c.open(&std::fs::read(enc).unwrap()).unwrap(), b"fresh cleartext");
+    }
+
+    #[test]
+    fn sweep_fingerprint_changes_with_key_mode_and_threshold() {
+        let k1 = crate::crypt::Crypto::from_master_key(&[1u8; 32]);
+        let k2 = crate::crypt::Crypto::from_master_key(&[2u8; 32]);
+        let a = sweep_fingerprint(Some(&k1), None, 10);
+        assert_eq!(a, sweep_fingerprint(Some(&k1), None, 10), "deterministic");
+        assert_ne!(a, sweep_fingerprint(Some(&k2), None, 10));
+        assert_ne!(a, sweep_fingerprint(None, Some(&k1), 10));
+        assert_ne!(a, sweep_fingerprint(Some(&k1), None, 20));
+        assert_ne!(sweep_fingerprint(None, None, 10), sweep_fingerprint(None, None, 20));
     }
 
     #[test]
@@ -2661,7 +2969,7 @@ mod tests {
         let copy = format!("{}.conflict-host-1791868058", short);
         std::fs::write(repo.join(&copy), c.seal(b"local version")).unwrap();
 
-        assert_eq!(migrate_worktree_to_encrypted(repo, &c), 0);
+        assert_eq!(migrate_worktree_to_encrypted(repo, &c, &SweepScope::Full), 0);
         assert!(repo.join(&copy).exists(), "conflicted copy untouched");
         assert_eq!(
             c.dec_path(&copy),
@@ -2688,7 +2996,7 @@ mod tests {
         )
         .unwrap();
 
-        migrate_worktree_to_encrypted(repo, &c);
+        migrate_worktree_to_encrypted(repo, &c, &SweepScope::Full);
 
         let good = format!("{}{}", enc_base, suffix);
         assert!(repo.join(&good).exists(), "renamed to the canonical conflicted copy");
@@ -2696,7 +3004,7 @@ mod tests {
         assert!(!repo.join(crate::crypt::sidecar_name(&bad_leaf)).exists());
         assert_eq!(c.dec_path(&good), format!("shared.txt{}", suffix));
         assert_eq!(c.open(&std::fs::read(repo.join(&good)).unwrap()).unwrap(), b"local version");
-        assert_eq!(migrate_worktree_to_encrypted(repo, &c), 0, "idempotent");
+        assert_eq!(migrate_worktree_to_encrypted(repo, &c, &SweepScope::Full), 0, "idempotent");
     }
 
     #[test]
