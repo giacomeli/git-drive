@@ -15,7 +15,7 @@ Este guia mostra, na ordem em que você deve executar, como preparar o ambiente,
 - [7. Montar o drive](#7-montar-o-drive)
 - [8. Usar o filesystem no dia a dia](#8-usar-o-filesystem-no-dia-a-dia)
 - [9. Observar o ciclo de sincronização](#9-observar-o-ciclo-de-sincronização)
-- [10. Montar automaticamente no login (launchd)](#10-montar-automaticamente-no-login-launchd)
+- [10. Montar automaticamente no login (launchd / systemd)](#10-montar-automaticamente-no-login-launchd--systemd)
 - [11. Lixeira do Finder](#11-lixeira-do-finder)
 - [12. Desmontar](#12-desmontar)
 - [13. Cenários completos](#13-cenários-completos)
@@ -30,10 +30,11 @@ Antes de qualquer coisa, garanta que seu sistema tem:
 
 | Dependência | Como instalar | Verificação |
 | --- | --- | --- |
-| macOS (Darwin) | — | `uname` deve retornar `Darwin` |
-| [macFUSE](https://osxfuse.github.io/) | `brew install --cask macfuse` | `kextstat \| grep -i fuse` lista módulo carregado |
-| Rust 1.70+ (edition 2021) | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` | `rustc --version` |
-| Git 2.x | `brew install git` (ou Xcode CLT) | `git --version` |
+| macOS ou Linux | — | `uname` retorna `Darwin` ou `Linux` |
+| [macFUSE](https://osxfuse.github.io/) (macOS) | `brew install --cask macfuse` | `kextstat \| grep -i fuse` lista módulo carregado |
+| fuse3 (Linux) | pacote da distro (`fuse3`; ex.: `pacman -S fuse3`, `apt install fuse3`) | `fusermount3 --version` |
+| Rust 1.85+ (edition 2021) | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` | `rustc --version` |
+| Git 2.31+ | `brew install git` (ou Xcode CLT) / pacote da distro | `git --version` — também usado pelo daemon no fetch/push (ver passo 5) |
 | Um repositório Git local | ver passo 3 | `git -C <path> rev-parse --abbrev-ref HEAD` |
 
 > **Atenção macFUSE:** após instalar via Homebrew, o macOS exige aprovação manual da extensão em **Ajustes do Sistema → Privacidade e segurança**. Sem isso, `fuser::mount2` falha com erro genérico de I/O.
@@ -62,7 +63,7 @@ Clone e compile uma vez antes do primeiro uso.
 git clone <url-deste-repo> git-drive
 cd git-drive
 cargo build                    # primeiro build baixa deps (fuser, git2, tokio...)
-cargo test                     # opcional, valida toolchain (~256 testes)
+cargo test                     # opcional, valida toolchain (~315 testes)
 ```
 
 O binário fica em `target/debug/git-drive`. Para build otimizada (recomendado após estabilizar seu fluxo):
@@ -128,19 +129,36 @@ ls -la /tmp/gitmount           # tem que estar vazio
 
 ## 5. Configurar credenciais do remote
 
-git-drive usa a seguinte ordem de preferência para autenticar `git push` / `git fetch`:
+Por padrão (`"git_transport": "auto"`) o git-drive faz fetch e push pelo **binário `git` do
+sistema**, então autentica exatamente como um `git fetch` digitado no repo: OpenSSH com o seu
+`~/.ssh/config` (aliases de Host, `IdentityFile`, portas), o ssh-agent, o Keychain do macOS
+(`UseKeychain`) e qualquer tipo de chave; HTTPS passa pelo seu credential helper. O daemon nunca
+pergunta nada: roda com `GIT_TERMINAL_PROMPT=0` e, salvo um `core.sshCommand` seu, com
+`ssh -o BatchMode=yes`. Um comando de rede que fica 300 s sem produzir saída é encerrado, então uma
+conexão travada nunca bloqueia o drive.
 
-1. **`remote_token` do `config.json`** (HTTPS, PAT plain-text) — se presente, vira `Cred::userpass_plaintext("git", <token>)`.
-2. **ssh-agent / credential helper do sistema** — fallback quando `remote_token` é `null`.
+| Fonte da credencial | Quando é usada |
+| --- | --- |
+| `remote_token` no `config.json` | Remotes HTTPS. Enviado como `http.extraHeader` (Basic, usuário `x-access-token`) pelo ambiente — nunca aparece na lista de processos. |
+| Seu setup normal de git/ssh | Todo o resto (remotes SSH, HTTPS sem token). |
+
+**Regra prática:** se `git -C <repo> fetch` funciona num terminal daquela máquina (com o mesmo
+usuário, sem digitar nada), o daemon também funciona.
+
+`"git_transport": "libgit2"` força o transporte em processo (também é o fallback quando não existe
+binário `git`). Ele só conhece o ssh-agent e as chaves padrão `~/.ssh/id_ed25519`, `id_ecdsa` e
+`id_rsa` (sem passphrase) — ignora `~/.ssh/config` e o Keychain.
 
 ### 5.1. Usando SSH (recomendado para uso pessoal)
 
 ```bash
-ssh-add -l                     # lista chaves carregadas no agent
 ssh -T git@github.com          # deve responder "Hi <usuario>! You've successfully..."
+git -C ~/Projects/meu-drive fetch --dry-run origin   # precisa funcionar sem pedir nada
 ```
 
-Se a URL do remote já é `git@github.com:...` e o agent tem a chave, deixe `remote_token: null` no `config.json`.
+Se a URL do remote já é `git@github.com:...` e isso funciona, deixe `remote_token: null` no
+`config.json`. Uma chave com passphrase precisa estar disponível sem interação: no agent, ou no
+Keychain do macOS com `UseKeychain yes` para aquele host no `~/.ssh/config`.
 
 ### 5.2. Usando token HTTPS (ex.: GitHub PAT)
 
@@ -163,8 +181,10 @@ Se o repo é local-only (`git init` sem `git remote add`), ignore esta etapa int
 ## 6. Ajustar `config.json`
 
 `config.json` fica em **`~/.config/git-drive/config.json`** (junto da chave da criptografia; um
-`./config.json` no CWD tem precedência no fluxo dev). Ausente → defaults silenciosos; inválido →
-defaults com log de aviso. Instalações antigas (Application Support) são migradas pelo `install`.
+`./config.json` no CWD tem precedência no fluxo dev). Ausente → defaults; **presente mas inválido →
+o daemon se recusa a subir** (um fallback silencioso subiria com a criptografia desligada e sem
+identidade). Instalações antigas (`~/.config/drive-sync/`, Application Support) são migradas pelo
+`install`.
 
 ### 6.1. Template completo comentado
 
@@ -180,7 +200,8 @@ defaults com log de aviso. Instalações antigas (Application Support) são migr
   "encryption_key_file": null,
   "user_name": "Juliano",
   "user_email": "juliano@example.com",
-  "remote_token": null
+  "remote_token": null,
+  "git_transport": "auto"
 }
 ```
 
@@ -195,7 +216,8 @@ defaults com log de aviso. Instalações antigas (Application Support) são migr
 | `encryption_enabled` | Criptografia em repouso (ver seção 8.10). Default `false`. |
 | `encryption_key_file` | Path do arquivo de chave. Default: `~/.config/git-drive/drive.key`. |
 | `user_name` / `user_email` | Se qualquer um for `null`, git-drive **aplica as mudanças no working tree mas não commita**. Deixe ambos preenchidos para ter histórico. |
-| `remote_token` | PAT para HTTPS. `null` cai para ssh-agent / credential helper. |
+| `remote_token` | PAT para HTTPS. `null` cai para o seu setup de git/ssh. |
+| `git_transport` | `auto` (padrão: `git` do sistema quando disponível), `cli` ou `libgit2`. Só mude se o `git` faltar ou se comportar mal naquela máquina. |
 
 ### 6.2. Receita rápida por cenário
 
@@ -266,11 +288,13 @@ sequenceDiagram
     participant F as GitDriveFS
     participant K as Kernel FUSE
     U->>M: cargo run -- -r REPO -m MOUNT
-    M->>C: load_from("config.json")
-    C-->>M: Config (defaults se ausente)
-    M->>M: current_branch_name(repo)
+    M->>C: try_load_from("config.json")
+    C-->>M: Config (defaults se ausente, erro se inválido)
+    M->>M: current_branch_name(repo)<br/>set_transport(git_transport)
     M->>S: new_full_with_pull(...)
     S-->>S: spawn watcher de escrita<br/>spawn watcher de pull
+    M->>S: enable_journal + recover_at_boot
+    S-->>S: replay das ops da sessão que caiu<br/>drain síncrono
     M->>F: new(repo, branch, sync)
     F-->>F: construir indices hierarquicos
     M->>K: fuser::mount2(fs, MOUNT, opts)
@@ -282,7 +306,7 @@ sequenceDiagram
 
 ## 8. Usar o filesystem no dia a dia
 
-Com `/tmp/gitmount` montado, trate-o como qualquer diretório. Abaixo, as operações suportadas (v0.1.0).
+Com `/tmp/gitmount` montado, trate-o como qualquer diretório. Abaixo, as operações suportadas (v0.2.0).
 
 ### 8.1. Criar arquivo
 
@@ -422,8 +446,14 @@ Os logs da sessão ficam em `logs/git-drive-<timestamp>.log` (o path é anunciad
 Quando o pull watcher roda:
 
 ```text
-[14:33:05.220] pull: fast-forward aplicado
+[14:33:05.220] pull: fast-forward applied
+[14:33:06.341] refresh: index rebuilt in 1.1s (70981 files)
 ```
+
+No boot o daemon informa quanto o índice levou (`boot: index of N files built in ...`, com a
+divisão listagem/nomes/mtimes) e qual transporte de rede usa (`boot: git transport=Cli`). Um aviso
+`push: origin moved (another client pushed) — reconciling` é o caso concorrente normal (outra
+máquina deu push antes); ele é seguido de merge e de um novo push.
 
 ### 9.1.1. `git-drive status`
 
@@ -462,27 +492,44 @@ git-drive tray
 
 ### 9.1.3. Notificações
 
-O daemon notifica via Central de Notificações (atribuídas ao "Script Editor"): conflito de merge
-(com os nomes das conflicted copies), push falho persistente, drive montado/desmontado e pull
-bloqueado por working tree sujo (no máximo uma por hora enquanto persistir).
+O daemon notifica via Central de Notificações no macOS (atribuídas ao "Script Editor") e via
+`notify-send` no Linux: conflito de merge (com os nomes em claro das conflicted copies), push falho
+e pull bloqueado por working tree sujo (ambos no máximo uma vez por hora enquanto persistirem), e
+drive montado/desmontado.
 
-## 10. Montar automaticamente no login (launchd)
+## 10. Montar automaticamente no login (launchd / systemd)
 
 ```bash
 git-drive install -r ~/Projects/meu-drive -m ~/GitDrive --with-tray
 ```
 
-O install grava `~/Library/LaunchAgents/dev.giacomeli.git-drive.plist` (RunAtLoad + KeepAlive),
-copia o `config.json` do diretório atual para `~/Library/Application Support/git-drive/` (se ainda
-não existir) e passa os paths padrão por flags — logs em `~/Library/Logs/git-drive/`, status em
-`~/Library/Application Support/git-drive/status.json` (o `git-drive status` acha sozinho de
-qualquer diretório).
+O mesmo comando funciona nas duas plataformas. Nos dois casos ele primeiro copia o binário em
+execução para **`~/.local/bin/git-drive`** e aponta o serviço para lá — o serviço nunca referencia
+uma árvore de build, então mover ou recompilar o projeto não o quebra. Também migra config/chave de
+locais legados para `~/.config/git-drive/` e, se ainda não existir config, copia o `./config.json`
+do diretório atual.
 
-- **Parada limpa:** SIGTERM (launchctl, logout) ou eject no Finder drenam a fila pendente (commit +
-  push) antes de sair — nada se perde. Parada limpa não é ressuscitada pelo KeepAlive.
-- **Crash:** o launchd religa o daemon, que detecta e recupera mount zumbi deixado pelo processo
-  morto.
-- **Remover:** `git-drive uninstall` (para o daemon, desmonta e remove os agentes, inclusive a tray).
+| | macOS (LaunchAgent) | Linux (units de usuário do systemd) |
+| --- | --- | --- |
+| Arquivos do serviço | `~/Library/LaunchAgents/dev.giacomeli.git-drive.plist` (+ `.tray.plist`) | `~/.config/systemd/user/git-drive.service` (+ `git-drive-tray.service`) |
+| Política de restart | KeepAlive `{SuccessfulExit=false}` | `Restart=on-failure`, `TimeoutStopSec=90` |
+| Logs | `~/Library/Logs/git-drive/` | `~/.local/state/git-drive/logs/` (respeita `$XDG_STATE_HOME`) |
+| Status | `~/Library/Application Support/git-drive/status.json` | `~/.local/state/git-drive/status.json` |
+| Serviços legados (`drive-sync`) | derrubados, plists removidos | parados, units mantidas como `<unit>.bak` |
+
+O `git-drive status` acha o arquivo de status sozinho de qualquer diretório. No Linux, sem
+`loginctl enable-linger $USER` o drive só roda enquanto você está logado (o install mostra a dica);
+a tray precisa de sessão gráfica (no GNOME, a extensão AppIndicator).
+
+- **Parada limpa:** SIGTERM (launchctl/systemctl, logout) ou eject drenam a fila pendente (commit +
+  push) antes de sair — nada se perde. Parada limpa não é reiniciada.
+- **Crash:** o gerenciador de serviços religa o daemon, que recupera o mount zumbi deixado pelo
+  processo morto. Escritas que o processo morto já tinha confirmado também não se perdem: toda
+  operação enfileirada vai para o journal em `.git/git-drive-journal/` antes de ser confirmada, e o
+  boot seguinte faz o replay e o commit **antes** de o volume aparecer (o log mostra
+  `journal: N op(s) from an interrupted session replayed`). O journal sobrevive a crash do processo
+  (kill -9, panic, OOM), não a uma queda de energia dentro da janela de write-back do SO.
+- **Remover:** `git-drive uninstall` (para o daemon, desmonta e remove o serviço, inclusive a tray).
 
 ## 11. Lixeira do Finder
 
@@ -643,9 +690,12 @@ cargo run -- -r ~/drives/compartilhado -m /tmp/compartilhado
 | `mount2` falha com erro genérico no macOS | macFUSE não aprovado em **Privacidade e segurança**. | Aprovar na UI, reiniciar o mac se necessário. |
 | `current_branch_name` retorna erro "HEAD detached" | Repo em detached HEAD. | `git checkout <branch>` no repo real. |
 | Escritas aparecem no drive mas não há commit | `user_name` ou `user_email` `null` no `config.json`. | Preencher ambos. |
-| Commit OK mas push falha com `authentication required` | `remote_token` ausente e ssh-agent sem chave. | Carregar chave (`ssh-add`) ou preencher `remote_token`. |
+| Daemon sai no boot com `invalid config ...` | `config.json` existe mas não é JSON válido (ou um campo tem tipo errado). | Corrigir o arquivo; o daemon se recusa a adivinhar. |
+| `pull: fetch error` / `push failed` no log | A máquina não alcança ou não autentica no remote sem interação. | Rodar `git -C <repo> fetch origin` com o mesmo usuário, num shell simples: precisa funcionar sem pedir nada. A linha do log traz a mensagem de erro do próprio git. |
+| Commit OK mas push falha com `authentication required` | HTTPS sem `remote_token` e sem credential helper, ou chave SSH com passphrase fora do agent/Keychain. | Preencher `remote_token`, configurar um credential helper ou deixar a chave disponível sem interação. |
+| Commits ficam sem publicar enquanto offline | Esperado: ficam guardados localmente. | Nada a fazer — o próximo ciclo de pull bem-sucedido publica (`push: origin ok` no log). |
 | Push falha com `403` / `404` | PAT sem escopo `repo` ou URL errada. | Regerar PAT com escopo certo, conferir `git remote -v`. |
-| Pull watcher loga `not fast-forward` | Histórico divergiu (commit local + commit remoto paralelo). | Ctrl-C o git-drive, resolver no repo real (`git pull --rebase`), remontar. |
+| Pull watcher loga `not fast-forward` | Modo sem identidade (sem `user_name`/`user_email`) e o histórico divergiu — FF-only não consegue fazer merge. | Configurar a identidade (merge 3-way com conflicted copies) ou resolver manualmente no repo real. |
 | Mudança no remote demora até ~1s para aparecer | Cache de `getattr` do kernel (TTL ~1s). | Aguardar, ou re-listar (`ls`) o diretório pai. |
 | "device busy" no `umount` | Processo com FD aberto no mount. | `lsof /tmp/gitmount` para achar e fechar. |
 | `cargo run` trava depois de Ctrl-C | Kernel não liberou o mount. | `umount /tmp/gitmount` manual; em último caso `diskutil unmount force`. |
@@ -657,7 +707,7 @@ cargo run -- -r ~/drives/compartilhado -m /tmp/compartilhado
 
 - Se você adicionar uma nova operação FUSE em `src/fs.rs`, liste em [8.1–8.6](#8-usar-o-filesystem-no-dia-a-dia) ou [8.7](#87-o-que-não-funciona-v010) conforme o caso.
 - Se surgir novo campo em `config.json`, atualize a tabela de [6.1](#61-template-completo-comentado) e, quando for relevante, adicione receita em [6.2](#62-receita-rápida-por-cenário).
-- Ao mudar a estratégia de credenciais em `src/git.rs`, revisite [5](#5-configurar-credenciais-do-remote).
+- Ao mudar a estratégia de credenciais ou o transporte em `src/git.rs`, revisite [5](#5-configurar-credenciais-do-remote).
 - Ao mudar logs do processo (mensagens, formato), atualize [9.1](#91-logs-do-processo) para refletir o texto real.
 
 ---

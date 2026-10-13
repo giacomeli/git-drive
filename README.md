@@ -3,7 +3,7 @@
 [![CI](https://github.com/giacomeli/git-drive/actions/workflows/ci.yml/badge.svg)](https://github.com/giacomeli/git-drive/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](#requirements)
-[![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](#requirements)
+[![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](#requirements)
 
 <p align="center">
   <img src="./promo-assets/git-drive-social-preview-1280x640.png"
@@ -33,20 +33,26 @@ versioned Git data underneath, and it syncs with any Git server, including GitHu
 ## Features
 
 - Bidirectional sync with a causal queue (kernel ordering preserved), 3-way merge with
-  conflicted copies, and automatic retry of rejected pushes.
+  conflicted copies, and automatic retry of rejected pushes. Commits made offline are published
+  as soon as the remote is reachable again.
+- Fetch and push through your system `git`, so the drive authenticates exactly like `git fetch`
+  in a terminal (SSH config, agent, macOS Keychain, credential helpers).
+- Crash-safe queue: pending operations are journaled before they are acknowledged and replayed
+  at the next boot.
 - Large files split into content-addressed chunks below GitHub's 100 MB per-file limit
   (`.chunks/` + manifest), transparent on the drive.
 - Optional encryption at rest (XChaCha20-Poly1305): content and names encrypted in the repo,
   everything plaintext on the mount; toggled in the config with automatic migration.
 - Symlinks, mtime derived from history, ignored files as visible local-only entries, native
-  Finder Trash, menu bar tray, macOS notifications, and a LaunchAgent to mount at
-  login.
+  Finder Trash, menu bar tray, desktop notifications, and a login service (LaunchAgent on macOS,
+  systemd user units on Linux).
 
 ## Requirements
 
 - Rust 1.85+ (checked in CI)
-- macOS with [macFUSE](https://osxfuse.github.io/) installed: `brew install macfuse`
-  (the test suite also passes on Linux — the runtime port is on the roadmap)
+- macOS with [macFUSE](https://osxfuse.github.io/) installed (`brew install macfuse`), or Linux
+  with fuse3 (runtime validated on Arch Linux; still experimental)
+- Git 2.31+ on PATH (used for fetch/push; set `"git_transport": "libgit2"` to do without it)
 - A local Git repository (with a checked-out branch) to mount
 - Optional: `origin` configured for remote synchronization
 
@@ -61,15 +67,18 @@ cargo run -- tray             # status icon in the menu bar
 cargo run -- key generate     # encryption-at-rest key
 ```
 
-To mount automatically at login (LaunchAgent with KeepAlive):
+To mount automatically at login (LaunchAgent on macOS, systemd user units on Linux):
 
 ```bash
-cargo run -- install -r <repo_path> -m <mount_path> --with-tray
-cargo run -- uninstall        # stops the daemon and removes the agents
+cargo run --release -- install -r <repo_path> -m <mount_path> --with-tray
+cargo run -- uninstall        # stops the daemon and removes the service
 ```
 
+`install` copies the binary to `~/.local/bin/git-drive` and points the service there. On Linux,
+run `loginctl enable-linger $USER` if the drive should keep running after logout.
+
 SIGTERM/eject perform a clean stop: the pending queue is committed and pushed before exiting.
-Merge conflicts, failed pushes and blocked pulls trigger a macOS notification. The Finder Trash
+Merge conflicts, failed pushes and blocked pulls trigger a desktop notification. The Finder Trash
 works natively (items remain recoverable until emptied or remounted).
 
 Example:
@@ -100,7 +109,8 @@ precedence in the dev flow):
   "encryption_key_file": null,
   "user_name": "Your Name",
   "user_email": "you@example.com",
-  "remote_token": null
+  "remote_token": null,
+  "git_transport": "auto"
 }
 ```
 
@@ -116,9 +126,11 @@ precedence in the dev flow):
 | `encryption_key_file` | `null` | Key file (default `~/.config/git-drive/drive.key`). Generate it with `git-drive key generate`. **Lost key = lost data.** |
 | `user_name` | `null` | Commit identity. If absent, commits are skipped. |
 | `user_email` | `null` | Same as above. |
-| `remote_token` | `null` | HTTPS token (e.g. a GitHub PAT). If absent, uses ssh-agent / the system credential helper. **Plain text.** |
+| `remote_token` | `null` | HTTPS token (e.g. a GitHub PAT). If absent, uses your normal git/ssh credentials. **Plain text.** |
+| `git_transport` | `"auto"` | `auto` (system `git` when available), `cli` or `libgit2` for fetch/push. |
 
-If the file is missing or invalid, defaults are applied with a warning log.
+If the file is missing, defaults are applied with a warning. If it exists but is invalid, the
+daemon refuses to start.
 
 > **Security:** `config.json` may contain a plain-text `remote_token` and the encryption key
 > lives right next to it — keep `~/.config/git-drive/` out of any repo and back up the key in a
@@ -127,19 +139,21 @@ If the file is missing or invalid, defaults are applied with a warning log.
 
 ## Synchronization
 
-- **Local write → remote**: each batch of operations (grouped by the debounce) becomes a single
-  commit followed by `git push`. A rejected push triggers reconciliation (fetch + 3-way merge +
-  retry).
-- **Remote → local**: every `pull_interval_secs`, `git fetch` + merge — fast-forward when
-  possible, otherwise a 3-way merge; conflicts preserve the local version as
-  `<file>.conflict-<host>-<timestamp>` and accept the remote one as canonical.
+- **Local write → remote**: each batch of operations (grouped by the debounce) becomes a commit
+  followed by `git push`. A push refused because another client pushed first triggers
+  reconciliation (fetch + 3-way merge + retry, up to 3 rounds).
+- **Remote → local**: shortly after boot and then every `pull_interval_secs`, `git fetch` + merge
+  — fast-forward when possible, otherwise a 3-way merge. When both sides changed a file, the local
+  version is preserved as `<file>.conflict-<host>-<timestamp>` and the remote one becomes
+  canonical; when one side edited and the other deleted, the edit wins. Local commits the remote
+  does not have yet (e.g. written offline) are pushed in the same cycle.
 - **Branch**: detects the active branch at boot and operates on it until unmount. A detached
   HEAD aborts.
 
 ## Tests
 
 ```bash
-cargo test                   # ~256 tests (unit + integration)
+cargo test                   # ~315 tests (unit + integration)
 cargo test --test sync_flow  # watcher -> commit -> push -> pull flow
 ```
 

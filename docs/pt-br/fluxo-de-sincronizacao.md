@@ -4,7 +4,7 @@
 
 ## Visão Geral
 
-O `SyncManager` desacopla três tempos diferentes: (a) recebimento de operações vindas do kernel FUSE — rápido, em memória; (b) persistência no working tree + commit + push — custoso, roda no fim de um ciclo de ociosidade (debounce); (c) puxar mudanças do remote — também custoso, roda em intervalo independente (pull watcher). Os ciclos (b) e (c) são serializados por um lock compartilhado de repositório (`repo_lock`): drain e pull nunca executam concorrentes sobre o mesmo repo.
+O `SyncManager` desacopla três tempos diferentes: (a) recebimento de operações vindas do kernel FUSE — rápido, registrado no journal em disco e enfileirado em memória; (b) persistência no working tree + commit + push — custoso, roda no fim de um ciclo de ociosidade (debounce); (c) puxar mudanças do remote e publicar commits locais que o remote não tem — também custoso, roda em intervalo independente (pull watcher). Os ciclos (b) e (c) são serializados por um lock compartilhado de repositório (`repo_lock`): drain e pull nunca executam concorrentes sobre o mesmo repo. As operações de rede (fetch/push) passam pelo transporte escolhido no boot para o processo todo (`git_transport`: o `git` CLI do sistema por padrão, libgit2 como fallback).
 
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'primaryColor':'#E3F2FD','primaryTextColor':'#0D47A1','primaryBorderColor':'#1976D2','lineColor':'#546E7A'}}}%%
@@ -22,20 +22,23 @@ sequenceDiagram
     participant Origin as origin (remote)
 
     User->>FS: write / create / mv / mkdir / rm
-    FS->>Sync: queue_* (push_coalescing preserva ordem de chegada)
+    FS->>Sync: queue_*
+    Sync->>Disk: registro no journal (seq.op + seq.data) ANTES da fila
+    Sync->>Sync: push_coalescing (preserva ordem de chegada)
     Sync->>WW: notify_one()
 
     loop até drenar
         WW->>WW: sleep(debounce_secs)
         WW->>Sync: last_op.elapsed() >= debounce e fila não vazia?
         alt ocioso
-            Sync-->>WW: mem::take(fila) — ordem causal
+            Sync-->>WW: take_queue — ordem causal + fronteira do journal
             WW->>Lock: lock() [ciclo inteiro]
-            WW->>Disk: apply_op_to_disk em ordem de chegada
-            WW->>Origin: commit_working_tree + push_to_remote
+            WW->>Disk: apply_op_to_disk em ordem de chegada, commit por lote
             Note over WW: commit ok -> commit_generation += 1
-            alt push rejeitado (non-FF)
-                WW->>Origin: reconcile_and_retry_push (fetch + pull_and_merge + push)
+            WW->>Disk: journal truncate_through(fronteira)
+            WW->>Origin: push_progressive (um push por commit)
+            alt remote andou (outro cliente deu push)
+                WW->>Origin: reconcile_and_retry_push (fetch + pull_and_merge + push, até 3 rodadas)
                 WW->>Sync: refresh_flag = true
             end
             WW->>Lock: unlock
@@ -43,7 +46,7 @@ sequenceDiagram
     end
 
     par Pull paralelo
-        PW->>PW: sleep(pull_interval_secs)
+        PW->>PW: sleep(3 s na primeira rodada, depois pull_interval_secs)
         PW->>Sync: fila vazia?
         alt sim
             PW->>Lock: lock() [ciclo inteiro]
@@ -52,6 +55,9 @@ sequenceDiagram
                 PW->>Origin: fetch_remote + pull_and_merge (ou merge_ff_only sem identidade)
                 alt FF / Merged / Conflicted
                     PW->>Sync: refresh_flag = true
+                end
+                opt branch local à frente do remote
+                    PW->>Origin: publish_progressive
                 end
             else tree suja
                 Note over PW: pula iteração — checkout force destruiria mudanças locais
@@ -66,10 +72,12 @@ sequenceDiagram
         FS->>FS: descarta write buffers não-dirty (gc)
     end
     alt flag true
-        FS->>Disk: list_files + list_dirs do HEAD
-        FS->>FS: reconstrói índices preservando inodes
+        FS->>Disk: list_files + list_dirs do HEAD (tamanhos pelo header dos objetos)
+        FS->>FS: reconstrói índices preservando inodes<br/>(cache de nomes, mtimes incrementais)
     end
 ```
+
+No boot, antes do mount, o `enable_journal` faz o replay do que uma sessão que caiu deixou no journal e o `recover_at_boot` drena isso de forma síncrona (ou commita um working tree sujo) — ver [Journal write-ahead](#journal-write-ahead).
 
 ---
 
@@ -93,10 +101,23 @@ pub struct SyncManager {
     commit_generation: Arc<AtomicU64>,
     repo_lock: Arc<Mutex<()>>,
     status: Arc<StatusState>,
+    notifier: Arc<Notifier>,
+    chunk_threshold_bytes: Arc<AtomicU64>,
+    chunk_size_bytes: Arc<AtomicU64>,
+    commit_batch_bytes: Arc<AtomicU64>,
+    crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
+    migration_crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
+}
+
+struct Inner {
+    buffer: Vec<SyncOp>,
+    last_op: Option<Instant>,
+    journal: Option<Arc<crate::journal::Journal>>,
+    next_seq: u64,
 }
 ```
 
-- `inner` — fila `Vec<SyncOp>` em ordem de chegada + timestamp do último `queue_*`.
+- `inner` — fila `Vec<SyncOp>` em ordem de chegada, timestamp do último `queue_*`, o journal write-ahead opcional e o seq do próximo registro (atribuído sob este lock junto com o push na fila).
 - `notify` — sinaliza ao watcher de escrita que há trabalho.
 - `remote_name`/`remote_token` — credenciais opcionais para push/pull. Ausência desliga push/pull respectivamente.
 - `refresh_flag` — `AtomicBool` setado quando o HEAD avança por pull ou reconcile; consumido por `GitDriveFS::refresh_if_needed`.
@@ -136,17 +157,39 @@ Essa estrutura substituiu um `HashMap<String, SyncOp>` chaveado por path com sor
 
 ---
 
+## Journal write-ahead
+
+`src/journal.rs`, diretório `.git/git-drive-journal/`. A fila vive em RAM até o drain, então sem
+journal um crash (kill -9, panic, OOM) perdia toda op dos últimos segundos — inclusive arquivos cujo
+`close(2)` já tinha devolvido sucesso para o aplicativo.
+
+| Etapa | Onde | O que acontece |
+| --- | --- | --- |
+| Preparar | `enqueue`, fora do lock da fila | `Journal::prepare` grava `tmp-<pid>-<n>.op` (cabeçalho JSON, ex.: `["rename","a","b"]`) e, para uma escrita, `tmp-<pid>-<n>.data` (os bytes de um conteúdo `Mem`, ou uma cópia do arquivo de spool — cópia, não hard link, porque o drain renomeia o spool para dentro do working tree). |
+| Confirmar | `enqueue`, sob o lock da fila | `seq = next_seq++`, os temporários são renomeados para `<seq>.data` e depois `<seq>.op` (o rename do `.op` é o que faz o registro existir), e a op entra na fila. |
+| Tomar | `take_queue` | O drain pega a fila e a fronteira `next_seq - 1`: exatamente os registros das ops que ele pegou. |
+| Truncar | `DrainCtx::run`, sob `repo_lock` | Depois que o último lote foi aplicado e commitado (ou aplicado sem commit no modo sem identidade), os registros `<= fronteira` são apagados (o `.op` primeiro) — ANTES do push, ainda sob o lock, então nenhum pull entra entre o commit e a limpeza. |
+| Replay | boot, `enable_journal` | Os registros são carregados em ordem de seq (ordem de chegada) e empurrados na fila com `push_coalescing`; temporários restantes (ops que nunca ganharam seq, logo nunca chegaram à fila) são descartados; um registro de escrita cujo arquivo de conteúdo sumiu já foi movido para o working tree por um drain interrompido e é descartado. |
+| Recuperação | boot, `recover_at_boot` | Com ops replayadas, o `drain_now` roda de forma síncrona antes do mount, então o drive sobe num HEAD que já as contém (sem janela em que o usuário edita a versão velha). Sem registros, um working tree sujo (crash entre apply e commit, ou sessão anterior ao journal) é commitado como `git-drive: recover uncommitted changes`. |
+
+Fazer replay de ops já commitadas é inofensivo: reaplicar a mesma sequência causal sobre o próprio
+resultado produz o mesmo estado final para todo path que ela toca. Não há fsync — os registros
+sobrevivem a crash do processo (page cache), não a uma queda de energia dentro da janela de
+write-back do SO.
+
+---
+
 ## Watcher de escrita
 
 Fluxo, ver `src/sync.rs::spawn_watcher`:
 
 1. `notified().await` — dorme até o primeiro `queue_*`.
 2. Loop interno dorme por `debounce_secs`.
-3. Sob o lock de `inner`: se `last_op.elapsed() >= debounce` e a fila não está vazia, `mem::take` da fila; caso contrário continua esperando.
+3. Se `last_op.elapsed() >= debounce` e a fila não está vazia, `take_queue` pega a fila e sua fronteira de journal; caso contrário continua esperando.
 4. Adquire `repo_lock` (segura pelo ciclo inteiro; não há `.await` no escopo do guard).
 5. Itera o lote **na ordem da fila** chamando `apply_op_to_disk` para cada `SyncOp`. Com criptografia habilitada, a tradução claro->cifrado de paths e a selagem de conteúdo acontecem NESTA materialização (a fila trabalha 100% em claro). Em seguida, com chunking habilitado (`chunk_threshold_mb > 0`), a varredura converte qualquer arquivo bruto acima do limiar em manifest + `.chunks/` (com criptografia, cada chunk é selado e o hash é do ciphertext); as varreduras de migração conformam o worktree ao estado do config (cifrar tudo ou decifrar tudo, com aviso de que a história permanece como era); e o GC remove chunks que nenhum manifest referencia (exige a chave quando os manifests estão selados — nunca coleta às cegas).
-6. Se `user_name`/`user_email` estão presentes, `commit_batch` gera a mensagem `git-drive: <N> changes (...)` e chama `git::commit_working_tree` (`add_all` com `IndexAddOption::DEFAULT` — arquivos que casam com o `.gitignore` do repo montado ficam fora do commit por especificação; no mount eles viram local-only visíveis). Commit criado incrementa `commit_generation`.
-7. Se houve commit e `remote_name` está configurado, `push_batch` chama `git::push_to_remote`. Push rejeitado (tipicamente non-FF) dispara `reconcile_and_retry_push`: fetch + `pull_and_merge` + um retry de push. Recuperação seta `refresh_flag`. O commit local nunca é revertido.
+6. Se `user_name`/`user_email` estão presentes, `commit_batch` gera a mensagem `git-drive: <N> changes (...)` e chama `git::commit_working_tree` (`add_all` com `IndexAddOption::DEFAULT` — arquivos que casam com o `.gitignore` do repo montado ficam fora do commit por especificação; no mount eles viram local-only visíveis). A fila é fatiada em lotes limitados por tamanho (`commit_batch_mb`), um commit cada. Commit criado incrementa `commit_generation`. Depois do último lote, os registros de journal cobertos pelo drain são truncados.
+7. Se houve commit e `remote_name` está configurado, `publish_progressive` faz um push por commit (`git::push_progressive`). Push recusado porque o remote andou (`Publish::RemoteMoved`: non-FF, "fetch first", "cannot lock ref") dispara `reconcile_and_retry_push`: fetch + `pull_and_merge` + push, repetido por até 3 rodadas enquanto outro cliente continua dando push no meio. Essa divergência esperada loga WARN; só falha real loga ERROR e notifica (com rate limit, chave `push_failed`). Recuperação seta `refresh_flag`. O commit local nunca é revertido — se a publicação ainda falhar, o próximo ciclo de pull tenta de novo.
 8. Ao final do ciclo, `status.record_drain` registra ops aplicadas, oid do commit, resultado do push e ops ainda pendentes na fila — e persiste o `status.json`.
 
 O corpo do ciclo vive em `DrainCtx::run`, compartilhado entre o watcher e o `drain_now` do shutdown
@@ -165,7 +208,7 @@ pós-reconcile e conflicted copies também disparam notificações macOS (`notif
 | `Rename` | `create_dir_all(parent do destino)` + `fs::rename`. |
 | `Symlink` | Remove path pré-existente + `std::os::unix::fs::symlink(target, path)` — o `add_all` estagia como entrada `120000`. |
 
-Erros são logados e o lote segue — arquivos restantes são tentados. **Sem atomicidade multi-arquivo**: um crash no meio do lote deixa estado parcial no working tree (sem commit).
+Erros são logados e o lote segue — arquivos restantes são tentados. **Sem atomicidade multi-arquivo**: um crash no meio do lote deixa estado parcial no working tree (sem commit) — o boot seguinte faz o replay do journal e commita (ver acima).
 
 ---
 
@@ -173,14 +216,34 @@ Erros são logados e o lote segue — arquivos restantes são tentados. **Sem at
 
 `src/sync.rs::spawn_pull_watcher`. Roda somente se `pull_interval_secs > 0` **e** `remote_name` está configurado.
 
-1. Loop: `sleep(pull_interval_secs)`.
+1. Loop: a primeira iteração dorme `min(pull_interval_secs, 3)` segundos — uma máquina acordando ou religando se atualiza em segundos — e as seguintes `pull_interval_secs`.
 2. Se a fila não está vazia, pula a iteração (não rouba tempo do commit local).
 3. Adquire `repo_lock` — serializa com o drain.
 4. **Guarda de working tree**: `git::is_working_tree_clean` (staged, unstaged e untracked; ignorados fora). Tree suja pula a iteração — o checkout force do fast-forward destruiria mudanças locais não commitadas. No modo sem identidade (commits pulados por design), a primeira escrita local bloqueia o pull até o usuário commitar manualmente ou configurar identidade — comportamento aceito e registrado nas decisões da Fase 0.
 5. `git::fetch_remote` (`git fetch origin <branch>`).
-6. Com identidade: `git::pull_and_merge` — FF se possível; senão merge 3-way; conflito gera conflicted copy (`<path>.conflict-<host>-<ts>`) com a versão remota como canônica. Sem identidade: degrada para `git::merge_ff_only` (trava em divergência).
+6. Com identidade: `git::pull_and_merge` (ver [Política de merge](#política-de-merge)). Sem identidade: degrada para `git::merge_ff_only` (trava em divergência).
 7. Qualquer outcome que toque a tree (`FastForwarded`/`Merged`/`Conflicted`) seta `refresh_flag = true`.
-8. Toda iteração registra o outcome em `status.record_pull` — inclusive os pulos ("fila de sync pendente", "working tree sujo") e erros de fetch/merge. Conflicted copies entram na lista `conflicts` do status.
+8. Se a branch local tem commits que `refs/remotes/origin/<branch>` não tem e a ponta remota é ancestral (`local_ahead_of_remote`) — push que falhou offline, sessão anterior que morreu antes de publicar, ou o commit de merge recém-criado —, `publish_progressive` publica nesse mesmo ciclo. Antes, eles esperavam a próxima escrita local, então uma máquina que ficou quieta depois de escrever offline nunca sincronizava.
+9. Toda iteração registra o outcome em `status.record_pull` — inclusive os pulos ("fila de sync pendente", "working tree sujo") e erros de fetch/merge. Conflicted copies entram na lista `conflicts` do status pelo nome em claro (no modo cifrado o merge enxerga nomes de disco base32/`dslong_`; `conflict_copies_for_display` decodifica, resolvendo sidecars).
+
+---
+
+## Política de merge
+
+`git::pull_and_merge`, usado pelo pull watcher e pelo reconcile:
+
+| Situação | Resultado |
+| --- | --- |
+| Só o remote avançou | Fast-forward (`checkout force`, atrás da guarda de tree limpa). |
+| Os dois lados mudaram arquivos diferentes | Merge 3-way, commit de merge com 2 pais. |
+| Os dois lados mudaram (ou criaram) o mesmo arquivo | Versão remota canônica no path; versão local preservada como `<path>.conflict-<host>-<ts>`. |
+| Um lado editou, o outro apagou | A edição vence e fica no próprio path — só uma versão sobrevive, então não há o que conflitar. (Uma conflicted copy aqui deixava o nome original sumido e, no modo cifrado, uma cópia órfã sem o sidecar de nome longo.) |
+| Entrada de nome longo perdeu o sidecar (o lado que apagou removeu `dslong_<h>.name`) | `restore_missing_long_name_sidecars` restaura a partir do HEAD local ou da tree remota, para o nome continuar decodificável. |
+
+No modo cifrado a conflicted copy se chama `<nome cifrado>.conflict-...` em disco; a varredura de
+migração trata esse formato como conforme (ela cifrava o nome base32 uma segunda vez, e a cópia
+aparecia com o nome cifrado do original) e repara cópias já danificadas assim
+(`repair_double_encrypted_conflicts`).
 
 ---
 
@@ -191,7 +254,11 @@ Erros são logados e o lote segue — arquivos restantes são tentados. **Sem at
 1. Se há ops pendentes na fila (`has_pending_ops`), retorna — refresh com lote não drenado descartaria paths recém-criados dos índices.
 2. Se `commit_generation` avançou desde a última observação, descarta write buffers **não-dirty** (gc): com a fila vazia e commit criado, o conteúdo deles já está no HEAD, e mantê-los esconderia mudanças remotas futuras do `read`.
 3. `take_refresh_flag()`; se `false`, retorna.
-4. Descarta buffers não-dirty de novo (o HEAD avançou por pull/merge) e reconstrói os índices: lista dirs e files do HEAD, preserva inodes de paths que ainda existem, aloca novos inodes (lazy, via `unwrap_or_else`) só para paths novos.
+4. Descarta buffers não-dirty de novo (o HEAD avançou por pull/merge) e reconstrói os índices: lista dirs e files do HEAD (tamanho dos blobs pelo header do objeto via `odb.read_header`, sem carregar conteúdo), preserva inodes de paths que ainda existem, aloca novos inodes (lazy, via `unwrap_or_else`) só para paths novos. No modo cifrado, os nomes em claro vêm do `name_cache` (path em disco -> path em claro; só paths novos são decodificados e leem seus sidecars). Os mtimes são recalculados só para os paths tocados por `indexed_head..new_head` (`git::commit_times_between`), com fallback para o walk completo acima de 4096 commits.
+
+O refresh roda na thread FUSE, então sua duração é tempo de drive congelado. Medido num drive cifrado
+de 96.878 arquivos: 8,1 s antes dessas otimizações, 1,1 s depois. Todo refresh loga
+`refresh: index rebuilt in <t> (<n> files)`.
 
 Buffers **dirty** (escrita ainda não enfileirada) nunca são descartados.
 
@@ -209,7 +276,8 @@ Buffers **dirty** (escrita ainda não enfileirada) nunca são descartados.
 | `Arc<AtomicBool>` (`refresh_flag`) | Canal de uma via dos watchers para `GitDriveFS`. `SeqCst`. |
 | `Arc<AtomicU64>` (`commit_generation`) | Contador monotônico de commits do drain, base do gc de buffers. |
 | `Arc<AtomicU64>` (`next_inode`) | Alocador monotônico de inodes. |
-| `fs::*` síncrono | As gravações em disco acontecem fora do lock de `Inner` (mas dentro do `repo_lock`). |
+| `fs::*` síncrono | As gravações em disco acontecem fora do lock de `Inner` (mas dentro do `repo_lock`). A exceção é o journal: o conteúdo do registro é gravado fora do lock de `Inner`, mas os dois renames que dão o seq acontecem sob ele, junto com o push na fila. |
+| Processos `git` filhos (transporte CLI) | Rodam dentro do `repo_lock`; stdin fechado, sem prompts, encerrados após 300 s sem saída para que uma conexão travada não segure o lock para sempre. |
 
 ---
 
@@ -220,6 +288,8 @@ Buffers **dirty** (escrita ainda não enfileirada) nunca são descartados.
 - Formato: `git-drive: <N> changes (<p1>, <p2>, <p3>[, +M more])`
 - Até 3 paths inline; mais que isso adiciona `+<M> more`.
 - `<path>` vem de `SyncOp::primary_path`.
+- Modo cifrado: só a contagem (`git-drive: <N> changes`) — paths em claro vazariam nomes no histórico.
+- Recuperação de boot de tree suja sem op na fila: `git-drive: recover uncommitted changes`.
 
 ---
 
@@ -242,28 +312,29 @@ Write+Delete (o lado efêmero é filtrado individualmente).
 ## Limitações do Fluxo Atual
 
 1. **Pull bloqueado no modo sem identidade.** Sem `user_name`/`user_email`, escritas locais nunca viram commit; a guarda de working tree então bloqueia o pull indefinidamente após a primeira escrita. Sync vira efetivamente unidirecional até commit manual ou configuração de identidade.
-2. **Sem atomicidade multi-arquivo.** Crash no meio do lote deixa working tree parcialmente atualizado mas sem commit.
+2. **Sem atomicidade multi-arquivo.** Crash no meio do lote deixa working tree parcialmente atualizado mas sem commit; o replay do journal no boot seguinte completa e commita. O journal não usa fsync: uma queda de energia ainda pode perder os últimos segundos.
 3. **Sem cancelamento.** Ops enfileiradas sempre rodam — não há API para descartar um `queue_write` antes do debounce.
 4. **TTL de FUSE vs refresh.** `TTL = 1s` no kernel faz o refresh demorar até 1s extra para aparecer ao usuário.
-5. **Falha persistente de push só loga.** Depois do retry único do reconcile, o commit fica local até o próximo ciclo com push bem-sucedido.
+5. **Falha persistente de push mantém os commits locais.** Depois das rodadas do reconcile, os commits ficam locais; todo ciclo de pull tenta publicar de novo assim que o remote volta a ser alcançável.
 
 ---
 
 ## Como adicionar uma ação pós-flush
 
-Ponto de extensão em `src/sync.rs::spawn_watcher`, entre `commit_batch` e `push_batch`:
+Ponto de extensão em `src/sync.rs::DrainCtx::run`, logo após o commit de um lote (Fase A), antes da
+truncagem do journal e da publicação (Fase B):
 
 ```rust
-if committed {
-    commit_generation.fetch_add(1, Ordering::SeqCst);
-    meu_hook::on_flush(&ops, &repo_path);   // <- aqui
-    if let Some(ref remote) = remote_name {
-        // push_batch / reconcile_and_retry_push ...
-    }
+if let Some(oid) = commit_oid {
+    commits_created += 1;
+    last_commit = Some(oid);
+    self.commit_generation.fetch_add(1, Ordering::SeqCst);
+    meu_hook::on_commit(&ops, &self.repo_path);   // <- aqui
 }
 ```
 
-`ops` já contém `Vec<&SyncOp>` com todos os paths/conteúdos do lote, na ordem causal.
+`ops` já contém `Vec<&SyncOp>` com todos os paths/conteúdos do lote, na ordem causal. Mantenha o
+hook fora da truncagem do journal: registros só podem sair depois que o drain deles commitou.
 
 ## Como adicionar uma nova regra de coalescência
 
@@ -279,12 +350,13 @@ A única coalescência hoje é Write-sobre-Write (`push_coalescing` em `src/sync
 
 | Arquivo | Responsabilidade |
 | --- | --- |
-| `src/sync.rs` | `SyncManager`, `SyncOp`, fila causal (`push_coalescing`), watchers, `commit_batch`, `push_batch`, `reconcile_and_retry_push` |
+| `src/sync.rs` | `SyncManager`, `SyncOp`, fila causal (`push_coalescing`), `take_queue`, `enable_journal`, `recover_at_boot`, watchers, `commit_batch`, `publish_progressive`, `reconcile_and_retry_push`, `local_ahead_of_remote` |
+| `src/journal.rs` | Journal write-ahead: `prepare`/`commit`/`truncate_through`/`open` (replay) |
 | `src/fs.rs` | `write_buffers` + dirty flags, `refresh_if_needed` (gc de buffers + rebuild), chamadas a `sync.queue_*` nos `apply_*` |
-| `src/git.rs` | `commit_working_tree`, `push_to_remote`, `fetch_remote`, `merge_ff_only`, `pull_and_merge`, `is_working_tree_clean` |
+| `src/git.rs` | `commit_working_tree`, transporte (`Transport`, `run_git_net`, `CredAttempts`), `push_progressive`, `fetch_remote`, `merge_ff_only`, `pull_and_merge`, `is_working_tree_clean`, `commit_times_between` |
 | `src/status.rs` | `SyncStatus`/`StatusState`, escrita atômica do `status.json`, formatação do subcomando |
-| `src/notify.rs` | Notificações macOS (osascript) com rate limit para eventos persistentes |
-| `src/config.rs` | Origem de `write_debounce_secs`, `pull_interval_secs`, `read_cache_mb`, `large_file_threshold_mb`, `chunk_threshold_mb`, `chunk_size_mb`, `encryption_enabled`, `encryption_key_file`, identidade e token |
+| `src/notify.rs` | Notificações (osascript no macOS, notify-send no Linux) com rate limit para eventos persistentes |
+| `src/config.rs` | Origem de `write_debounce_secs`, `pull_interval_secs`, `read_cache_mb`, `large_file_threshold_mb`, `chunk_threshold_mb`, `chunk_size_mb`, `commit_batch_mb`, `encryption_enabled`, `encryption_key_file`, identidade, token e `git_transport` |
 
 Docs relacionadas:
 

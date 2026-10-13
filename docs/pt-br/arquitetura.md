@@ -21,16 +21,17 @@ para quem usa o mount:
 
 ```mermaid
 flowchart LR
-    CLI[CLI: main.rs] --> Config[Config::load_from<br/>~/.config/git-drive/config.json]
-    Config --> Sync[SyncManager<br/>2 watchers async]
+    CLI[CLI: main.rs] --> Config[Config::try_load_from<br/>~/.config/git-drive/config.json]
+    Config --> Sync[SyncManager<br/>2 watchers async + journal]
+    Sync --> Journal[(".git/git-drive-journal<br/>replay no boot")]
     Sync --> Write[Watcher de escrita<br/>debounce -> ops -> chunking/cripto -> commit -> push]
-    Sync --> Pull[Watcher de pull<br/>fetch + FF ou merge 3-way]
+    Sync --> Pull[Watcher de pull<br/>fetch + FF ou merge 3-way + publica commits pendentes]
     Sync --> FS[GitDriveFS<br/>indices hierarquicos da visao CLARA]
     FS --> Mount[fuser::spawn_mount2]
     Mount --> Kernel[(kernel FUSE)]
     Kernel -- syscalls --> FS
     FS -- queue_* em paths claros --> Sync
-    Write -- git commit + push --> Remote[(origin)]
+    Write -- git commit + push (git CLI ou libgit2) --> Remote[(origin)]
     Pull -- git fetch + merge --> Remote
     Pull -- refresh_flag --> FS
 ```
@@ -39,45 +40,43 @@ flowchart LR
 
 ## Estrutura de Diretórios
 
-```text
-git-drive/
-├── Cargo.toml                    # fuser, git2, tokio, clap, serde, sha2, chacha20poly1305, hkdf...
-├── AGENTS.md                     # invariantes, armadilhas e guia para agentes
-├── README.md
-├── .github/workflows/ci.yml     # CI de verificação (espelha os comandos do AGENTS.md)
-├── docs/
-│   ├── README.md
-│   ├── usage.md                  # guia passo a passo do usuário
-│   ├── architecture.md
-│   ├── sync-flow.md
-│   ├── fuse-filesystem.md
-│   └── pt-br/                    # versões em português dos docs
-├── src/
-│   ├── main.rs                   # CLI, dispatch de subcomandos, lifecycle do mount
-│   ├── lib.rs                    # módulos públicos p/ testes + redirect de logs
-│   ├── fs.rs                     # GitDriveFS + impl fuser::Filesystem + apply_*
-│   ├── git.rs                    # wrapper sobre git2 (leitura, commit, push, pull, ignore, mtime)
-│   ├── sync.rs                   # SyncManager + fila causal + drain + varreduras
-│   ├── chunk.rs                  # manifest + fatiamento content-addressed (Fase 2.6)
-│   ├── crypt.rs                  # criptografia em repouso (Fase 2.7)
-│   ├── config.rs                 # loader do config.json
-│   ├── paths.rs                  # resolução de paths (XDG ~/.config/git-drive + legados)
-│   ├── status.rs                 # status.json atômico + subcomando status
-│   ├── notify.rs                 # notificações macOS (osascript + rate limit)
-│   ├── tray.rs                   # ícone da barra de menus
-│   └── launchd.rs                # LaunchAgents (install/uninstall)
-├── tests/
-│   ├── common/mod.rs             # helpers (init_repo determinístico, commit_*, bare remote)
-│   ├── smoke.rs
-│   ├── fs_hierarchy.rs           # modelo hierárquico, buffers, chunking e cripto na visão FUSE
-│   ├── sync_flow.rs              # drain, commit, push, pull, migrações
-│   └── e2e_integration.rs        # cenários ponta-a-ponta
-└── vendor/fuser/                 # fuser 0.14 com patches locais (upstream no roadmap)
+```mermaid
+flowchart LR
+    root["git-drive/"]
+    root --> cargo["Cargo.toml<br/>fuser, git2, tokio, clap, serde, sha2, chacha20poly1305, hkdf"]
+    root --> agents["AGENTS.md<br/>invariantes, armadilhas, guia para agentes"]
+    root --> ci[".github/workflows/ci.yml<br/>CI de verificação (espelha o AGENTS.md)"]
+    root --> docs["docs/<br/>usage, architecture, sync-flow, fuse-filesystem, pt-br/"]
+    root --> vendor["vendor/fuser/<br/>fuser 0.14 com patches locais"]
+    root --> src["src/"]
+    root --> tests["tests/"]
+    src --> s_main["main.rs<br/>CLI, dispatch, lifecycle do mount, recuperação no boot"]
+    src --> s_lib["lib.rs<br/>módulos públicos p/ testes + logging"]
+    src --> s_fs["fs.rs<br/>GitDriveFS + fuser::Filesystem + apply_*"]
+    src --> s_git["git.rs<br/>wrapper git2 + transporte de rede (CLI / libgit2)"]
+    src --> s_sync["sync.rs<br/>SyncManager, fila causal, drain, varreduras"]
+    src --> s_journal["journal.rs<br/>journal write-ahead da fila"]
+    src --> s_chunk["chunk.rs<br/>manifest + fatiamento content-addressed"]
+    src --> s_crypt["crypt.rs<br/>criptografia em repouso"]
+    src --> s_config["config.rs<br/>loader do config.json (estrito no modo mount)"]
+    src --> s_paths["paths.rs<br/>paths XDG / de plataforma / legados"]
+    src --> s_status["status.rs<br/>status.json atômico + subcomando status"]
+    src --> s_notify["notify.rs<br/>osascript / notify-send + rate limit"]
+    src --> s_tray["tray.rs + viewer.rs<br/>ícone da tray e visualizador de log"]
+    src --> s_service["service.rs<br/>dispatch de install/uninstall, instalação do binário"]
+    src --> s_launchd["launchd.rs<br/>LaunchAgents (macOS)"]
+    src --> s_systemd["systemd.rs<br/>units de usuário do systemd (Linux)"]
+    tests --> t_common["common/mod.rs<br/>helpers de repo"]
+    tests --> t_fs["fs_hierarchy.rs<br/>visão FUSE, buffers, chunking, cripto"]
+    tests --> t_sync["sync_flow.rs<br/>drain, push, pull, journal, recuperação"]
+    tests --> t_e2e["e2e_integration.rs + smoke.rs"]
 ```
 
 O config e a chave de criptografia vivem em `~/.config/git-drive/` (com fallback de leitura para
-o local legado em `~/Library/Application Support/git-drive/`); status.json fica no Application
-Support e logs em `~/Library/Logs/git-drive/`.
+os locais legados `~/.config/drive-sync/` e `~/Library/Application Support/`). O daemon instalado
+guarda o status.json no Application Support e os logs em `~/Library/Logs/git-drive/` no macOS, e
+ambos em `$XDG_STATE_HOME/git-drive/` (padrão `~/.local/state/git-drive/`) no Linux. O serviço
+sempre roda a cópia instalada em `~/.local/bin/git-drive`.
 
 ---
 
@@ -85,15 +84,15 @@ Support e logs em `~/Library/Logs/git-drive/`.
 
 | Camada | Arquivo | Responsabilidade |
 | --- | --- | --- |
-| CLI / Orquestração | `src/main.rs` | Subcomandos (`status`/`install`/`uninstall`/`tray`/`key generate`) e modo mount: runtime tokio explícito, recuperação de mount zumbi, validação da chave de criptografia (habilitada sem chave = aborta), espera de sinais e shutdown limpo (unmount -> drain final). |
+| CLI / Orquestração | `src/main.rs` | Subcomandos (`status`/`install`/`uninstall`/`tray`/`viewer`/`key generate`) e modo mount: carga estrita do config, resolução do transporte, runtime tokio explícito, replay do journal + recuperação de boot antes do mount, recuperação de mount zumbi, validação da chave de criptografia (habilitada sem chave = aborta), espera de sinais e shutdown limpo (unmount -> drain final). |
 | Filesystem | `src/fs.rs` | Implementa `fuser::Filesystem`. Índices hierárquicos da visão CLARA, buffers de escrita (RAM copy-on-write ou spool em disco), leitura com cache LRU + handle de repo persistente, detecção lazy de manifests, decifração AEAD, mtime derivado, local-only. |
-| Git | `src/git.rs` | Leitura de trees/blobs (com `FileKind` p/ symlinks), commit do working tree (`add_all` respeitando ignore), push com detecção de rejeição por ref, fetch, FF e merge 3-way com conflicted copies, `is_working_tree_clean`, ignorados e `commit_times_by_path`. |
-| Sincronização | `src/sync.rs` | Fila causal de `SyncOp` (coalescing só de Write, barreiras no resto), drain com tradução claro->cifrado, varredura de chunking, migrações de criptografia nos dois sentidos, GC de chunks órfãos, push com reconcile e pull watcher. |
+| Git | `src/git.rs` | Leitura de trees/blobs (tamanhos pelo header do objeto, `FileKind` p/ symlinks), commit do working tree (`add_all` respeitando ignore), transporte de rede (`git` CLI do sistema por padrão, fallback libgit2 com callback de credencial com estado), push com detecção de rejeição por ref, fetch, FF e merge 3-way (ambos modificaram -> conflicted copy, modify/delete -> a edição vence, sidecars restaurados), `is_working_tree_clean`, ignorados, `commit_times_by_path` e `commit_times_between`. |
+| Sincronização | `src/sync.rs`, `src/journal.rs` | Fila causal de `SyncOp` (coalescing só de Write, barreiras no resto) com journal write-ahead, drain com tradução claro->cifrado, varredura de chunking, migrações de criptografia nos dois sentidos (inclusive reparo de conflicted copies cifradas duas vezes), GC de chunks órfãos, push com reconcile em várias rodadas, pull watcher que também publica commits pendentes, recuperação no boot. |
 | Chunking | `src/chunk.rs` | Manifest texto versionado, sharding `.chunks/<2 hex>/<sha256>`, fatiamento em streaming com transform opcional (selagem) e dedup por content-addressing. |
 | Criptografia | `src/crypt.rs` | XChaCha20-Poly1305 convergente (nonce derivado do plaintext), HKDF de subchaves, nomes por componente em base32 lowercase com fallback literal, arquivo de chave 0600. |
-| Observabilidade | `src/status.rs`, `src/notify.rs`, `src/tray.rs` | `status.json` atômico, notificações macOS com rate limit e tray com 4 estados. |
-| Instalação / Paths | `src/launchd.rs`, `src/paths.rs` | LaunchAgents por template, migração de config/chave do local legado, resolução XDG. |
-| Configuração | `src/config.rs` | Loader com `#[serde(default)]` por campo (11 campos). Degrada para defaults com log. |
+| Observabilidade | `src/status.rs`, `src/notify.rs`, `src/tray.rs` | `status.json` atômico, notificações com rate limit (osascript no macOS, notify-send no Linux; processos filhos colhidos), tray com 4 estados, tempos de índice/refresh no log. |
+| Instalação / Paths | `src/service.rs`, `src/launchd.rs`, `src/systemd.rs`, `src/paths.rs` | Dispatch por plataforma, binário instalado em `~/.local/bin/git-drive`, LaunchAgents por template (macOS) e units de usuário do systemd (Linux), migração de config/chave dos locais legados, resolução XDG. |
+| Configuração | `src/config.rs` | Loader com `#[serde(default)]` por campo (16 campos). Arquivo ausente = defaults; arquivo existente e inválido aborta o modo mount. |
 
 ---
 
@@ -175,6 +174,11 @@ pub struct Config {
     pub user_name: Option<String>,
     pub user_email: Option<String>,
     pub remote_token: Option<String>,
+    pub commit_batch_mb: u64,              // 256
+    pub log_max_mb: u64,                   // 50
+    pub log_keep_files: usize,             // 10
+    pub log_level: String,                 // "info"
+    pub git_transport: String,             // "auto" | "cli" | "libgit2"
 }
 ```
 
@@ -189,8 +193,13 @@ pub struct Config {
   `large_file_threshold_mb` o buffer vive em spool no disco.
 - Pull watcher pula iteração se há lote pendente (evita corrida com commit local).
 - `refresh_if_needed` é chamado em cada `lookup`/`getattr`/`readdir`. Barato em steady state;
-  caro após pull (rebuild) ou commit local (gc + varredura de local-only).
-- `Config::load_from` roda uma única vez — não há hot-reload (mudar `encryption_enabled` exige
+  após um pull reconstrói o índice com a thread FUSE bloqueada. Tamanhos de blob vêm do header dos
+  objetos, nomes decifrados de um cache reaproveitado entre refreshes, e os mtimes são recalculados
+  só para os commits novos: num drive cifrado de 96.878 arquivos, o boot caiu de ~25 s para ~9 s e
+  o refresh pós-pull de 8,1 s para 1,1 s.
+- Toda op enfileirada custa uma escrita extra (o registro no journal) — o preço de não perder
+  escritas confirmadas num crash.
+- O config é carregado uma única vez — não há hot-reload (mudar `encryption_enabled` exige
   reiniciar o daemon; a migração roda no drain seguinte).
 
 ---
@@ -201,8 +210,8 @@ pub struct Config {
 | --- | --- | --- |
 | 1 | `.gitkeep` automático em `mkdir`/`rmdir` | Git não rastreia diretórios vazios — workaround em `src/sync.rs` |
 | 2 | Credenciais e chave em texto plano no disco local | `~/.config/git-drive/` (keychain é candidato futuro) |
-| 3 | Conflito de merge vira conflicted copy | `pull_and_merge` 3-way; sem identidade degrada para FF-only |
-| 4 | Push falho não é revertido | commit local permanece; reconcile + retry automáticos |
+| 3 | Edição concorrente do mesmo arquivo vira conflicted copy | `pull_and_merge` 3-way; modify/delete mantém a edição; sem identidade degrada para FF-only |
+| 4 | Push falho não é revertido | commit local permanece; reconcile em até 3 rodadas; o ciclo de pull tenta publicar de novo |
 | 5 | HEAD detached aborta boot | `src/main.rs` |
 | 6 | Sem FIFOs/sockets/hardlinks reais | symlinks suportados; `link` é cópia |
 | 7 | `chmod` em memória, `chown` ignorado | uid/gid são os do processo do mount |
@@ -210,7 +219,8 @@ pub struct Config {
 | 9 | Refresh depende de syscalls FUSE | TTL de 1s no kernel pode mascarar mudanças remotas por ~1s |
 | 10 | Arquivos acima de `chunk_threshold_mb` viram manifest + `.chunks/` | transparente no mount; clone puro vê os artefatos (`src/chunk.rs`) |
 | 11 | Criptografia em repouso é opcional e não protege o passado | história pré-migração permanece legível; ignore/local-only desativados no modo cifrado (`src/crypt.rs`) |
-| 12 | Runtime só em macOS | a suíte passa em Linux (CI); o port do mount fuse3 está no roadmap |
+| 12 | Journal sem fsync | escritas confirmadas sobrevivem a crash do processo, não a queda de energia dentro da janela de write-back do SO (`src/journal.rs`) |
+| 13 | Serviço Linux só roda com o usuário logado, sem linger | `loginctl enable-linger $USER` (`src/systemd.rs`) |
 
 ---
 
@@ -242,12 +252,15 @@ pub struct Config {
 | --- | --- |
 | `src/main.rs` | Entry point, CLI, lifecycle do mount e shutdown limpo |
 | `src/fs.rs` | `GitDriveFS`, modelo hierárquico, `apply_*`, `refresh_if_needed` |
-| `src/git.rs` | Wrapper sobre `git2` (leitura, commit, push, pull, ignore, mtime) |
+| `src/git.rs` | Wrapper sobre `git2` (leitura, commit, merge, ignore, mtime) + transporte de rede |
 | `src/sync.rs` | `SyncManager`, fila causal, drain, varreduras e GC |
+| `src/journal.rs` | Journal write-ahead da fila |
 | `src/chunk.rs` | Manifest + fatiamento content-addressed |
 | `src/crypt.rs` | Criptografia em repouso |
 | `src/config.rs` | Loader de `config.json` |
-| `src/paths.rs` | Resolução XDG + legados |
+| `src/paths.rs` | Resolução XDG + plataforma + legados |
+| `src/service.rs` | Dispatch do serviço de login e instalação do binário |
+| `src/launchd.rs` / `src/systemd.rs` | LaunchAgents (macOS) / units de usuário do systemd (Linux) |
 | `tests/common/mod.rs` | Helpers de repositório Git para testes |
 
 Docs relacionadas:
