@@ -198,6 +198,9 @@ pub struct Config {
   headers, decrypted names from a cache reused across refreshes, and mtimes are recomputed only for
   the new commits: on a 96,878-file encrypted drive, boot went from ~25 s to ~9 s and a post-pull
   refresh from 8.1 s to 1.1 s.
+- The drain's sweeps (chunking, encryption migration, chunk GC) are incremental: one full pass per
+  state, then only dirty files plus paths changed since the last conforming HEAD. Save-to-commit on
+  the real drive went from 4 min 22 s to 8.4 s on the Mac and 4.3 s on Linux.
 - Every queued op costs one extra write (its journal record) — the price of not losing
   acknowledged writes on a crash.
 - The config is loaded a single time — there is no hot reload (changing `encryption_enabled`

@@ -306,7 +306,7 @@ sequenceDiagram
 
 ## 8. Use the filesystem day to day
 
-With `/tmp/gitmount` mounted, treat it like any directory. Below, the supported operations (v0.2.0).
+With `/tmp/gitmount` mounted, treat it like any directory. Below, the supported operations (v0.2.1).
 
 ### 8.1. Create a file
 

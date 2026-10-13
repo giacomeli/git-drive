@@ -192,6 +192,9 @@ pub struct Config {
 - Escrita: pico de RAM ~1x o tamanho do arquivo (Arc compartilhado buffer/fila); acima de
   `large_file_threshold_mb` o buffer vive em spool no disco.
 - Pull watcher pula iteração se há lote pendente (evita corrida com commit local).
+- As varreduras do drain (chunking, migração de criptografia, GC de chunks) são incrementais: uma
+  passada completa por estado e depois só arquivos sujos mais paths alterados desde o último HEAD
+  conforme. Do salvamento ao commit no drive real: de 4 min 22 s para 8,4 s no Mac e 4,3 s no Linux.
 - `refresh_if_needed` é chamado em cada `lookup`/`getattr`/`readdir`. Barato em steady state;
   após um pull reconstrói o índice com a thread FUSE bloqueada. Tamanhos de blob vêm do header dos
   objetos, nomes decifrados de um cache reaproveitado entre refreshes, e os mtimes são recalculados

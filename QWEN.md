@@ -12,7 +12,7 @@ pull. Optional at-rest encryption (XChaCha20-Poly1305, convergent) lets even a p
 act as a private drive. Runs on macOS (macFUSE) and Linux (fuse3); `git-drive install`
 creates the login service on both (LaunchAgent / systemd user units).
 
-- Crate: `git-drive` v0.2.0, Rust edition 2021, MSRV **1.85** (checked in CI)
+- Crate: `git-drive` v0.2.1, Rust edition 2021, MSRV **1.85** (checked in CI)
 - Key deps: `fuser` 0.14 (locally patched, see `vendor/`), `git2`, `tokio`, `clap`,
   `chacha20poly1305`/`hkdf`/`sha2` (encryption + chunking), `tray-icon`/`tao` (menu bar),
   `eframe`/egui (viewer window)
@@ -106,7 +106,7 @@ These encode real data-loss incidents:
 
 FUSE `write` → `apply_write` (buffer = copy of HEAD blob, inode marked dirty) → `flush`
 enqueues `SyncOp::Write` **only if dirty** → debounce watcher drains the queue **in arrival
-order** under `repo_lock`, applies ops to the worktree, runs the chunking sweep, commits (1
+order** under `repo_lock`, applies ops to the worktree, runs the (incremental) chunking/encryption sweeps, commits (1
 commit per size-bounded batch), pushes (with reconcile-and-retry on rejection). Pull watcher
 fetches + merges on the interval, only with a clean tree, and sets `refresh_flag`;
 `refresh_if_needed` (on lookup/getattr/readdir) rebuilds indices and discards non-dirty
