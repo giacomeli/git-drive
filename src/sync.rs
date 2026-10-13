@@ -2105,8 +2105,6 @@ fn gc_orphan_chunks(repo_path: &Path, key: Option<&crate::crypt::Crypto>) {
     }
 }
 
-/// Working tree files as (full path, relative path), skipping `.git` at any
-/// level and `.chunks` at the root. Does not follow symlinks.
 /// Which working-tree files the drain's sweeps (chunking, encryption
 /// migration, orphan-chunk GC) must examine.
 #[derive(Debug)]
@@ -2276,6 +2274,8 @@ fn sweep_scope(repo_path: &Path, fingerprint: &str) -> SweepScope {
     }
 }
 
+/// Working tree files as (full path, relative path), skipping `.git` at any
+/// level and `.chunks` at the root. Does not follow symlinks.
 fn walk_worktree_files(repo_path: &Path) -> Vec<(std::path::PathBuf, String)> {
     let mut out = Vec::new();
     let mut stack = vec![repo_path.to_path_buf()];
