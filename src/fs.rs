@@ -234,6 +234,9 @@ pub(crate) struct DirEntry {
     pub(crate) children: HashSet<u64>,
 }
 
+/// In-memory extended attributes: inode -> (name -> value).
+type XattrMap = HashMap<u64, HashMap<OsString, Vec<u8>>>;
+
 pub struct GitDriveFS {
     repo_path: String,
     #[allow(dead_code)]
@@ -283,6 +286,14 @@ pub struct GitDriveFS {
     /// revwalk at boot/refresh). Consulted after `times` (session) and before
     /// `boot_time` (residue: local-only and directories).
     derived_times: HashMap<u64, SystemTime>,
+    /// Encrypted mode: on-disk path -> clear path of every indexed entry.
+    /// The mapping is deterministic, so refreshes reuse it and only decode
+    /// (and read the sidecars of) paths they have not seen — re-decoding all
+    /// ~100k names on every post-pull refresh froze the drive for seconds.
+    name_cache: HashMap<String, String>,
+    /// HEAD the index was built from; lets the post-pull refresh recompute
+    /// mtimes only for the paths the new commits touched.
+    indexed_head: Option<git2::Oid>,
     /// Lazy per-inode manifest detection cache (Phase 2.6): `Some` =
     /// chunked file (parsed manifest), `None` = checked and not chunked.
     /// Cleared together with the buffer gc (HEAD changed).
@@ -291,7 +302,7 @@ pub struct GitDriveFS {
     /// file pay hash+disk once per chunk, not per syscall.
     last_chunk: Option<(u64, usize, Vec<u8>)>,
     boot_time: SystemTime,
-    xattrs: Arc<parking_lot::Mutex<HashMap<u64, HashMap<OsString, Vec<u8>>>>>,
+    xattrs: Arc<parking_lot::Mutex<XattrMap>>,
 }
 
 /// Default read cache budget when the caller does not specify one
@@ -347,11 +358,17 @@ impl GitDriveFS {
         spool_threshold_bytes: u64,
         crypto: Option<Arc<crate::crypt::Crypto>>,
     ) -> anyhow::Result<Self> {
+        let t0 = std::time::Instant::now();
         let repo = git::open_repo(repo_path)?;
         let commit = git::get_commit(&repo, "HEAD")?;
         let dirs = git::list_dirs_at_commit(&repo, &commit)?;
         let files = git::list_files_at_commit(&repo, &commit)?;
-        let (dirs, files) = decrypt_listing(crypto.as_deref(), repo_path, dirs, files);
+        let indexed_head = Some(commit.id());
+        let t_list = t0.elapsed();
+        let (dirs, files, name_cache) =
+            decrypt_listing_cached(crypto.as_deref(), repo_path, dirs, files, &HashMap::new());
+        let t_decrypt = t0.elapsed();
+        let n_files = files.len();
 
         let mut files_by_inode = HashMap::new();
         let mut dirs_by_inode = HashMap::new();
@@ -465,17 +482,31 @@ impl GitDriveFS {
             mode_overrides: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             times: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             derived_times: HashMap::new(),
+            name_cache,
+            indexed_head,
             manifests: parking_lot::Mutex::new(HashMap::new()),
             last_chunk: None,
             boot_time: SystemTime::now(),
             xattrs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         };
+        let t_index = t0.elapsed();
         // Ignored files present in the working tree enter as visible
         // local-only entries (Phase 2.5): shown in the mount, never committed.
         fs.incorporate_local_only(&HashMap::new());
+        let t_local = t0.elapsed();
         // mtime derived from history: without this, every remount would
         // "renew" the mtime of every file to the boot instant.
         fs.refresh_derived_times();
+        log::info!(
+            "boot: index of {} files built in {:.1?} (list {:.1?}, names {:.1?}, index {:.1?}, local-only {:.1?}, mtimes {:.1?})",
+            n_files,
+            t0.elapsed(),
+            t_list,
+            t_decrypt - t_list,
+            t_index - t_decrypt,
+            t_local - t_index,
+            t0.elapsed() - t_local
+        );
         Ok(fs)
     }
 
@@ -1293,6 +1324,7 @@ impl GitDriveFS {
         }
         // Post-pull refresh: HEAD advanced via fetch/merge (which only runs
         // with a clean working tree). Clean buffers reflect the old HEAD — discard.
+        let t0 = std::time::Instant::now();
         self.gc_clean_buffers();
         let repo = match git::open_repo(&self.repo_path) {
             Ok(r) => r,
@@ -1322,7 +1354,15 @@ impl GitDriveFS {
                 return;
             }
         };
-        let (dirs, files) = decrypt_listing(self.crypto.as_deref(), &self.repo_path, dirs, files);
+        let new_head = commit.id();
+        let (dirs, files, name_cache) = decrypt_listing_cached(
+            self.crypto.as_deref(),
+            &self.repo_path,
+            dirs,
+            files,
+            &self.name_cache,
+        );
+        self.name_cache = name_cache;
 
         let previous: HashMap<String, u64> = self.inodes_by_path.clone();
 
@@ -1407,7 +1447,17 @@ impl GitDriveFS {
         // handles stay valid.
         self.incorporate_local_only(&previous);
         // HEAD advanced: paths touched by the pull get the new commit's mtime.
-        self.refresh_derived_times();
+        match self.indexed_head {
+            Some(old) if old != new_head => self.refresh_derived_times_since(old, new_head),
+            Some(_) => self.derived_times.retain(|ino, _| self.files_by_inode.contains_key(ino)),
+            None => self.refresh_derived_times(),
+        }
+        self.indexed_head = Some(new_head);
+        log::info!(
+            "refresh: index rebuilt in {:.1?} ({} files)",
+            t0.elapsed(),
+            self.files_by_inode.len()
+        );
     }
 
     pub fn apply_mkdir(&mut self, parent: u64, name: &str) -> Result<(u64, FileAttr), i32> {
@@ -1943,12 +1993,53 @@ impl GitDriveFS {
         };
         self.derived_times.clear();
         for (path, time) in by_path {
-            let clear = match &self.crypto {
-                Some(c) => c.dec_path(&path),
-                None => path,
-            };
-            if let Some(&ino) = self.inodes_by_path.get(&clear) {
+            if let Some(ino) = self.inode_of_disk_path(&path) {
                 self.derived_times.insert(ino, time);
+            }
+        }
+    }
+
+    /// Clear-view inode of an on-disk (possibly encrypted) path. Goes through
+    /// the name cache, which resolves `dslong_` names via their sidecars — the
+    /// stateless `dec_path` left every long name literal, so in encrypted
+    /// mode most files never got their mtime from history.
+    fn inode_of_disk_path(&self, disk: &str) -> Option<u64> {
+        let clear = match &self.crypto {
+            Some(c) => match self.name_cache.get(disk) {
+                Some(clear) => clear.clone(),
+                None => c.dec_path(disk),
+            },
+            None => disk.to_string(),
+        };
+        self.inodes_by_path.get(&clear).copied()
+    }
+
+    /// Post-pull mtime update: only the paths touched by the commits between
+    /// the previously indexed HEAD and the new one change; everything else
+    /// keeps its time. Falls back to the full walk when the range is unusual
+    /// (old HEAD unreachable, or longer than the walk cap).
+    fn refresh_derived_times_since(&mut self, old: git2::Oid, new: git2::Oid) {
+        let repo = match git::open_repo(&self.repo_path) {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("mtime: error opening repo: {}", e);
+                return;
+            }
+        };
+        match git::commit_times_between(&repo, old, new, Self::MTIME_WALK_DEPTH_CAP) {
+            Ok(Some(changed)) => {
+                let files = &self.files_by_inode;
+                self.derived_times.retain(|ino, _| files.contains_key(ino));
+                for (path, time) in changed {
+                    if let Some(ino) = self.inode_of_disk_path(&path) {
+                        self.derived_times.insert(ino, time);
+                    }
+                }
+            }
+            Ok(None) => self.refresh_derived_times(),
+            Err(e) => {
+                log::warn!("mtime: incremental walk failed ({}), full recompute", e);
+                self.refresh_derived_times();
             }
         }
     }
@@ -2402,7 +2493,7 @@ impl Filesystem for GitDriveFS {
         const XATTR_REPLACE: i32 = 0x2;
 
         let mut xattrs = self.xattrs.lock();
-        let entry = xattrs.entry(ino).or_insert_with(HashMap::new);
+        let entry = xattrs.entry(ino).or_default();
         let exists = entry.contains_key(name);
         if flags & XATTR_CREATE != 0 && exists {
             reply.error(libc::EEXIST);
@@ -2872,42 +2963,37 @@ fn enoattr() -> i32 {
 /// Fixed overhead of a sealed blob: magic (24) + nonce (24) + AEAD tag (16).
 const SEALED_OVERHEAD: u64 = 64;
 
-/// Converts the HEAD listing (encrypted paths) to the clear view. The size of
-/// a regular file whose name decrypted is adjusted to the plaintext size
-/// (conforming blobs are sealed by construction of the drain).
-fn decrypt_listing(
+/// `decrypt_listing` with a disk->clear cache: paths already known reuse
+/// their clear form; only new paths are decoded, reading just the sidecars
+/// they need from the working tree. Returns the listing plus the cache for
+/// exactly the current entries (stale paths drop out).
+fn decrypt_listing_cached(
     crypto: Option<&crate::crypt::Crypto>,
     repo_path: &str,
     dirs: Vec<String>,
     files: Vec<git::ListedFile>,
-) -> (Vec<String>, Vec<git::ListedFile>) {
-    let Some(c) = crypto else { return (dirs, files) };
-
-    // Long-name resolution: read the `<disk>.name` sidecars in this listing to
-    // recover the full encrypted name of each hashed (`dslong_`) component.
-    // Keyed by the component's on-disk path (sidecar path minus `.name`).
-    let mut sidecars: HashMap<String, String> = HashMap::new();
-    for f in &files {
-        if crate::crypt::is_long_sidecar(leaf_name(&f.path)) {
-            let base = &f.path[..f.path.len() - crate::crypt::SIDECAR_SUFFIX.len()];
-            if let Ok(content) =
-                std::fs::read_to_string(std::path::Path::new(repo_path).join(&f.path))
-            {
-                sidecars.insert(base.to_string(), content.trim().to_string());
-            }
-        }
-    }
-
-    let dirs = dirs
-        .into_iter()
-        .map(|d| dec_path_with_sidecars(c, &d, &sidecars))
-        .collect();
+    cache: &HashMap<String, String>,
+) -> (Vec<String>, Vec<git::ListedFile>, HashMap<String, String>) {
+    let Some(c) = crypto else {
+        return (dirs, files, HashMap::new());
+    };
+    let mut new_cache: HashMap<String, String> =
+        HashMap::with_capacity(dirs.len() + files.len());
+    let root = std::path::Path::new(repo_path);
+    let mut decode = |disk: &str| -> String {
+        let clear = match cache.get(disk) {
+            Some(clear) => clear.clone(),
+            None => dec_path_reading_sidecars(c, root, disk),
+        };
+        new_cache.insert(disk.to_string(), clear.clone());
+        clear
+    };
+    let dirs = dirs.into_iter().map(|d| decode(&d)).collect();
     let files = files
         .into_iter()
-        // Sidecars are our own metadata — never shown on the drive.
         .filter(|f| !crate::crypt::is_long_sidecar(leaf_name(&f.path)))
         .map(|mut f| {
-            let clear = dec_path_with_sidecars(c, &f.path, &sidecars);
+            let clear = decode(&f.path);
             let decoded = clear != f.path;
             f.path = clear;
             if decoded && f.kind == git::FileKind::Regular {
@@ -2916,43 +3002,34 @@ fn decrypt_listing(
             f
         })
         .collect();
-    (dirs, files)
+    (dirs, files, new_cache)
 }
 
-/// Decrypts an on-disk path, resolving hashed long-name (`dslong_`) components
-/// through the sidecar map (keyed by on-disk component path). Normal components
-/// fall back to the stateless `dec_path`; unknown long names stay literal.
-fn dec_path_with_sidecars(
+/// Decrypts an on-disk path, reading each hashed long-name component's
+/// sidecar (exact `<leaf>.name`, or the conflict base `dslong_<h>.name`)
+/// from the working tree on demand. Unresolvable components stay literal.
+fn dec_path_reading_sidecars(
     c: &crate::crypt::Crypto,
+    root: &std::path::Path,
     on_disk: &str,
-    sidecars: &HashMap<String, String>,
 ) -> String {
     let mut clear: Vec<String> = Vec::new();
-    let mut accum = String::new();
+    let mut dir = std::path::PathBuf::new();
     for comp in on_disk.split('/') {
-        if !accum.is_empty() {
-            accum.push('/');
-        }
-        accum.push_str(comp);
         if crate::crypt::is_long_name(comp) {
-            // Exact sidecar, or the conflict base (`dslong_<hash>` without the
-            // `.conflict-...` suffix, whose sidecar holds the encrypted name).
-            let content = sidecars.get(&accum).or_else(|| {
-                crate::crypt::long_name_base(comp).and_then(|base| {
-                    let base_path = match accum.rfind('/') {
-                        Some(i) => format!("{}/{}", &accum[..i], base),
-                        None => base.to_string(),
-                    };
-                    sidecars.get(&base_path)
-                })
+            let read = |name: &str| std::fs::read_to_string(root.join(&dir).join(name)).ok();
+            let content = read(&crate::crypt::sidecar_name(comp)).or_else(|| {
+                crate::crypt::long_name_base(comp)
+                    .and_then(|base| read(&crate::crypt::sidecar_name(base)))
             });
-            match content.and_then(|ct| c.dec_long(comp, ct)) {
+            match content.and_then(|ct| c.dec_long(comp, ct.trim())) {
                 Some(cl) => clear.push(cl),
                 None => clear.push(comp.to_string()),
             }
         } else {
             clear.push(c.dec_path(comp));
         }
+        dir.push(comp);
     }
     clear.join("/")
 }
@@ -2980,7 +3057,7 @@ mod tests {
 
     #[test]
     fn decrypt_listing_resolves_long_name_and_hides_sidecar() {
-        use super::{decrypt_listing, git};
+        use super::{decrypt_listing_cached, git};
         use crate::crypt::Crypto;
 
         let dir = tempfile::tempdir().unwrap();
@@ -3010,7 +3087,7 @@ mod tests {
                 kind: git::FileKind::Regular,
             },
         ];
-        let (dirs, files) = decrypt_listing(Some(&c), repo, vec![], files);
+        let (dirs, files, _) = decrypt_listing_cached(Some(&c), repo, vec![], files, &std::collections::HashMap::new());
         assert!(dirs.is_empty());
         // The sidecar is hidden and the long name resolves to its cleartext.
         assert_eq!(files.len(), 1, "sidecar must be hidden from the listing");

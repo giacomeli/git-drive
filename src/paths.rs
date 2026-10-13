@@ -24,9 +24,46 @@ pub(crate) fn app_support_dir_from(home: &Path) -> PathBuf {
     home.join("Library/Application Support/git-drive")
 }
 
-/// `~/Library/Logs/git-drive` (logs when running via launchd).
+/// Standard log directory of the installed daemon: `~/Library/Logs/git-drive`
+/// on macOS, `<state dir>/logs` on Linux.
 pub fn standard_log_dir() -> PathBuf {
-    standard_log_dir_from(&home_dir())
+    #[cfg(target_os = "macos")]
+    {
+        standard_log_dir_from(&home_dir())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        state_dir().join("logs")
+    }
+}
+
+/// Where the installed daemon keeps its state (status.json): Application
+/// Support on macOS, `$XDG_STATE_HOME/git-drive` (default
+/// `~/.local/state/git-drive`) on Linux.
+pub fn state_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        app_support_dir()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        xdg_state_dir_from(&home_dir(), std::env::var_os("XDG_STATE_HOME").map(PathBuf::from))
+    }
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn xdg_state_dir_from(home: &Path, xdg_state_home: Option<PathBuf>) -> PathBuf {
+    xdg_state_home
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(".local/state"))
+        .join("git-drive")
+}
+
+/// Stable install location of the binary referenced by the login service.
+/// The service must not point into a build tree: moving or renaming the
+/// project directory broke the Mac LaunchAgent (exit 78, 2026-10).
+pub fn installed_binary_path() -> PathBuf {
+    home_dir().join(".local/bin/git-drive")
 }
 
 pub(crate) fn standard_log_dir_from(home: &Path) -> PathBuf {
@@ -131,11 +168,11 @@ fn resolve_key_for_read_from(explicit: Option<&str>, candidates: &[PathBuf]) -> 
 }
 
 pub fn standard_status_path() -> PathBuf {
-    app_support_dir().join("status.json")
+    state_dir().join("status.json")
 }
 
 /// Status path for READING (`status` subcommand and tray):
-/// explicit flag > `./logs/status.json` (dev flow) > macOS standard.
+/// explicit flag > `./logs/status.json` (dev flow) > platform standard.
 pub fn resolve_status_for_read(flag: Option<&str>) -> PathBuf {
     resolve_status_for_read_from(flag, Path::new("logs/status.json"), &standard_status_path())
 }
@@ -169,6 +206,24 @@ mod tests {
         assert_eq!(
             config_dir_from(home),
             PathBuf::from("/Users/test/.config/git-drive")
+        );
+    }
+
+    #[test]
+    fn xdg_state_dir_honors_absolute_env_only() {
+        let home = Path::new("/home/test");
+        assert_eq!(
+            xdg_state_dir_from(home, None),
+            PathBuf::from("/home/test/.local/state/git-drive")
+        );
+        assert_eq!(
+            xdg_state_dir_from(home, Some(PathBuf::from("/var/state"))),
+            PathBuf::from("/var/state/git-drive")
+        );
+        // The spec says relative values are invalid and must be ignored.
+        assert_eq!(
+            xdg_state_dir_from(home, Some(PathBuf::from("rel"))),
+            PathBuf::from("/home/test/.local/state/git-drive")
         );
     }
 

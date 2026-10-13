@@ -117,6 +117,12 @@ struct Inner {
     /// HashMap + sort-by-op-type combination produced.
     buffer: Vec<SyncOp>,
     last_op: Option<Instant>,
+    /// Write-ahead journal of the queue (crash durability); `None` = off.
+    journal: Option<Arc<crate::journal::Journal>>,
+    /// Seq of the next journal record. Assigned under this lock together with
+    /// the push into `buffer`, so a drain's boundary (`next_seq - 1` at take
+    /// time) covers exactly the ops it took.
+    next_seq: u64,
 }
 
 impl SyncManager {
@@ -171,6 +177,7 @@ impl SyncManager {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_full_with_pull(
         repo_path: &str,
         branch: String,
@@ -187,6 +194,8 @@ impl SyncManager {
             inner: Arc::new(Mutex::new(Inner {
                 buffer: Vec::new(),
                 last_op: None,
+                journal: None,
+                next_seq: 1,
             })),
             notify: Arc::new(Notify::new()),
             debounce_secs,
@@ -292,15 +301,59 @@ impl SyncManager {
     /// `repo_lock`). Used during clean shutdown: after the unmount, it
     /// guarantees no queued op is lost when the process dies.
     pub fn drain_now(&self) {
-        let changes = { std::mem::take(&mut self.inner.lock().buffer) };
+        let (changes, boundary) = take_queue(&self.inner);
         if changes.is_empty() {
             return;
         }
-        log::info!(
-            "drain_now: draining {} pending op(s) at shutdown",
-            changes.len()
-        );
-        self.drain_ctx().run(changes);
+        log::info!("drain_now: draining {} pending op(s)", changes.len());
+        self.drain_ctx().run(changes, boundary);
+    }
+
+    /// Enables the write-ahead journal in `dir` and replays the records a
+    /// previous session left behind (it crashed before committing them) into
+    /// the queue, in their original order. Returns how many were replayed.
+    pub fn enable_journal(&self, dir: &Path) -> std::io::Result<usize> {
+        let (journal, records) = crate::journal::Journal::open(dir)?;
+        let replayed = records.len();
+        let max_seq = records.last().map(|r| r.0).unwrap_or(0);
+        {
+            let mut inner = self.inner.lock();
+            for (_, op) in records {
+                push_coalescing(&mut inner.buffer, op);
+            }
+            inner.next_seq = inner.next_seq.max(max_seq + 1);
+            inner.journal = Some(Arc::new(journal));
+            if replayed > 0 {
+                inner.last_op = Some(Instant::now());
+            }
+        }
+        if replayed > 0 {
+            log::warn!(
+                "journal: {} op(s) from an interrupted session replayed into the queue",
+                replayed
+            );
+            self.notify.notify_one();
+        }
+        Ok(replayed)
+    }
+
+    /// Boot recovery, run BEFORE the mount: drains replayed journal ops right
+    /// away (the drive then boots on a HEAD that already contains them — no
+    /// window where the user sees and edits the stale version), and commits a
+    /// working tree left dirty by a crash between apply and commit.
+    pub fn recover_at_boot(&self) {
+        if self.has_pending_ops() {
+            self.drain_now();
+            return;
+        }
+        let dirty = git::open_repo(self.repo_path.to_str().unwrap_or(""))
+            .and_then(|r| git::is_working_tree_clean(&r))
+            .map(|clean| !clean)
+            .unwrap_or(false);
+        if dirty {
+            log::warn!("boot: working tree has uncommitted changes — committing them");
+            self.drain_ctx().run(Vec::new(), None);
+        }
     }
 
     /// Access to the observable state (snapshot for tests/embedded CLI).
@@ -330,10 +383,17 @@ impl SyncManager {
         let repo_lock = self.repo_lock.clone();
         let status = self.status.clone();
         let notifier = self.notifier.clone();
+        let crypto = self.crypto.clone();
 
         task::spawn(async move {
+            // The first pull runs right after boot (not one full interval
+            // later): a machine waking up or relaunching catches up with the
+            // remote — and publishes commits a previous session left unpushed
+            // — within seconds.
+            let mut delay = interval_secs.min(3);
             loop {
-                sleep(Duration::from_secs(interval_secs)).await;
+                sleep(Duration::from_secs(delay)).await;
+                delay = interval_secs;
 
                 // Skip the pull while a batch is pending (avoids racing the local commit)
                 let pending = { !inner.lock().buffer.is_empty() };
@@ -428,10 +488,9 @@ impl SyncManager {
                             resolved
                         );
                         status.record_pull(&format!("merge with {} conflict(s)", resolved.len()));
-                        let copies: Vec<String> = resolved
-                            .iter()
-                            .map(|p| format!("{}.{}", p, suffix))
-                            .collect();
+                        let c = crypto.lock().clone();
+                        let copies =
+                            conflict_copies_for_display(&repo_path, c.as_deref(), &resolved, &suffix);
                         status.add_conflicts(copies.clone());
                         notifier.notify(NotifyEvent::Conflicts { copies });
                         refresh_flag.store(true, Ordering::SeqCst);
@@ -439,6 +498,29 @@ impl SyncManager {
                     Err(e) => {
                         log::error!("pull: merge error: {}", e);
                         status.record_pull("merge error");
+                        continue;
+                    }
+                }
+
+                // Local commits the remote does not have yet — a push that
+                // failed while offline, a previous session that died before
+                // publishing, or the merge commit just created above — are
+                // published HERE. Leaving them to the next drain meant a
+                // machine that went quiet after an offline write never synced.
+                if local_ahead_of_remote(&repo, &branch, remote) {
+                    drop(repo);
+                    let ok = publish_progressive(
+                        &repo_path,
+                        &branch,
+                        remote,
+                        &remote_token,
+                        &status,
+                    )
+                    .ok();
+                    if ok {
+                        notifier.reset(notify::KEY_PUSH_FAILED);
+                    } else {
+                        notifier.notify(NotifyEvent::PushFailed);
                     }
                 }
             }
@@ -494,8 +576,25 @@ impl SyncManager {
         if op_touches_ephemeral(&op) {
             return;
         }
+        // Journal first (content bytes written OUTSIDE the queue lock), then
+        // seq + push under the lock — see `journal.rs`.
+        let journal = self.inner.lock().journal.clone();
+        let prepared = journal.as_ref().and_then(|j| match j.prepare(&op) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                log::error!("journal: could not persist op on {}: {}", op.primary_path(), e);
+                None
+            }
+        });
         {
             let mut inner = self.inner.lock();
+            if let (Some(j), Some(p)) = (journal.as_ref(), prepared) {
+                let seq = inner.next_seq;
+                inner.next_seq += 1;
+                if let Err(e) = j.commit(p, seq) {
+                    log::error!("journal: could not commit record {}: {}", seq, e);
+                }
+            }
             push_coalescing(&mut inner.buffer, op);
             inner.last_op = Some(Instant::now());
         }
@@ -524,23 +623,21 @@ impl SyncManager {
                 loop {
                     sleep(Duration::from_secs(debounce_secs)).await;
 
-                    let drained = {
-                        let mut inner = ctx.inner.lock();
-                        let should_drain = inner
+                    let should_drain = {
+                        let inner = ctx.inner.lock();
+                        inner
                             .last_op
                             .map(|l| l.elapsed() >= Duration::from_secs(debounce_secs))
                             .unwrap_or(false)
-                            && !inner.buffer.is_empty();
-                        if !should_drain {
-                            None
-                        } else {
-                            Some(std::mem::take(&mut inner.buffer))
-                        }
+                            && !inner.buffer.is_empty()
                     };
 
-                    if let Some(changes) = drained {
-                        log::info!("drain: syncing changes");
-                        ctx.run(changes);
+                    if should_drain {
+                        let (changes, boundary) = take_queue(&ctx.inner);
+                        if !changes.is_empty() {
+                            log::info!("drain: syncing changes");
+                            ctx.run(changes, boundary);
+                        }
                         break;
                     }
                 }
@@ -571,8 +668,17 @@ struct DrainCtx {
     migration_crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
 }
 
+/// Takes the whole queue plus its journal boundary (the last seq the taken
+/// ops cover; `None` without a journal).
+fn take_queue(inner: &Mutex<Inner>) -> (Vec<SyncOp>, Option<u64>) {
+    let mut inner = inner.lock();
+    let changes = std::mem::take(&mut inner.buffer);
+    let boundary = inner.journal.as_ref().map(|_| inner.next_seq - 1);
+    (changes, boundary)
+}
+
 impl DrainCtx {
-    fn run(&self, changes: Vec<SyncOp>) {
+    fn run(&self, changes: Vec<SyncOp>, journal_boundary: Option<u64>) {
         // Serialize the whole cycle (apply + commit + push + reconcile) with
         // the pull watcher (RF4 of Phase 0). No .await in the guard's scope.
         let _repo_guard = self.repo_lock.lock();
@@ -700,6 +806,17 @@ impl DrainCtx {
             drop(batch); // free this batch's content before the next one
         }
 
+        // Every taken op is now applied and committed (or applied without a
+        // commit in identity-less mode — the working tree holds it): its
+        // journal records are no longer needed. Still under the repo lock, so
+        // no pull can land between the commit and this cleanup.
+        if let Some(boundary) = journal_boundary {
+            let journal = self.inner.lock().journal.clone();
+            if let Some(j) = journal {
+                j.truncate_through(boundary);
+            }
+        }
+
         // Phase B (publish): push commit by commit — every pack stays around
         // one batch. A mid-catch-up failure leaves the remote on an
         // intermediate commit; the next cycle resumes from there.
@@ -712,9 +829,11 @@ impl DrainCtx {
                     remote,
                     &self.remote_token,
                     &self.status,
-                );
+                )
+                .ok();
                 if ok {
                     pushed = Some(true);
+                    self.notifier.reset(notify::KEY_PUSH_FAILED);
                 } else {
                     let recovered = reconcile_and_retry_push(
                         &self.repo_path,
@@ -725,10 +844,12 @@ impl DrainCtx {
                         &self.user_email,
                         &self.status,
                         &self.notifier,
+                        crypto.as_deref(),
                     );
                     pushed = Some(recovered);
                     if recovered {
                         self.refresh_flag.store(true, Ordering::SeqCst);
+                        self.notifier.reset(notify::KEY_PUSH_FAILED);
                     } else {
                         // Push + reconcile failed: local commits left unpublished.
                         self.notifier.notify(NotifyEvent::PushFailed);
@@ -783,21 +904,51 @@ pub(crate) fn split_batches(changes: Vec<SyncOp>, limit: u64) -> Vec<Vec<SyncOp>
     batches
 }
 
+/// True when the local branch has commits that `refs/remotes/<remote>/<branch>`
+/// lacks AND the remote tip is an ancestor (a plain catch-up push is possible).
+/// A missing remote-tracking ref (empty remote) counts as ahead.
+fn local_ahead_of_remote(repo: &git2::Repository, branch: &str, remote: &str) -> bool {
+    let Ok(local) = repo.refname_to_id(&format!("refs/heads/{}", branch)) else {
+        return false;
+    };
+    match repo.refname_to_id(&format!("refs/remotes/{}/{}", remote, branch)) {
+        Ok(tip) => tip != local && repo.graph_descendant_of(local, tip).unwrap_or(false),
+        Err(_) => true,
+    }
+}
+
 /// Publishes every commit missing on the remote, one push per commit (bounded
 /// packs). Progress heartbeats go to the status (tray stays alive during long
 /// uploads). Returns `true` when the remote reached the local tip.
+/// Outcome of `publish_progressive`.
+#[derive(Debug, PartialEq, Eq)]
+enum Publish {
+    /// The remote reached the local tip.
+    Done,
+    /// Another client pushed first (fast-forward impossible): reconcile.
+    RemoteMoved,
+    /// Network/auth/server failure.
+    Failed,
+}
+
+impl Publish {
+    fn ok(&self) -> bool {
+        *self == Publish::Done
+    }
+}
+
 fn publish_progressive(
     repo_path: &Path,
     branch: &str,
     remote: &str,
     token: &Option<String>,
     status: &StatusState,
-) -> bool {
+) -> Publish {
     let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
         Ok(r) => r,
         Err(e) => {
             log::error!("push: error opening repo: {}", e);
-            return false;
+            return Publish::Failed;
         }
     };
     // Throttled transfer heartbeat: a single pack can take minutes on a slow
@@ -821,18 +972,37 @@ fn publish_progressive(
         Ok(0) => {
             log::info!("push: {} up to date", remote);
             status.set_unpushed(0);
-            true
+            Publish::Done
         }
         Ok(n) => {
             log::info!("push: {} ok ({} commit(s) published)", remote, n);
             status.set_unpushed(0);
-            true
+            Publish::Done
         }
         Err(e) => {
-            log::error!("push: error on {}: {}", remote, e);
-            false
+            if is_remote_moved(e.message()) {
+                // Another client pushed first: the expected concurrent case,
+                // resolved by the reconcile (fetch + merge + push) right after.
+                log::warn!("push: {} moved (another client pushed) — reconciling", remote);
+                Publish::RemoteMoved
+            } else {
+                log::error!("push: error on {}: {}", remote, e);
+                Publish::Failed
+            }
         }
     }
+}
+
+/// True when a push failed only because the remote branch advanced (a
+/// fast-forward is no longer possible) — not a network/auth/server error.
+fn is_remote_moved(msg: &str) -> bool {
+    msg.contains("not an ancestor")
+        || msg.contains("non-fast-forward")
+        || msg.contains("fetch first")
+        || msg.contains("NotFastForward")
+        || msg.contains("cannot push non-fastforwardable")
+        // A concurrent push landing on the remote ref at the same instant.
+        || msg.contains("cannot lock ref")
 }
 
 /// Translates a CLEARTEXT path from the queue into the on-disk path
@@ -893,8 +1063,22 @@ fn canonicalize_disk_path(
             // Valid encrypted component: re-encode from its cleartext —
             // identity for conforming names, dslong for over-threshold ones.
             Some(clear) => c.enc_component(&clear),
-            // Cleartext (or mixed/conflicted) component.
-            None => c.enc_component_keep_conflict(comp),
+            None => match c.dec_conflicted(comp) {
+                // Conflicted copy a merge made of an ENCRYPTED name
+                // (`<encrypted>.conflict-...`): re-encode the clear base and
+                // keep the suffix. Treating the encrypted base as cleartext
+                // encrypted it a second time — the copy then showed up on the
+                // drive under the base32 name of the original (2026-10-13).
+                Some((clear, suffix)) => {
+                    let e = c.enc_component(&clear);
+                    crate::crypt::EncName {
+                        disk: format!("{}{}", e.disk, suffix),
+                        sidecar: e.sidecar,
+                    }
+                }
+                // Cleartext (or cleartext conflicted) component.
+                None => c.enc_component_keep_conflict(comp),
+            },
         };
         if let Some(content) = e.sidecar {
             let dir = parts.join("/");
@@ -1164,9 +1348,12 @@ fn commit_batch(
     }
 }
 
-/// The push failed (usually non-FF). Does fetch + pull_and_merge + a single push
-/// retry. Returns `true` if the retry succeeded (implies the working tree changed
-/// and the caller must signal a refresh to the FUSE layer).
+/// The push failed (usually non-FF). Does fetch + pull_and_merge + push, up
+/// to `RECONCILE_ROUNDS` times: with several clients writing at once, the
+/// remote can move AGAIN between this merge and the retry (a third client's
+/// push) — that is a race to re-run, not a failure to report. Returns `true`
+/// if a retry succeeded (the working tree changed — the caller signals a
+/// refresh to the FUSE layer).
 #[allow(clippy::too_many_arguments)]
 fn reconcile_and_retry_push(
     repo_path: &Path,
@@ -1177,68 +1364,128 @@ fn reconcile_and_retry_push(
     user_email: &Option<String>,
     status: &StatusState,
     notifier: &Notifier,
+    crypto: Option<&crate::crypt::Crypto>,
 ) -> bool {
+    const RECONCILE_ROUNDS: usize = 3;
     let (Some(name), Some(email)) = (user_name.as_deref(), user_email.as_deref()) else {
         log::error!(
             "reconcile: push failed and no identity configured — cannot reconcile"
         );
         return false;
     };
-    let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
-        Ok(r) => r,
-        Err(e) => {
-            log::error!("reconcile: error opening repo: {}", e);
+    for round in 1..=RECONCILE_ROUNDS {
+        let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("reconcile: error opening repo: {}", e);
+                return false;
+            }
+        };
+
+        if let Err(e) = git::fetch_remote(&repo, branch, remote, token.as_deref()) {
+            log::error!("reconcile: fetch error: {}", e);
             return false;
         }
-    };
 
-    if let Err(e) = git::fetch_remote(&repo, branch, remote, token.as_deref()) {
-        log::error!("reconcile: fetch error: {}", e);
-        return false;
-    }
+        let suffix = conflict_suffix();
+        match git::pull_and_merge(&repo, branch, remote, name, email, &suffix) {
+            Ok(git::MergeOutcome::NoOp) if round == 1 => {
+                log::error!(
+                    "reconcile: no divergence — the original error may be network/auth"
+                );
+                return false;
+            }
+            Ok(git::MergeOutcome::NoOp) => {}
+            Ok(git::MergeOutcome::Conflicted { ref resolved, ref suffix }) => {
+                log::warn!(
+                    "reconcile: {} conflict(s) — local versions at *.{}: {:?}",
+                    resolved.len(),
+                    suffix,
+                    resolved
+                );
+                let copies = conflict_copies_for_display(repo_path, crypto, resolved, suffix);
+                status.add_conflicts(copies.clone());
+                notifier.notify(NotifyEvent::Conflicts { copies });
+            }
+            Ok(o) => {
+                log::info!("reconcile: applied ({:?})", o);
+            }
+            Err(e) => {
+                log::error!("reconcile: pull_and_merge error: {}", e);
+                return false;
+            }
+        }
 
-    let suffix = conflict_suffix();
-    match git::pull_and_merge(&repo, branch, remote, name, email, &suffix) {
-        Ok(git::MergeOutcome::NoOp) => {
-            log::error!(
-                "reconcile: no divergence — the original error may be network/auth"
-            );
-            return false;
-        }
-        Ok(git::MergeOutcome::Conflicted { ref resolved, ref suffix }) => {
-            log::warn!(
-                "reconcile: {} conflict(s) — local versions at *.{}: {:?}",
-                resolved.len(),
-                suffix,
-                resolved
-            );
-            let copies: Vec<String> = resolved
-                .iter()
-                .map(|p| format!("{}.{}", p, suffix))
-                .collect();
-            status.add_conflicts(copies.clone());
-            notifier.notify(NotifyEvent::Conflicts { copies });
-        }
-        Ok(o) => {
-            log::info!("reconcile: applied ({:?})", o);
-        }
-        Err(e) => {
-            log::error!("reconcile: pull_and_merge error: {}", e);
-            return false;
+        // The retry is progressive too: after a merge, the missing history can
+        // span many batch commits — pushing the tip here would rebuild the very
+        // giant pack that failed in the first place.
+        drop(repo);
+        match publish_progressive(repo_path, branch, remote, token, status) {
+            Publish::Done => {
+                log::info!("push: retry on {} ok", remote);
+                return true;
+            }
+            Publish::RemoteMoved if round < RECONCILE_ROUNDS => {
+                log::info!("reconcile: remote moved again — round {}", round + 1);
+            }
+            _ => {
+                log::error!("push: retry failed again");
+                return false;
+            }
         }
     }
+    false
+}
 
-    // The retry is progressive too: after a merge, the missing history can
-    // span many batch commits — pushing the tip here would rebuild the very
-    // giant pack that failed in the first place.
-    drop(repo);
-    if publish_progressive(repo_path, branch, remote, token, status) {
-        log::info!("push: retry on {} ok", remote);
-        true
-    } else {
-        log::error!("push: retry failed again");
-        false
+/// Conflicted-copy paths as the user sees them on the drive. The merge works
+/// on ON-DISK paths, which in encrypted mode are base32/`dslong_` names —
+/// meaningless in the status, the tray and the notification.
+fn conflict_copies_for_display(
+    repo_path: &Path,
+    crypto: Option<&crate::crypt::Crypto>,
+    resolved: &[String],
+    suffix: &str,
+) -> Vec<String> {
+    resolved
+        .iter()
+        .map(|p| {
+            let disk = format!("{}.{}", p, suffix);
+            match crypto {
+                Some(c) => clear_path_from_disk(repo_path, c, &disk),
+                None => disk,
+            }
+        })
+        .collect()
+}
+
+/// Decrypts an on-disk path component by component, resolving hashed
+/// long names through their sidecar files in the working tree (exact
+/// `<leaf>.name`, or the conflict base `dslong_<h>.name`). Unresolvable
+/// components stay literal.
+fn clear_path_from_disk(repo_path: &Path, c: &crate::crypt::Crypto, disk: &str) -> String {
+    let mut dir = PathBuf::new();
+    let mut clear: Vec<String> = Vec::new();
+    for comp in disk.split('/') {
+        let name = if crate::crypt::is_long_name(comp) {
+            let exact = repo_path.join(&dir).join(crate::crypt::sidecar_name(comp));
+            let content = std::fs::read_to_string(&exact).ok().or_else(|| {
+                crate::crypt::long_name_base(comp).and_then(|base| {
+                    std::fs::read_to_string(
+                        repo_path.join(&dir).join(crate::crypt::sidecar_name(base)),
+                    )
+                    .ok()
+                })
+            });
+            content
+                .and_then(|ct| c.dec_long(comp, ct.trim()))
+                .unwrap_or_else(|| comp.to_string())
+        } else {
+            c.dec_path(comp)
+        };
+        clear.push(name);
+        dir.push(comp);
     }
+    clear.join("/")
 }
 
 /// Generates a unique suffix for conflicted copies. Format: `conflict-<hostname>-<unix_ts>`.
@@ -1271,6 +1518,10 @@ fn gethostname_or(fallback: &str) -> String {
 
 fn build_commit_message(ops: &[&SyncOp], redact_paths: bool) -> String {
     let n = ops.len();
+    if n == 0 {
+        // Boot recovery of a dirty working tree (no queued op behind it).
+        return "git-drive: recover uncommitted changes".to_string();
+    }
     // Encrypted repo: the queue paths are CLEARTEXT — echoing them into the
     // commit message would leak every file name into the (unencrypted) git
     // history, defeating the name encryption. Count only.
@@ -1386,7 +1637,7 @@ fn file_starts_with_encrypted_magic(path: &Path) -> bool {
 /// working tree to the encrypted state (name AND content). Idempotent — a
 /// file already conforming is skipped. Returns how many items were converted.
 fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> usize {
-    let mut converted = 0usize;
+    let mut converted = repair_double_encrypted_conflicts(repo_path, c);
     for (full, rel) in walk_worktree_files(repo_path) {
         let leaf = rel.rsplit('/').next().unwrap_or(&rel);
         // Long-name sidecars are our own metadata, never user files.
@@ -1399,9 +1650,14 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
         // 81..255, valid base32) must be re-written as dslong, or deep paths
         // keep breaking macOS's PATH_MAX on the replica (2026-07-10 incident).
         let comp_ok = |comp: &str| {
+            let base = match c.dec_conflicted(comp) {
+                // A conflicted copy conforms when its encrypted base does.
+                Some((_, suffix)) => &comp[..comp.len() - suffix.len()],
+                None => comp,
+            };
             crate::crypt::is_long_name(comp)
-                || (comp.len() <= crate::crypt::LONG_NAME_THRESHOLD
-                    && c.dec_component(comp).is_some())
+                || (base.len() <= crate::crypt::LONG_NAME_THRESHOLD
+                    && c.dec_component(base).is_some())
         };
         let name_ok = rel.split('/').all(comp_ok);
         if meta.file_type().is_symlink() {
@@ -1528,6 +1784,54 @@ fn migrate_worktree_to_encrypted(repo_path: &Path, c: &crate::crypt::Crypto) -> 
     }
     prune_empty_dirs(repo_path);
     converted
+}
+
+/// Repairs conflicted copies whose name was encrypted TWICE by the old
+/// migration sweep: `<encrypted>.conflict-S` was treated as cleartext and
+/// became `dslong_<h>.conflict-S` with a sidecar holding enc(`<encrypted>`),
+/// so the drive showed the base32 name of the original. Detected by the
+/// sidecar decoding to a name that is itself a valid encrypted component;
+/// renamed to the canonical form of `<clear>.conflict-S`. Idempotent.
+fn repair_double_encrypted_conflicts(repo_path: &Path, c: &crate::crypt::Crypto) -> usize {
+    let mut repaired = 0usize;
+    for (full, rel) in walk_worktree_files(repo_path) {
+        let (dir, leaf) = match rel.rsplit_once('/') {
+            Some((d, l)) => (Some(d), l),
+            None => (None, rel.as_str()),
+        };
+        if !crate::crypt::is_long_name(leaf) {
+            continue;
+        }
+        let Some((_, suffix)) = crate::crypt::split_conflict(leaf) else {
+            continue;
+        };
+        let join = |name: &str| match dir {
+            Some(d) => repo_path.join(d).join(name),
+            None => repo_path.join(name),
+        };
+        let exact_sidecar = join(&crate::crypt::sidecar_name(leaf));
+        let Ok(content) = std::fs::read_to_string(&exact_sidecar) else {
+            continue;
+        };
+        let Some(inner) = c.dec_component(content.trim()) else {
+            continue;
+        };
+        // Double encryption: the "cleartext" is itself an encrypted name.
+        let Some(real_base) = c.dec_component(&inner) else {
+            continue;
+        };
+        let canonical = c.enc_component_keep_conflict(&format!("{}{}", real_base, suffix));
+        let new_full = join(&canonical.disk);
+        if let Some(sc) = &canonical.sidecar {
+            let _ = std::fs::write(join(&crate::crypt::sidecar_name(&canonical.disk)), sc);
+        }
+        if new_full != full && std::fs::rename(&full, &new_full).is_ok() {
+            let _ = std::fs::remove_file(&exact_sidecar);
+            log::info!("crypto: repaired double-encrypted conflicted copy {}", rel);
+            repaired += 1;
+        }
+    }
+    repaired
 }
 
 /// `encrypted -> cleartext` migration: decrypts names and content; sealed
@@ -2342,6 +2646,57 @@ mod tests {
 
         // Idempotent: second pass converts nothing.
         assert_eq!(migrate_worktree_to_encrypted(repo, &c), 0);
+    }
+
+    #[test]
+    fn migration_leaves_conflicted_copy_of_encrypted_name_alone() {
+        // A merge appends `.conflict-...` to the ENCRYPTED name on disk. The
+        // sweep must treat that as conforming — it used to encrypt the base32
+        // name a second time (2026-10-13 sandbox run).
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let c = crate::crypt::Crypto::from_master_key(&[9u8; 32]);
+        let short = c.enc_component("shared.txt").disk; // exactly 80 chars
+        assert!(short.len() <= crate::crypt::LONG_NAME_THRESHOLD);
+        let copy = format!("{}.conflict-host-1791868058", short);
+        std::fs::write(repo.join(&copy), c.seal(b"local version")).unwrap();
+
+        assert_eq!(migrate_worktree_to_encrypted(repo, &c), 0);
+        assert!(repo.join(&copy).exists(), "conflicted copy untouched");
+        assert_eq!(
+            c.dec_path(&copy),
+            "shared.txt.conflict-host-1791868058",
+            "still decodes to the clear name"
+        );
+    }
+
+    #[test]
+    fn migration_repairs_double_encrypted_conflicted_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let c = crate::crypt::Crypto::from_master_key(&[9u8; 32]);
+        let suffix = ".conflict-host-1791868058";
+        // Reproduce the damage: the encrypted base treated as cleartext.
+        let enc_base = c.enc_component("shared.txt").disk;
+        let bad = c.enc_component(&enc_base);
+        assert!(bad.disk.starts_with(crate::crypt::LONG_NAME_PREFIX));
+        let bad_leaf = format!("{}{}", bad.disk, suffix);
+        std::fs::write(repo.join(&bad_leaf), c.seal(b"local version")).unwrap();
+        std::fs::write(
+            repo.join(crate::crypt::sidecar_name(&bad_leaf)),
+            bad.sidecar.clone().unwrap(),
+        )
+        .unwrap();
+
+        migrate_worktree_to_encrypted(repo, &c);
+
+        let good = format!("{}{}", enc_base, suffix);
+        assert!(repo.join(&good).exists(), "renamed to the canonical conflicted copy");
+        assert!(!repo.join(&bad_leaf).exists());
+        assert!(!repo.join(crate::crypt::sidecar_name(&bad_leaf)).exists());
+        assert_eq!(c.dec_path(&good), format!("shared.txt{}", suffix));
+        assert_eq!(c.open(&std::fs::read(repo.join(&good)).unwrap()).unwrap(), b"local version");
+        assert_eq!(migrate_worktree_to_encrypted(repo, &c), 0, "idempotent");
     }
 
     #[test]

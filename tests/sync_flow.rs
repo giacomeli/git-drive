@@ -1410,3 +1410,105 @@ async fn enable_migration_encrypts_preexisting_symlinks() {
     let target = std::fs::read_link(test.dir.path().join(&cipher_link)).unwrap();
     assert_eq!(crypto.dec_path(&target.to_string_lossy()), "real.txt");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn pull_watcher_publishes_commits_left_unpushed() {
+    // A commit that never reached the remote (push failed while offline, or
+    // the previous session died before publishing) must be published by the
+    // pull cycle itself — not only by the next local write.
+    let test = init_repo();
+    let bare = init_bare_remote();
+    let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+    test.repo.remote("origin", &bare_url).unwrap();
+    commit_file(&test.repo, "base.txt", b"base", "base");
+    git_drive::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
+    commit_file(&test.repo, "offline.txt", b"written offline", "offline write");
+    let local_tip = test.repo.head().unwrap().peel_to_commit().unwrap().id();
+
+    let _sync = SyncManager::new_full_with_pull(
+        test.dir.path().to_str().unwrap(),
+        "main".to_string(),
+        1,
+        Some("Alice".to_string()),
+        Some("a@x.com".to_string()),
+        Some("origin".to_string()),
+        None,
+        1,
+    );
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+
+    let bare_repo = Repository::open(bare.path()).unwrap();
+    let remote_tip = bare_repo
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    assert_eq!(remote_tip, local_tip, "the pull cycle published the pending commit");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn journal_replays_ops_of_a_crashed_session_at_boot() {
+    // Session 1 acknowledges writes and "crashes" before the debounce drain
+    // (huge debounce = the drain never runs). Session 2 must replay and
+    // commit them before mounting.
+    let test = init_repo();
+    let repo_path = test.dir.path().to_str().unwrap().to_string();
+    let journal_dir = test.dir.path().join(".git/git-drive-journal");
+
+    let s1 = SyncManager::new_with_identity(
+        &repo_path,
+        "main".to_string(),
+        3600,
+        Some("Alice".to_string()),
+        Some("a@x.com".to_string()),
+    );
+    assert_eq!(s1.enable_journal(&journal_dir).unwrap(), 0);
+    s1.queue_write("notes/a.txt", b"saved right before the crash".to_vec());
+    s1.queue_write("b.txt", b"to be renamed".to_vec());
+    s1.queue_rename("b.txt", "c.txt");
+    assert!(!file_exists(test.dir.path(), "notes/a.txt"), "nothing applied yet");
+
+    let s2 = SyncManager::new_with_identity(
+        &repo_path,
+        "main".to_string(),
+        3600,
+        Some("Alice".to_string()),
+        Some("a@x.com".to_string()),
+    );
+    assert_eq!(s2.enable_journal(&journal_dir).unwrap(), 3);
+    s2.recover_at_boot();
+
+    assert_eq!(read_file(test.dir.path(), "notes/a.txt"), b"saved right before the crash");
+    assert_eq!(read_file(test.dir.path(), "c.txt"), b"to be renamed");
+    assert!(!file_exists(test.dir.path(), "b.txt"), "causal order preserved by the replay");
+    let head = test.repo.head().unwrap().peel_to_commit().unwrap();
+    let tree = head.tree().unwrap();
+    assert!(tree.get_path(std::path::Path::new("notes/a.txt")).is_ok(), "committed");
+    let left = std::fs::read_dir(&journal_dir).unwrap().count();
+    assert_eq!(left, 0, "journal truncated after the commit");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn journal_is_truncated_by_the_regular_drain() {
+    let test = init_repo();
+    let journal_dir = test.dir.path().join(".git/git-drive-journal");
+    let sync = mgr(test.dir.path().to_str().unwrap(), "main", Some(("Alice", "a@x.com")));
+    sync.enable_journal(&journal_dir).unwrap();
+    sync.queue_write("a.txt", b"x".to_vec());
+    assert!(std::fs::read_dir(&journal_dir).unwrap().count() > 0, "journaled on enqueue");
+    wait_flush().await;
+    assert_eq!(read_file(test.dir.path(), "a.txt"), b"x");
+    assert_eq!(std::fs::read_dir(&journal_dir).unwrap().count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn boot_recovery_commits_a_dirty_working_tree() {
+    let test = init_repo();
+    std::fs::write(test.dir.path().join("left-dirty.txt"), b"applied, never committed").unwrap();
+    let sync = mgr(test.dir.path().to_str().unwrap(), "main", Some(("Alice", "a@x.com")));
+    sync.recover_at_boot();
+    let head = test.repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.message().unwrap(), "git-drive: recover uncommitted changes");
+    assert!(head.tree().unwrap().get_path(std::path::Path::new("left-dirty.txt")).is_ok());
+}

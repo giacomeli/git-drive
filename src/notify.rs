@@ -13,6 +13,7 @@ use crate::status::now_unix;
 const RATE_LIMIT_SECS: u64 = 3600;
 
 pub const KEY_PULL_BLOCKED: &str = "pull_blocked";
+pub const KEY_PUSH_FAILED: &str = "push_failed";
 
 #[derive(Debug, Clone)]
 pub enum NotifyEvent {
@@ -33,6 +34,9 @@ impl NotifyEvent {
     fn persistent_key(&self) -> Option<&'static str> {
         match self {
             NotifyEvent::PullBlocked => Some(KEY_PULL_BLOCKED),
+            // Persistent too: while offline every drain and every pull cycle
+            // retries the push — one notification per hour, not per minute.
+            NotifyEvent::PushFailed => Some(KEY_PUSH_FAILED),
             _ => None,
         }
     }
@@ -159,6 +163,18 @@ fn applescript_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Waits for a fire-and-forget child on a background thread. Without the
+/// wait, every spawned helper (osascript, xdg-open, the viewer) stays as a
+/// zombie for the life of the parent — seen on the Arch tray (2026-10).
+pub fn reap_in_background(child: std::io::Result<std::process::Child>) {
+    if let Ok(mut child) = child {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn dispatch_osascript(title: &str, body: &str) {
     let script = format!(
         "display notification \"{}\" with title \"{}\"",
@@ -166,12 +182,27 @@ fn dispatch_osascript(title: &str, body: &str) {
         applescript_escape(title)
     );
     // Fire-and-forget: a notification failure must never affect the sync.
-    let _ = std::process::Command::new("osascript")
+    let child = std::process::Command::new("osascript")
         .arg("-e")
         .arg(script)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+    reap_in_background(child);
+}
+
+/// Linux: desktop notification via `notify-send` (libnotify). Absent binary
+/// or no session bus = silently nothing, like a failed osascript.
+#[cfg(not(target_os = "macos"))]
+fn dispatch_osascript(title: &str, body: &str) {
+    let child = std::process::Command::new("notify-send")
+        .arg("--app-name=git-drive")
+        .arg(title)
+        .arg(body)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    reap_in_background(child);
 }
 
 #[cfg(test)]

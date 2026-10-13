@@ -141,7 +141,7 @@ fn gui_domain() -> String {
 /// it with launchd. `with_tray` registers a second agent that starts the tray
 /// at login.
 pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
-    let binary = std::env::current_exe()?;
+    let binary = crate::service::install_binary()?;
     let repo = std::fs::canonicalize(repo)
         .map_err(|e| anyhow::anyhow!("repo {} inaccessible: {}", repo, e))?;
     std::fs::create_dir_all(mount)?;
@@ -152,44 +152,8 @@ pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
     std::fs::create_dir_all(&app_support)?;
     std::fs::create_dir_all(&log_dir)?;
 
-    // Migration: config/key moved twice (Application Support -> ~/.config/
-    // drive-sync on 2026-07-06, then to ~/.config/git-drive with the rename).
-    // If the new path does not exist and a legacy one does, move the most
-    // recent generation.
-    let _ = std::fs::create_dir_all(paths::config_dir());
-    for (legacies, new) in [
-        (paths::legacy_config_paths(), paths::standard_config_path()),
-        (paths::legacy_key_paths(), paths::standard_key_path()),
-    ] {
-        if new.exists() {
-            continue;
-        }
-        if let Some(legacy) = legacies.iter().find(|p| p.exists()) {
-            match std::fs::rename(legacy, &new) {
-                Ok(_) => println!("migrated: {} -> {}", legacy.display(), new.display()),
-                Err(e) => eprintln!("warning: failed to migrate {}: {}", legacy.display(), e),
-            }
-        }
-    }
-
-    // Config: if the standard one does not exist and there is a ./config.json
-    // in the CWD (dev flow), copy it — otherwise the daemon starts from the
-    // defaults (no identity = no commits).
-    let config = paths::standard_config_path();
-    if !config.exists() {
-        if Path::new("config.json").exists() {
-            std::fs::copy("config.json", &config)?;
-            log::info!(
-                "install: config.json copied to {}",
-                config.display()
-            );
-        } else {
-            log::warn!(
-                "install: no config.json — create {} with user_name/user_email to enable commits",
-                config.display()
-            );
-        }
-    }
+    crate::service::migrate_legacy_config();
+    let config = crate::service::ensure_config()?;
 
     let status_file = paths::standard_status_path();
     let plist = render_plist(&binary, &repo, &mount, &config, &log_dir, &status_file);

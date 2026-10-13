@@ -3,11 +3,14 @@ pub mod config;
 pub mod crypt;
 pub mod fs;
 pub mod git;
+pub mod journal;
 pub mod launchd;
 pub mod notify;
 pub mod paths;
+pub mod service;
 pub mod status;
 pub mod sync;
+pub mod systemd;
 pub mod tray;
 pub mod viewer;
 
@@ -93,12 +96,12 @@ mod tests {
     use super::*;
 
     // Initializes the process-global logger, so it must be the only test that
-    // does so. `into_path` keeps the dir alive past this test (the global
+    // does so. `keep` leaves the dir alive past this test (the global
     // logger keeps pointing at it), avoiding write-after-delete noise.
     #[test]
     #[serial_test::serial]
     fn init_logging_creates_and_locates_current_file() {
-        let dir = tempfile::tempdir().unwrap().into_path();
+        let dir = tempfile::tempdir().unwrap().keep();
         let (handle, path) = init_logging(false, &dir, "info", 50, 10).unwrap();
         log::info!("test line for the current file");
         handle.flush();

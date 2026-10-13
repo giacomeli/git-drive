@@ -44,24 +44,27 @@ pub fn list_files_at_commit(
     commit: &git2::Commit,
 ) -> Result<Vec<ListedFile>, Error> {
     let tree = commit.tree()?;
+    let odb = repo.odb()?;
     let mut files = Vec::new();
 
     tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
         if let Some(name) = entry.name() {
             if let Some(ObjectType::Blob) = entry.kind() {
-                if let Ok(obj) = entry.to_object(repo) {
-                    if let Some(blob) = obj.as_blob() {
-                        let kind = if entry.filemode() == FILEMODE_SYMLINK {
-                            FileKind::Symlink
-                        } else {
-                            FileKind::Regular
-                        };
-                        files.push(ListedFile {
-                            path: format!("{}{}", root, name),
-                            size: blob.size() as u64,
-                            kind,
-                        });
-                    }
+                // Size from the object HEADER: loading every blob just to
+                // read its length decompressed the whole repository on each
+                // boot and on every post-pull refresh (~2 GB on the real
+                // drive — tens of seconds with the FUSE thread blocked).
+                if let Ok((size, ObjectType::Blob)) = odb.read_header(entry.id()) {
+                    let kind = if entry.filemode() == FILEMODE_SYMLINK {
+                        FileKind::Symlink
+                    } else {
+                        FileKind::Regular
+                    };
+                    files.push(ListedFile {
+                        path: format!("{}{}", root, name),
+                        size: size as u64,
+                        kind,
+                    });
                 }
             }
         }
@@ -146,66 +149,368 @@ pub fn commit_working_tree(
     Ok(Some(oid))
 }
 
-/// On-disk SSH key for daemons without an ssh-agent (systemd/launchd have no
-/// SSH_AUTH_SOCK). Preference: id_ed25519, then id_rsa.
-fn discover_ssh_key(home: &Path) -> Option<(std::path::PathBuf, Option<std::path::PathBuf>)> {
-    for name in ["id_ed25519", "id_rsa"] {
-        let private = home.join(".ssh").join(name);
-        if private.exists() {
-            let public = private.with_extension("pub");
-            return Some((private.clone(), public.exists().then_some(public)));
+/// Network transport used by fetch and push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// The system `git` binary. Authentication goes through OpenSSH (honors
+    /// `~/.ssh/config`, the agent, the macOS Keychain and every key type) or
+    /// the configured HTTPS credential helper — the same path a manual
+    /// `git fetch` takes, so "works in the terminal" means "works in the daemon".
+    Cli,
+    /// In-process libgit2/libssh2 (fallback when no `git` binary exists).
+    Libgit2,
+}
+
+/// Process-wide transport. Defaults to libgit2 (library and test default);
+/// the mount mode resolves the configured value at boot via `set_transport`.
+static TRANSPORT_CLI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_transport(t: Transport) {
+    TRANSPORT_CLI.store(t == Transport::Cli, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn transport() -> Transport {
+    if TRANSPORT_CLI.load(std::sync::atomic::Ordering::SeqCst) {
+        Transport::Cli
+    } else {
+        Transport::Libgit2
+    }
+}
+
+/// Resolves the `git_transport` config value: `cli`, `libgit2` or `auto`
+/// (CLI when a working `git` binary is on PATH, libgit2 otherwise).
+pub fn resolve_transport(pref: &str) -> Transport {
+    match pref {
+        "libgit2" => Transport::Libgit2,
+        "cli" => Transport::Cli,
+        _ => {
+            let works = std::process::Command::new("git")
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if works {
+                Transport::Cli
+            } else {
+                Transport::Libgit2
+            }
         }
     }
-    None
 }
 
-/// Credential callback shared by push and fetch: HTTPS token >
-/// ssh-agent > on-disk SSH key > default.
+/// On-disk SSH keys for daemons without a usable ssh-agent, in preference
+/// order. Each entry is `(private, public if present)`.
+fn discover_ssh_keys(home: &Path) -> Vec<(std::path::PathBuf, Option<std::path::PathBuf>)> {
+    ["id_ed25519", "id_ecdsa", "id_rsa"]
+        .iter()
+        .map(|name| home.join(".ssh").join(name))
+        .filter(|private| private.exists())
+        .map(|private| {
+            let public = private.with_extension("pub");
+            let public = public.exists().then_some(public);
+            (private, public)
+        })
+        .collect()
+}
+
+/// Attempt tracker for the libgit2 credential callback. libgit2 calls the
+/// callback AGAIN after every failed authentication on the same connection;
+/// a stateless callback that always answers "agent" loops until the server's
+/// login grace time drops the connection ("Failed getting response" after
+/// ~120 s on GitHub) and never reaches the on-disk keys — the 2026-09/10
+/// incident where both machines failed every fetch for weeks.
+#[derive(Default)]
+struct CredAttempts {
+    token: bool,
+    username: bool,
+    agent: bool,
+    next_key: usize,
+    default: bool,
+}
+
+/// Credential callback shared by push and fetch on the libgit2 transport:
+/// HTTPS token > ssh-agent > each on-disk SSH key > default, every method
+/// tried at most once per connection.
 fn credential_callback(
+    state: &mut CredAttempts,
     token: Option<&str>,
     username_from_url: Option<&str>,
+    allowed: git2::CredentialType,
 ) -> Result<git2::Cred, Error> {
-    if let Some(t) = token {
-        return git2::Cred::userpass_plaintext("x-access-token", t);
-    }
-    let Some(username) = username_from_url else {
-        return git2::Cred::default();
-    };
-    git2::Cred::ssh_key_from_agent(username)
-        .or_else(|agent_err| {
-            let home = std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_default();
-            match discover_ssh_key(&home) {
-                Some((private, public)) => {
-                    git2::Cred::ssh_key(username, public.as_deref(), &private, None)
-                }
-                None => Err(agent_err),
+    if allowed.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
+        if let Some(t) = token {
+            if !state.token {
+                state.token = true;
+                return git2::Cred::userpass_plaintext("x-access-token", t);
             }
-        })
-        .or_else(|_| git2::Cred::default())
+        }
+    }
+    let username = username_from_url.unwrap_or("git");
+    if allowed.contains(git2::CredentialType::USERNAME) && !state.username {
+        state.username = true;
+        return git2::Cred::username(username);
+    }
+    if allowed.contains(git2::CredentialType::SSH_KEY) {
+        if !state.agent {
+            state.agent = true;
+            if std::env::var_os("SSH_AUTH_SOCK").is_some() {
+                if let Ok(cred) = git2::Cred::ssh_key_from_agent(username) {
+                    return Ok(cred);
+                }
+            }
+        }
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
+        let keys = discover_ssh_keys(&home);
+        while state.next_key < keys.len() {
+            let (private, public) = &keys[state.next_key];
+            state.next_key += 1;
+            if let Ok(cred) = git2::Cred::ssh_key(username, public.as_deref(), private, None) {
+                return Ok(cred);
+            }
+        }
+    }
+    if allowed.contains(git2::CredentialType::DEFAULT) && !state.default {
+        state.default = true;
+        return git2::Cred::default();
+    }
+    Err(Error::from_str(
+        "authentication failed: every credential method was rejected (agent, ~/.ssh keys, token)",
+    ))
 }
 
-/// Pushes `refs/heads/<branch>:refs/heads/<branch>` to the given remote.
-/// If `token` is Some, uses HTTPS userpass authentication ("x-access-token").
-/// Otherwise, delegates to the system (ssh-agent / credential helper).
-pub fn push_to_remote(
-    repo: &Repository,
-    branch: &str,
-    remote_name: &str,
-    token: Option<&str>,
-) -> Result<(), Error> {
-    let mut remote = repo.find_remote(remote_name)?;
+/// Libgit2 remote callbacks with the stateful credential strategy.
+fn libgit2_callbacks<'a>(token: Option<&str>) -> git2::RemoteCallbacks<'a> {
     let mut callbacks = git2::RemoteCallbacks::new();
     let token_owned = token.map(|t| t.to_string());
-    callbacks.credentials(move |_url, username_from_url, _allowed| {
-        credential_callback(token_owned.as_deref(), username_from_url)
+    let mut attempts = CredAttempts::default();
+    callbacks.credentials(move |_url, username_from_url, allowed| {
+        credential_callback(&mut attempts, token_owned.as_deref(), username_from_url, allowed)
     });
-    // git2 returns Ok at the transport level even when the server REJECTS the
-    // ref update (e.g. GitHub's GH001 for blobs > 100 MB) — the rejection only
-    // arrives through the push_update_reference callback. Without collecting
-    // it, the drain logged "push ok" with the remote stalled and the reconcile
-    // retry never fired (incident from the 2026-07-03 validation).
+    callbacks
+}
+
+/// A network git command run without any output for this long is killed:
+/// a hung connection must not hold the repo lock (and stall every drain)
+/// forever. Progress output (`--progress`) keeps long transfers alive.
+const CLI_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Runs a network `git` command against `repo` (fetch/push). Never prompts:
+/// no stdin, `GIT_TERMINAL_PROMPT=0` and an `ssh -o BatchMode=yes` default
+/// (unless the user configured their own `core.sshCommand`/`GIT_SSH_COMMAND`).
+/// `on_activity` fires on the calling thread whenever the child writes
+/// progress. Returns stdout on success; the error carries the stderr tail.
+fn run_git_net(
+    repo: &Repository,
+    args: &[&str],
+    token: Option<&str>,
+    on_activity: &dyn Fn(),
+) -> Result<String, Error> {
+    use std::io::Read;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("--git-dir")
+        .arg(repo.path())
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+        ])
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let user_ssh = std::env::var_os("GIT_SSH_COMMAND").is_some()
+        || std::env::var_os("GIT_SSH").is_some()
+        || repo
+            .config()
+            .and_then(|c| c.get_string("core.sshCommand"))
+            .is_ok();
+    if !user_ssh {
+        cmd.env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=4",
+        );
+    }
+    if let Some(t) = token {
+        // Via env (not argv): the token never shows up in `ps`.
+        let basic = base64_encode(format!("x-access-token:{}", t).as_bytes());
+        cmd.env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "http.extraHeader")
+            .env("GIT_CONFIG_VALUE_0", format!("Authorization: Basic {}", basic));
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| Error::from_str(&format!("could not run git: {}", e)))?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let activity = Arc::new(AtomicU64::new(0));
+    let activity_w = activity.clone();
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stderr.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    all.extend_from_slice(&chunk[..n]);
+                    activity_w.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        all
+    });
+
+    let mut seen = 0u64;
+    let mut last_activity = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(e) => break Err(e),
+        }
+        let now_seen = activity.load(Ordering::SeqCst);
+        if now_seen != seen {
+            seen = now_seen;
+            last_activity = std::time::Instant::now();
+            on_activity();
+        } else if last_activity.elapsed() >= CLI_IDLE_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = out_reader.join();
+            let _ = err_reader.join();
+            return Err(Error::from_str(&format!(
+                "git {} timed out ({} s without progress)",
+                args.first().copied().unwrap_or(""),
+                CLI_IDLE_TIMEOUT.as_secs()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let out = out_reader.join().unwrap_or_default();
+    let err = err_reader.join().unwrap_or_default();
+    let status = status.map_err(|e| Error::from_str(&format!("waiting for git: {}", e)))?;
+    let stdout_s = String::from_utf8_lossy(&out).into_owned();
+    if status.success() {
+        return Ok(stdout_s);
+    }
+    Err(Error::from_str(&format!(
+        "git {} failed ({}): {}",
+        args.first().copied().unwrap_or(""),
+        status,
+        cli_error_tail(&stdout_s, &String::from_utf8_lossy(&err))
+    )))
+}
+
+/// Last meaningful lines of a failed git command: progress noise
+/// (`\r`-rewritten counters) dropped, porcelain rejection lines (`!`) kept.
+fn cli_error_tail(stdout: &str, stderr: &str) -> String {
+    let mut lines: Vec<String> = stderr
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter(|l| {
+            !(l.starts_with("Enumerating")
+                || l.starts_with("Counting")
+                || l.starts_with("Compressing")
+                || l.starts_with("Writing")
+                || l.starts_with("Total")
+                || l.starts_with("remote: Counting")
+                || l.starts_with("remote: Compressing")
+                || l.starts_with("remote: Total")
+                || l.starts_with("Receiving")
+                || l.starts_with("Resolving")
+                || l.starts_with("Unpacking")
+                || l.starts_with("Delta compression"))
+        })
+        .map(str::to_string)
+        .collect();
+    lines.extend(
+        stdout
+            .lines()
+            .filter(|l| l.starts_with('!'))
+            .map(str::to_string),
+    );
+    let start = lines.len().saturating_sub(6);
+    lines[start..].join(" | ")
+}
+
+/// Standard base64 (RFC 4648, padded) — only for the HTTP Basic header.
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// Pushes one refspec through the CLI. A server-side rejection (non-FF,
+/// GitHub's GH001 for oversized blobs, protected branch) makes `git push`
+/// exit non-zero, so — unlike libgit2 — there is no silent "push ok".
+fn push_refspec_cli(
+    repo: &Repository,
+    remote_name: &str,
+    refspec: &str,
+    token: Option<&str>,
+    on_activity: &dyn Fn(),
+) -> Result<(), Error> {
+    run_git_net(
+        repo,
+        &["push", "--porcelain", "--progress", remote_name, refspec],
+        token,
+        on_activity,
+    )
+    .map(|_| ())
+    .map_err(|e| {
+        let m = e.message();
+        // "[rejected]"/"[remote rejected]" porcelain lines and "! " refs mean
+        // the server refused the ref update; anything else is transport.
+        if m.contains("rejected") || m.contains("| !") || m.starts_with('!') {
+            Error::from_str(&format!("push rejected by remote: {}", m))
+        } else {
+            Error::from_str(&format!("push failed: {}", m))
+        }
+    })
+}
+
+/// Pushes one refspec through libgit2, collecting server-side rejections from
+/// the `push_update_reference` callback (git2 returns Ok at the transport
+/// level even when the ref is rejected — e.g. GitHub's GH001; the
+/// 2026-07-03 "push ok" incident).
+fn push_refspec_libgit2(
+    repo: &Repository,
+    remote_name: &str,
+    refspec: &str,
+    token: Option<&str>,
+    on_activity: &dyn Fn(),
+) -> Result<(), Error> {
+    let mut remote = repo.find_remote(remote_name)?;
+    let mut callbacks = libgit2_callbacks(token);
     let rejections: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
         std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let rejections_cb = rejections.clone();
@@ -217,10 +522,12 @@ pub fn push_to_remote(
         }
         Ok(())
     });
+    callbacks.push_transfer_progress(move |_current, _total, _bytes| {
+        on_activity();
+    });
     let mut push_opts = git2::PushOptions::new();
     push_opts.remote_callbacks(callbacks);
-    let refspec = format!("refs/heads/{0}:refs/heads/{0}", branch);
-    remote.push(&[&refspec], Some(&mut push_opts))?;
+    remote.push(&[refspec], Some(&mut push_opts))?;
     let rejections = rejections.borrow();
     if !rejections.is_empty() {
         return Err(Error::from_str(&format!(
@@ -229,6 +536,33 @@ pub fn push_to_remote(
         )));
     }
     Ok(())
+}
+
+/// Pushes one refspec with the process-wide transport.
+fn push_refspec(
+    repo: &Repository,
+    remote_name: &str,
+    refspec: &str,
+    token: Option<&str>,
+    on_activity: &dyn Fn(),
+) -> Result<(), Error> {
+    match transport() {
+        Transport::Cli => push_refspec_cli(repo, remote_name, refspec, token, on_activity),
+        Transport::Libgit2 => push_refspec_libgit2(repo, remote_name, refspec, token, on_activity),
+    }
+}
+
+/// Pushes `refs/heads/<branch>:refs/heads/<branch>` to the given remote.
+/// If `token` is Some, uses HTTPS userpass authentication ("x-access-token").
+/// Otherwise, delegates to the system (ssh-agent / credential helper).
+pub fn push_to_remote(
+    repo: &Repository,
+    branch: &str,
+    remote_name: &str,
+    token: Option<&str>,
+) -> Result<(), Error> {
+    let refspec = format!("refs/heads/{0}:refs/heads/{0}", branch);
+    push_refspec(repo, remote_name, &refspec, token, &|| {})
 }
 
 /// Progress events emitted by `push_progressive`.
@@ -316,43 +650,13 @@ pub fn push_progressive(
     let total = commits.len();
 
     for (i, oid) in commits.iter().enumerate() {
-        let mut remote = repo.find_remote(remote_name)?;
-        let mut callbacks = git2::RemoteCallbacks::new();
-        let token_owned = token.map(|t| t.to_string());
-        callbacks.credentials(move |_url, username_from_url, _allowed| {
-            credential_callback(token_owned.as_deref(), username_from_url)
-        });
-        // Same server-side rejection collection as `push_to_remote` (GH001 &
-        // friends only surface through this callback, never as Err).
-        let rejections: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let rejections_cb = rejections.clone();
-        callbacks.push_update_reference(move |refname, status| {
-            if let Some(msg) = status {
-                rejections_cb
-                    .borrow_mut()
-                    .push(format!("{}: {}", refname, msg));
-            }
-            Ok(())
-        });
-        let transfer_cb = on_progress;
-        callbacks.push_transfer_progress(move |_current, _total, _bytes| {
-            transfer_cb(PushProgress::Transfer);
-        });
-        let mut push_opts = git2::PushOptions::new();
-        push_opts.remote_callbacks(callbacks);
         let refspec = format!("{}:refs/heads/{}", oid, branch);
-        remote.push(&[&refspec], Some(&mut push_opts))?;
-        let rejected = rejections.borrow();
-        if !rejected.is_empty() {
-            return Err(Error::from_str(&format!(
-                "push rejected by remote at commit {}/{}: {}",
-                i + 1,
-                total,
-                rejected.join("; ")
-            )));
-        }
-        drop(rejected);
+        push_refspec(repo, remote_name, &refspec, token, &|| {
+            on_progress(PushProgress::Transfer)
+        })
+        .map_err(|e| {
+            Error::from_str(&format!("at commit {}/{}: {}", i + 1, total, e.message()))
+        })?;
         on_progress(PushProgress::CommitPushed {
             done: i + 1,
             total,
@@ -361,22 +665,50 @@ pub fn push_progressive(
     Ok(total)
 }
 
-/// Runs `git fetch` against the given remote (only the required branch).
-/// Reuses the same credential strategy as `push_to_remote`.
+/// Runs `git fetch` against the given remote (only the required branch),
+/// updating `refs/remotes/<remote>/<branch>`. Uses the process-wide transport.
+/// A remote that does not have the branch yet (empty repo) is not an error.
 pub fn fetch_remote(
     repo: &Repository,
     branch: &str,
     remote_name: &str,
     token: Option<&str>,
 ) -> Result<(), Error> {
+    match transport() {
+        Transport::Cli => fetch_remote_cli(repo, branch, remote_name, token),
+        Transport::Libgit2 => fetch_remote_libgit2(repo, branch, remote_name, token),
+    }
+}
+
+fn fetch_remote_cli(
+    repo: &Repository,
+    branch: &str,
+    remote_name: &str,
+    token: Option<&str>,
+) -> Result<(), Error> {
+    let refspec = format!("+refs/heads/{0}:refs/remotes/{1}/{0}", branch, remote_name);
+    match run_git_net(
+        repo,
+        &["fetch", "--no-tags", "--progress", remote_name, &refspec],
+        token,
+        &|| {},
+    ) {
+        Ok(_) => Ok(()),
+        // Empty remote / branch not born yet: nothing to fetch.
+        Err(e) if e.message().contains("couldn't find remote ref") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn fetch_remote_libgit2(
+    repo: &Repository,
+    branch: &str,
+    remote_name: &str,
+    token: Option<&str>,
+) -> Result<(), Error> {
     let mut remote = repo.find_remote(remote_name)?;
-    let mut callbacks = git2::RemoteCallbacks::new();
-    let token_owned = token.map(|t| t.to_string());
-    callbacks.credentials(move |_url, username_from_url, _allowed| {
-        credential_callback(token_owned.as_deref(), username_from_url)
-    });
     let mut fetch_opts = git2::FetchOptions::new();
-    fetch_opts.remote_callbacks(callbacks);
+    fetch_opts.remote_callbacks(libgit2_callbacks(token));
     remote.fetch(&[branch], Some(&mut fetch_opts), None)
 }
 
@@ -501,38 +833,44 @@ pub fn pull_and_merge(
                 .ok_or_else(|| Error::from_str("conflict without an identifiable path"))?;
             let path_str = String::from_utf8(path_bytes)
                 .map_err(|_| Error::from_str("path contains invalid bytes"))?;
-
-            if let Some(our_entry) = &our {
-                let our_blob = repo.find_blob(our_entry.id)?;
-                let conflict_name = format!("{}.{}", path_str, conflict_suffix);
-                let full_conflict = workdir.join(&conflict_name);
-                if let Some(parent) = full_conflict.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| Error::from_str(&format!("create_dir: {}", e)))?;
-                }
-                std::fs::write(&full_conflict, our_blob.content())
-                    .map_err(|e| Error::from_str(&format!("write conflict copy: {}", e)))?;
-                index.add_path(Path::new(&conflict_name))?;
-            }
-
             let full = workdir.join(&path_str);
-            if let Some(their_entry) = &their {
-                let their_blob = repo.find_blob(their_entry.id)?;
-                if let Some(parent) = full.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| Error::from_str(&format!("create_dir: {}", e)))?;
-                }
-                std::fs::write(&full, their_blob.content())
-                    .map_err(|e| Error::from_str(&format!("write their: {}", e)))?;
-                index.add_path(Path::new(&path_str))?;
-            } else {
-                let _ = std::fs::remove_file(&full);
-                index.remove_path(Path::new(&path_str))?;
-            }
 
-            conflicted_paths.push(path_str);
+            match (&our, &their) {
+                // Both sides changed the file: the local version is preserved
+                // as a conflicted copy and the remote one becomes canonical.
+                (Some(our_entry), Some(their_entry)) => {
+                    let our_blob = repo.find_blob(our_entry.id)?;
+                    let conflict_name = format!("{}.{}", path_str, conflict_suffix);
+                    write_workdir_file(&workdir.join(&conflict_name), our_blob.content())?;
+                    index.add_path(Path::new(&conflict_name))?;
+                    let their_blob = repo.find_blob(their_entry.id)?;
+                    write_workdir_file(&full, their_blob.content())?;
+                    index.add_path(Path::new(&path_str))?;
+                    conflicted_paths.push(path_str);
+                }
+                // Modify/delete: only ONE version survives, so there is
+                // nothing to "conflict" — the edit wins and stays at its own
+                // path (Dropbox semantics). A conflicted copy here left the
+                // original name gone and, in encrypted mode, an orphan copy
+                // whose long-name sidecar the delete had removed (unreadable
+                // literal name + EIO on the drive, 2026-10-13).
+                (Some(kept), None) | (None, Some(kept)) => {
+                    let blob = repo.find_blob(kept.id)?;
+                    write_workdir_file(&full, blob.content())?;
+                    index.add_path(Path::new(&path_str))?;
+                    log::info!(
+                        "merge: modify/delete on {} — the modified version was kept",
+                        path_str
+                    );
+                }
+                (None, None) => {}
+            }
         }
 
+        // Long-name sidecars (`dslong_<h>.name`) are separate files: the side
+        // that deleted an entry also deleted its sidecar, cleanly. Restore the
+        // sidecar of every surviving hashed entry so its name stays decodable.
+        restore_missing_long_name_sidecars(repo, &mut index, &workdir, &fetch_commit.id())?;
         index.write()?;
     }
 
@@ -578,6 +916,119 @@ pub fn pull_and_merge(
     }
 }
 
+/// Writes a file into the working tree, creating parent directories.
+fn write_workdir_file(full: &Path, content: &[u8]) -> Result<(), Error> {
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::from_str(&format!("create_dir: {}", e)))?;
+    }
+    std::fs::write(full, content).map_err(|e| Error::from_str(&format!("write {:?}: {}", full, e)))
+}
+
+/// For every hashed long-name entry (`dslong_<h>[.conflict-...]`) in the
+/// merged index whose sidecar is missing, restores the sidecar blob from the
+/// local HEAD tree or the remote tree. Crypto-agnostic: sidecars are plain
+/// files keyed by name.
+fn restore_missing_long_name_sidecars(
+    repo: &Repository,
+    index: &mut git2::Index,
+    workdir: &Path,
+    their_oid: &git2::Oid,
+) -> Result<(), Error> {
+    let present: std::collections::HashSet<String> = index
+        .iter()
+        .filter_map(|e| String::from_utf8(e.path).ok())
+        .collect();
+    // Every hashed component along every path counts — a long DIRECTORY name
+    // keeps its sidecar in the parent, and the side that deleted the whole
+    // directory took that sidecar with it.
+    let mut checked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut missing: Vec<String> = Vec::new();
+    for path in &present {
+        let mut dir = String::new();
+        for comp in path.split('/') {
+            let here = if dir.is_empty() {
+                comp.to_string()
+            } else {
+                format!("{}/{}", dir, comp)
+            };
+            if crate::crypt::is_long_name(comp) && checked.insert(here.clone()) {
+                let with_dir = |n: String| {
+                    if dir.is_empty() {
+                        n
+                    } else {
+                        format!("{}/{}", dir, n)
+                    }
+                };
+                let exact_p = with_dir(crate::crypt::sidecar_name(comp));
+                let base_p = crate::crypt::long_name_base(comp)
+                    .map(|b| with_dir(crate::crypt::sidecar_name(b)));
+                let has = present.contains(&exact_p)
+                    || base_p.as_ref().map(|b| present.contains(b)).unwrap_or(false);
+                if !has {
+                    missing.push(base_p.unwrap_or(exact_p));
+                }
+            }
+            dir = here;
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let head_tree = repo.head()?.peel_to_commit()?.tree()?;
+    let their_tree = repo.find_commit(*their_oid)?.tree()?;
+    for sidecar in missing {
+        let found = [&head_tree, &their_tree]
+            .iter()
+            .find_map(|t| t.get_path(Path::new(&sidecar)).ok().map(|e| e.id()));
+        if let Some(id) = found {
+            let blob = repo.find_blob(id)?;
+            write_workdir_file(&workdir.join(&sidecar), blob.content())?;
+            index.add_path(Path::new(&sidecar))?;
+            log::info!("merge: restored long-name sidecar {}", sidecar);
+        }
+    }
+    Ok(())
+}
+
+/// Timestamps for the paths touched by the commits in `old..new` (reachable
+/// from `new`, not from `old`), first touch from the newest commit winning —
+/// the incremental counterpart of `commit_times_by_path` for a post-pull
+/// refresh. `Ok(None)` when the range exceeds `cap` commits (the caller does
+/// the full walk instead).
+pub fn commit_times_between(
+    repo: &Repository,
+    old: git2::Oid,
+    new: git2::Oid,
+    cap: usize,
+) -> Result<Option<std::collections::HashMap<String, std::time::SystemTime>>, Error> {
+    let mut out: std::collections::HashMap<String, std::time::SystemTime> =
+        std::collections::HashMap::new();
+    let mut revwalk = repo.revwalk()?;
+    revwalk.push(new)?;
+    revwalk.hide(old)?;
+    revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+    for (n, oid) in revwalk.enumerate() {
+        if n >= cap {
+            return Ok(None);
+        }
+        let commit = repo.find_commit(oid?)?;
+        let time = commit_system_time(&commit);
+        let tree = commit.tree()?;
+        let parent_tree = match commit.parent(0) {
+            Ok(parent) => Some(parent.tree()?),
+            Err(_) => None,
+        };
+        let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+        for delta in diff.deltas() {
+            if let Some(path) = delta.new_file().path().and_then(|p| p.to_str()) {
+                out.entry(path.to_string()).or_insert(time);
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
 /// Converts a commit's committer timestamp into a `SystemTime` (UTC).
 fn commit_system_time(commit: &git2::Commit) -> std::time::SystemTime {
     let secs = commit.time().seconds();
@@ -614,12 +1065,10 @@ pub fn commit_times_by_path(
     revwalk.push_head()?;
     revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
 
-    let mut depth = 0usize;
-    for oid in revwalk {
+    for (depth, oid) in revwalk.enumerate() {
         if pending.is_empty() || depth >= depth_cap {
             break;
         }
-        depth += 1;
         let commit = repo.find_commit(oid?)?;
         let time = commit_system_time(&commit);
         let tree = commit.tree()?;
@@ -1265,6 +1714,105 @@ mod tests {
         assert_eq!(head.parent_count(), 2, "merge commit must have 2 parents");
     }
 
+    fn delete_and_commit(repo: &Repository, relpath: &str) {
+        let workdir = repo.workdir().unwrap();
+        let _ = std::fs::remove_file(workdir.join(relpath));
+        let mut index = repo.index().unwrap();
+        index.remove_path(std::path::Path::new(relpath)).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let parent_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "rm", &tree, &[&parent_commit])
+            .unwrap();
+    }
+
+    /// A and B share `base`; A applies `local`, B applies `remote` and pushes;
+    /// A fetches and merges. Returns A's repo (and keeps the temp dirs alive).
+    fn diverge_and_merge(
+        base: &[(&str, &[u8])],
+        local: &dyn Fn(&Repository),
+        remote: &dyn Fn(&Repository),
+    ) -> (Vec<tempfile::TempDir>, Repository, MergeOutcome) {
+        let (local_a, repo_a, bare) = setup_local_with_bare_remote();
+        let branch = current_branch_name(&repo_a).unwrap();
+        for (p, c) in base {
+            commit_file(&repo_a, p, c);
+        }
+        push_to_remote(&repo_a, &branch, "origin", None).unwrap();
+        let (dir_b, repo_b) = clone_of(&bare, "Bob");
+        remote(&repo_b);
+        push_to_remote(&repo_b, &branch, "origin", None).unwrap();
+        local(&repo_a);
+        fetch_remote(&repo_a, &branch, "origin", None).unwrap();
+        let outcome =
+            pull_and_merge(&repo_a, &branch, "origin", "Alice", "a@x.com", "conflict-xyz").unwrap();
+        (vec![local_a, bare, dir_b], repo_a, outcome)
+    }
+
+    #[test]
+    fn pull_and_merge_modify_vs_remote_delete_keeps_the_edit() {
+        let (_keep, repo_a, outcome) = diverge_and_merge(
+            &[("doc.txt", b"base")],
+            &|a| commit_file(a, "doc.txt", b"edited locally"),
+            &|b| delete_and_commit(b, "doc.txt"),
+        );
+        assert!(matches!(outcome, MergeOutcome::Merged), "got {:?}", outcome);
+        let wd = repo_a.workdir().unwrap();
+        assert_eq!(std::fs::read(wd.join("doc.txt")).unwrap(), b"edited locally");
+        assert!(!wd.join("doc.txt.conflict-xyz").exists(), "no conflicted copy for modify/delete");
+        let head = repo_a.head().unwrap().peel_to_commit().unwrap();
+        assert!(head.tree().unwrap().get_path(Path::new("doc.txt")).is_ok());
+        assert!(repo_a.state() == git2::RepositoryState::Clean);
+    }
+
+    #[test]
+    fn pull_and_merge_local_delete_vs_remote_modify_keeps_the_edit() {
+        let (_keep, repo_a, outcome) = diverge_and_merge(
+            &[("doc.txt", b"base")],
+            &|a| delete_and_commit(a, "doc.txt"),
+            &|b| commit_file(b, "doc.txt", b"edited remotely"),
+        );
+        assert!(matches!(outcome, MergeOutcome::Merged), "got {:?}", outcome);
+        let wd = repo_a.workdir().unwrap();
+        assert_eq!(std::fs::read(wd.join("doc.txt")).unwrap(), b"edited remotely");
+    }
+
+    #[test]
+    fn pull_and_merge_restores_long_name_sidecar_deleted_by_the_other_side() {
+        // Encrypted layout: hashed entry + sidecar. B deletes both (as the
+        // drain does); A edits the entry. The kept edit needs its sidecar.
+        let (_keep, repo_a, _outcome) = diverge_and_merge(
+            &[("d/dslong_abc", b"sealed v1"), ("d/dslong_abc.name", b"ENCNAME")],
+            &|a| commit_file(a, "d/dslong_abc", b"sealed v2"),
+            &|b| {
+                delete_and_commit(b, "d/dslong_abc");
+                delete_and_commit(b, "d/dslong_abc.name");
+            },
+        );
+        let wd = repo_a.workdir().unwrap();
+        assert_eq!(std::fs::read(wd.join("d/dslong_abc")).unwrap(), b"sealed v2");
+        assert_eq!(std::fs::read(wd.join("d/dslong_abc.name")).unwrap(), b"ENCNAME");
+        let tree = repo_a.head().unwrap().peel_to_commit().unwrap().tree().unwrap();
+        assert!(tree.get_path(Path::new("d/dslong_abc.name")).is_ok(), "sidecar committed");
+    }
+
+    #[test]
+    fn pull_and_merge_restores_sidecar_of_long_directory_deleted_remotely() {
+        let (_keep, repo_a, _outcome) = diverge_and_merge(
+            &[("dslong_dir/file", b"v1"), ("dslong_dir.name", b"ENCDIR")],
+            &|a| commit_file(a, "dslong_dir/file", b"v2"),
+            &|b| {
+                delete_and_commit(b, "dslong_dir/file");
+                delete_and_commit(b, "dslong_dir.name");
+            },
+        );
+        let wd = repo_a.workdir().unwrap();
+        assert_eq!(std::fs::read(wd.join("dslong_dir/file")).unwrap(), b"v2");
+        assert_eq!(std::fs::read(wd.join("dslong_dir.name")).unwrap(), b"ENCDIR");
+    }
+
     #[test]
     fn pull_and_merge_conflict_creates_conflict_copy_and_accepts_remote() {
         let (_local_a, repo_a, bare) = setup_local_with_bare_remote();
@@ -1328,22 +1876,137 @@ mod tests {
     }
 
     #[test]
-    fn discover_ssh_key_prefers_ed25519_and_detects_pub() {
+    fn discover_ssh_keys_lists_existing_keys_in_preference_order() {
         let dir = tempdir().unwrap();
         let ssh = dir.path().join(".ssh");
         std::fs::create_dir_all(&ssh).unwrap();
-        assert!(discover_ssh_key(dir.path()).is_none());
+        assert!(discover_ssh_keys(dir.path()).is_empty());
 
         std::fs::write(ssh.join("id_rsa"), b"k").unwrap();
-        let (private, public) = discover_ssh_key(dir.path()).unwrap();
-        assert!(private.ends_with(".ssh/id_rsa"));
-        assert!(public.is_none());
+        let keys = discover_ssh_keys(dir.path());
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].0.ends_with(".ssh/id_rsa"));
+        assert!(keys[0].1.is_none());
 
         std::fs::write(ssh.join("id_ed25519"), b"k").unwrap();
         std::fs::write(ssh.join("id_ed25519.pub"), b"p").unwrap();
-        let (private, public) = discover_ssh_key(dir.path()).unwrap();
-        assert!(private.ends_with(".ssh/id_ed25519"), "ed25519 takes precedence");
-        assert!(public.unwrap().ends_with("id_ed25519.pub"));
+        let keys = discover_ssh_keys(dir.path());
+        assert_eq!(keys.len(), 2, "every key is a candidate, not only the first");
+        assert!(keys[0].0.ends_with(".ssh/id_ed25519"), "ed25519 takes precedence");
+        assert!(keys[0].1.as_ref().unwrap().ends_with("id_ed25519.pub"));
+        assert!(keys[1].0.ends_with(".ssh/id_rsa"));
+    }
+
+    #[test]
+    fn credential_callback_never_repeats_a_method() {
+        // libgit2 re-invokes the callback after each rejected attempt; the
+        // stateless version answered "agent" forever (weeks of failed fetches).
+        let mut st = CredAttempts::default();
+        let allowed = git2::CredentialType::SSH_KEY;
+        let mut produced = 0;
+        while credential_callback(&mut st, None, Some("git"), allowed).is_ok() {
+            produced += 1;
+            assert!(produced < 10, "the callback must run out of methods");
+        }
+        assert!(st.agent, "the agent was attempted (or skipped) exactly once");
+
+        // Token: offered once for HTTPS, then exhausted.
+        let mut st = CredAttempts::default();
+        let https = git2::CredentialType::USER_PASS_PLAINTEXT;
+        assert!(credential_callback(&mut st, Some("t"), None, https).is_ok());
+        assert!(credential_callback(&mut st, Some("t"), None, https).is_err());
+    }
+
+    #[test]
+    fn cli_fetch_and_push_roundtrip_via_bare_remote() {
+        let (_local_a, repo_a, bare) = setup_local_with_bare_remote();
+        let (_dir_b, repo_b) = clone_of(&bare, "Bob");
+        let branch = current_branch_name(&repo_b).unwrap();
+        commit_file(&repo_b, "from_b.txt", b"hello");
+        let tip_b = repo_b.head().unwrap().peel_to_commit().unwrap().id();
+        let refspec = format!("{}:refs/heads/{}", tip_b, branch);
+        push_refspec_cli(&repo_b, "origin", &refspec, None, &|| {}).unwrap();
+
+        fetch_remote_cli(&repo_a, &branch, "origin", None).unwrap();
+        let fetched = repo_a
+            .find_reference(&format!("refs/remotes/origin/{}", branch))
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(fetched.id(), tip_b, "libgit2 sees the objects/refs the CLI wrote");
+    }
+
+    #[test]
+    fn cli_fetch_from_empty_remote_is_not_an_error() {
+        let (_dir, repo) = init_repo_with_commit();
+        let bare = tempdir().unwrap();
+        Repository::init_bare(bare.path()).unwrap();
+        repo.remote("origin", &format!("file://{}", bare.path().to_str().unwrap()))
+            .unwrap();
+        let branch = current_branch_name(&repo).unwrap();
+        fetch_remote_cli(&repo, &branch, "origin", None).unwrap();
+    }
+
+    #[test]
+    fn cli_push_reports_server_side_rejection() {
+        // Same GH001 reproduction as the libgit2 test: a locked ref on the
+        // remote makes the ref update fail — git push must return Err.
+        let (_dir, repo, bare) = setup_local_with_bare_remote();
+        commit_file(&repo, "novo.txt", b"x");
+        let branch = current_branch_name(&repo).unwrap();
+        let lock = bare.path().join(format!("refs/heads/{}.lock", branch));
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        std::fs::write(&lock, b"").unwrap();
+        let refspec = format!("refs/heads/{0}:refs/heads/{0}", branch);
+        let err = push_refspec_cli(&repo, "origin", &refspec, None, &|| {}).unwrap_err();
+        assert!(err.message().contains("push rejected"), "got: {}", err.message());
+    }
+
+    #[test]
+    fn cli_push_non_fast_forward_is_rejected() {
+        let (_dir_a, repo_a, bare) = setup_local_with_bare_remote();
+        let (_dir_b, repo_b) = clone_of(&bare, "Bob");
+        let branch = current_branch_name(&repo_b).unwrap();
+        commit_file(&repo_b, "b.txt", b"b");
+        let spec = format!("refs/heads/{0}:refs/heads/{0}", branch);
+        push_refspec_cli(&repo_b, "origin", &spec, None, &|| {}).unwrap();
+        commit_file(&repo_a, "a.txt", b"a");
+        assert!(push_refspec_cli(&repo_a, "origin", &spec, None, &|| {}).is_err());
+    }
+
+    #[test]
+    fn commit_times_between_covers_only_the_new_range() {
+        let (_dir, repo) = init_repo_with_commit();
+        commit_file(&repo, "old.txt", b"1");
+        let old = repo.head().unwrap().peel_to_commit().unwrap().id();
+        commit_file(&repo, "new.txt", b"2");
+        commit_file(&repo, "old.txt", b"3");
+        let new = repo.head().unwrap().peel_to_commit().unwrap().id();
+        let changed = commit_times_between(&repo, old, new, 100).unwrap().unwrap();
+        let mut keys: Vec<_> = changed.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["new.txt".to_string(), "old.txt".to_string()]);
+        assert!(commit_times_between(&repo, old, new, 1).unwrap().is_none(), "cap -> full walk");
+        assert!(commit_times_between(&repo, new, new, 100).unwrap().unwrap().is_empty());
+    }
+
+    #[test]
+    fn base64_encode_matches_rfc4648_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn cli_error_tail_drops_progress_and_keeps_rejections() {
+        let stderr = "Enumerating objects: 3, done.\rCounting objects: 100% (3/3)\nerror: failed to push some refs\n";
+        let stdout = "To /tmp/x\n!\trefs/heads/main:refs/heads/main\t[rejected] (non-fast-forward)\nDone\n";
+        let tail = cli_error_tail(stdout, stderr);
+        assert!(tail.contains("failed to push"));
+        assert!(tail.contains("[rejected]"));
+        assert!(!tail.contains("Counting"));
     }
 
     // ---- Phase 2.5, Block A: commit policy and ignored files ----

@@ -149,11 +149,14 @@ pub fn chunk_reader_into_repo(
 /// integrity verification work without the key. The manifest's
 /// `total_size`/`chunk_size` remain in PLAINTEXT bytes (offset-based reads
 /// need them).
+/// Per-chunk transform applied before storing (encryption seals each chunk).
+pub type ChunkTransform<'a> = &'a dyn Fn(&[u8]) -> Vec<u8>;
+
 pub fn chunk_reader_into_repo_with(
     reader: &mut impl Read,
     chunk_size: u64,
     repo_root: &Path,
-    transform: Option<&dyn Fn(&[u8]) -> Vec<u8>>,
+    transform: Option<ChunkTransform<'_>>,
 ) -> std::io::Result<Manifest> {
     let mut hashes = Vec::new();
     let mut total: u64 = 0;

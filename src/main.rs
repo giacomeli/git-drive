@@ -30,7 +30,7 @@ fn install_panic_hook() {
 
 fn cli() -> Command {
     Command::new("git-drive")
-        .version("0.1.0")
+        .version(env!("CARGO_PKG_VERSION"))
         .about("Git-backed versioned filesystem")
         .subcommand_negates_reqs(true)
         .subcommand(
@@ -45,7 +45,7 @@ fn cli() -> Command {
         )
         .subcommand(
             Command::new("install")
-                .about("Install the LaunchAgent: mounts the drive automatically at login")
+                .about("Install the login service (LaunchAgent on macOS, systemd user unit on Linux): mounts the drive automatically")
                 .arg(
                     Arg::new("repo")
                         .short('r')
@@ -69,7 +69,7 @@ fn cli() -> Command {
                         .action(clap::ArgAction::SetTrue),
                 ),
         )
-        .subcommand(Command::new("uninstall").about("Stop the daemon and remove the LaunchAgent"))
+        .subcommand(Command::new("uninstall").about("Stop the daemon and remove the login service"))
         .subcommand(
             Command::new("key")
                 .about("Manage the at-rest encryption key")
@@ -172,14 +172,14 @@ fn main() -> anyhow::Result<()> {
         return run_status(&file);
     }
     if let Some(sub) = matches.subcommand_matches("install") {
-        return git_drive::launchd::install(
+        return git_drive::service::install(
             sub.get_one::<String>("repo").unwrap(),
             sub.get_one::<String>("mount").unwrap(),
             sub.get_flag("with-tray"),
         );
     }
     if matches.subcommand_matches("uninstall").is_some() {
-        return git_drive::launchd::uninstall();
+        return git_drive::service::uninstall();
     }
     if let Some(sub) = matches.subcommand_matches("key") {
         if let Some(gen) = sub.subcommand_matches("generate") {
@@ -233,7 +233,8 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
         .unwrap_or_else(|| log_dir.join("status.json"));
 
     // Config is loaded first: the logger's rotation and level come from it.
-    let config = Config::load_from(&config_path);
+    // An existing but invalid config aborts the boot (see `try_load_from`).
+    let config = Config::try_load_from(&config_path).map_err(|e| anyhow::anyhow!(e))?;
 
     // Initialize the process logger (flexi_logger): rotating files in `log_dir`,
     // level from config and overridable by `RUST_LOG` (also captures fuser's
@@ -264,6 +265,9 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
         git::current_branch_name(&repo)?
     };
     log::info!("boot: branch={}", branch);
+    let transport = git::resolve_transport(&config.git_transport);
+    git::set_transport(transport);
+    log::info!("boot: git transport={:?}", transport);
 
     // Explicit runtime: the SyncManager watchers need the tokio context.
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -329,6 +333,13 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     sync.enable_status_file(status_file);
     sync.status_state()
         .set_runtime_info(&mount_path, &log_path.to_string_lossy());
+
+    // Crash durability: every queued op is journaled before it is
+    // acknowledged; whatever a crashed session left behind is replayed and
+    // committed BEFORE the volume appears (see journal.rs).
+    let journal_dir = git::open_repo(&repo_path)?.path().join("git-drive-journal");
+    sync.enable_journal(&journal_dir)?;
+    sync.recover_at_boot();
 
     let fs = GitDriveFS::new_with_options_crypto(
         &repo_path,

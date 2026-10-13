@@ -2,9 +2,9 @@
 //!
 //! The repo (working tree + HEAD) stores content AND names encrypted; the
 //! FUSE layer presents everything in the clear. XChaCha20-Poly1305 AEAD with
-//! the nonce derived from the plaintext (convergent encryption): same content
-//! + same key = same ciphertext — preserves chunk dedup and blob stability in
-//! Git. Decisions recorded in the Phase 2.7 planning notes (internal,
+//! the nonce derived from the plaintext (convergent encryption): the same
+//! content under the same key yields the same ciphertext — preserves chunk
+//! dedup and blob stability in Git. Decisions recorded in the Phase 2.7 planning notes (internal,
 //! kept outside the repository).
 
 use chacha20poly1305::aead::Aead;
@@ -329,6 +329,15 @@ impl Crypto {
             .join("/")
     }
 
+    /// Decodes a conflicted copy of an ENCRYPTED component
+    /// (`<encrypted>.conflict-...`, the shape a merge produces on disk):
+    /// returns the clear base name and the suffix (marker included).
+    /// `None` when there is no suffix or the base is not a valid encrypted name.
+    pub fn dec_conflicted<'a>(&self, component: &'a str) -> Option<(String, &'a str)> {
+        let (base, suffix) = split_conflict(component)?;
+        self.dec_component(base).map(|clear| (clear, suffix))
+    }
+
     fn dec_component_lossy(&self, component: &str) -> String {
         if let Some(clear) = self.dec_component(component) {
             return clear;
@@ -343,6 +352,14 @@ impl Crypto {
         // Literal fallback: mixed state during migration and internal artifacts.
         component.to_string()
     }
+}
+
+/// Splits a conflicted-copy component into `(base, suffix)`, the suffix
+/// starting at the `.conflict-` marker. `None` without the marker.
+pub fn split_conflict(component: &str) -> Option<(&str, &str)> {
+    component
+        .find(CONFLICT_MARKER)
+        .map(|idx| component.split_at(idx))
 }
 
 /// True if `name` is a hashed long-name entry (a real file/dir on disk whose

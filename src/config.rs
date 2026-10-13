@@ -46,6 +46,10 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn default_git_transport() -> String {
+    "auto".to_string()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default = "default_write_debounce_secs")]
@@ -102,6 +106,12 @@ pub struct Config {
     /// at runtime by the `RUST_LOG` environment variable.
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Network transport for fetch/push: `auto` (system `git` when available,
+    /// libgit2 otherwise), `cli` or `libgit2`. The CLI authenticates exactly
+    /// like a manual `git fetch` (OpenSSH config, agent, Keychain, credential
+    /// helpers); libgit2 only knows the agent and `~/.ssh/id_*`.
+    #[serde(default = "default_git_transport")]
+    pub git_transport: String,
 }
 
 impl Default for Config {
@@ -122,11 +132,28 @@ impl Default for Config {
             log_max_mb: default_log_max_mb(),
             log_keep_files: default_log_keep_files(),
             log_level: default_log_level(),
+            git_transport: default_git_transport(),
         }
     }
 }
 
 impl Config {
+    /// Strict loader for the mount mode: a missing file means defaults, but a
+    /// file that exists and does not parse is an ERROR. Silently falling back
+    /// to defaults there would boot with encryption OFF (and, with the key at
+    /// its default path, migrate the repo back to cleartext and push it) or
+    /// without an identity — a typo must stop the daemon, not leak the drive.
+    pub fn try_load_from(path: &str) -> Result<Self, String> {
+        if !Path::new(path).exists() {
+            eprintln!("config: {} not found, using defaults", path);
+            return Ok(Config::default());
+        }
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("failed to read config {}: {}", path, e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("invalid config {}: {}", path, e))
+    }
+
     pub fn load_from(path: &str) -> Self {
         // Config loads BEFORE the logger is initialized (the logger's rotation
         // and level come from it), so these bootstrap diagnostics go straight
@@ -183,6 +210,24 @@ mod tests {
         assert!(cfg.user_name.is_none());
         assert!(cfg.user_email.is_none());
         assert!(cfg.remote_token.is_none());
+    }
+
+    #[test]
+    fn try_load_from_rejects_unparseable_file_but_accepts_missing() {
+        let (_dir, path) = write_config(r#"{"encryption_enabled": true,,}"#);
+        assert!(Config::try_load_from(&path).is_err());
+        let missing = Config::try_load_from("/nonexistent/path/config.json").unwrap();
+        assert!(!missing.encryption_enabled);
+        let (_dir2, ok) = write_config(r#"{"encryption_enabled": true}"#);
+        assert!(Config::try_load_from(&ok).unwrap().encryption_enabled);
+    }
+
+    #[test]
+    fn git_transport_defaults_to_auto() {
+        let (_dir, path) = write_config("{}");
+        assert_eq!(Config::load_from(&path).git_transport, "auto");
+        let (_dir2, path2) = write_config(r#"{"git_transport": "libgit2"}"#);
+        assert_eq!(Config::load_from(&path2).git_transport, "libgit2");
     }
 
     #[test]

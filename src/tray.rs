@@ -166,11 +166,12 @@ fn open_in_file_manager(path: &str) {
     let program = "open";
     #[cfg(not(target_os = "macos"))]
     let program = "xdg-open";
-    let _ = std::process::Command::new(program)
+    let child = std::process::Command::new(program)
         .arg(path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+    crate::notify::reap_in_background(child);
 }
 
 /// Spawns the egui viewer (status + live log tail) as a separate process.
@@ -179,13 +180,14 @@ fn open_in_file_manager(path: &str) {
 /// Uses the current executable so it does not depend on PATH.
 fn spawn_viewer(status_path: &Path) {
     let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("git-drive"));
-    let _ = std::process::Command::new(bin)
+    let child = std::process::Command::new(bin)
         .arg("viewer")
         .arg("--file")
         .arg(status_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+    crate::notify::reap_in_background(child);
 }
 
 /// Starts the tray. BLOCKS the main thread with tao's event loop (an AppKit
