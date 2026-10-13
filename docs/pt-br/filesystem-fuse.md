@@ -125,11 +125,11 @@ Regras que sustentam o modelo:
 | --- | --- | --- | --- |
 | `lookup` | `lookup` | `apply_lookup(parent, name)` | Busca filho em `dirs_by_inode[parent].children` pelo `leaf_name`. Refresh antes. |
 | `getattr` | `getattr` | `apply_getattr(ino)` | Retorna `FileAttr` com uid/gid do processo e mtime estável (derivado do último commit que tocou o path; sessão tem precedência). Refresh antes. |
-| `setattr` | `setattr` | `apply_truncate(ino, size)` | `mode` vai para `mode_overrides` (in-memory); `size` trunca o buffer preservando conteúdo; times atualizam `times`. |
+| `setattr` | `setattr` | `apply_setattr` (`apply_truncate` para `size`) | `mode` vai para `mode_overrides` (in-memory); `size` trunca o buffer preservando conteúdo; mtime explícito atualiza `times` (setattr só de atime é descartado). A resposta é `apply_getattr`: o kernel a guarda pelo TTL, então ela precisa trazer o tamanho real de arquivo chunkado. |
 | `readdir` | `readdir` | `apply_readdir(ino)` | Lista `.`, `..` e children ordenados por nome. Refresh só na primeira página (`offset == 0`). |
 | `readdirplus` | `readdirplus` | `apply_readdir(ino)` | Variante com atributos inline — Finder usa `getattrlistbulk`. |
 | `open` | `open` | — | Sempre aceita, fh = ino. |
-| `read` | `read` | `apply_read(ino, offset, size)` | Buffer do inode (RAM ou spool), cache de blobs, working tree (local-only) ou blob do HEAD via handle de repo persistente (miss popula o cache). Erros viram `EIO`. |
+| `read` | `read` | `apply_read(ino, offset, size)` | Buffer do inode (RAM ou spool); arquivos chunkados e regulares de 4 MiB ou mais por faixa do working tree (`RangeReader`, verificados uma vez por sessão); arquivos pequenos do cache de blobs ou do blob do HEAD via handle de repo persistente (miss popula o cache). Erros viram `EIO`. |
 | `write` | `write` | `apply_write(ino, offset, data)` | Buffer inicializado do HEAD; escrita em offset; atualiza `entry.size`; marca dirty. |
 | `flush` | `flush` | `apply_flush(ino)` | Enfileira `queue_write` só se dirty; limpa a marca; `touch`. |
 | `release` | `release` | — | Apenas loga. |
@@ -181,9 +181,19 @@ Não implementadas (default `ENOSYS`): `mknod`, `fsync`, `fallocate`, `copy_file
 `apply_read` em `src/fs.rs` (callback `read` delega). Ordem das fontes:
 
 1. **Write buffer** do inode (mutações pendentes, conteúdo pós-create/rename ainda não commitado).
-2. **Cache de blobs** (`BlobCache`): LRU keyed por inode com orçamento em bytes (`read_cache_mb` no
+2. **Arquivo chunkado** (manifesto detectado por `manifest_for`): `read_chunked` lê, por chunk, só o
+   trecho pedido do arquivo do chunk pelo `RangeReader`, conferindo o SHA-256 de cada chunk contra o
+   manifesto uma vez por sessão. Divergência = `EIO`.
+3. **Arquivo regular de 4 MiB ou mais** (`RANGE_READ_MIN_BYTES`): `read_worktree_range` lê o trecho da
+   cópia no working tree, verificada uma vez contra o blob id do HEAD (mais a tag AEAD se selada).
+   Cópia que não é a versão do HEAD cai no passo 5; tag inválida é `EIO`. Local-only desse tamanho é
+   lido por faixa sem verificação (fica fora do Git).
+4. **Cache de blobs** (`BlobCache`): LRU keyed por inode com orçamento em bytes (`read_cache_mb` no
    `config.json`, default 64 MiB; `0` desativa). Blob maior que o orçamento não entra.
-3. **Blob do HEAD**: reabre o repo e lê; o miss popula o cache.
+5. **Blob do HEAD**: lê pelo handle de repo persistente; o miss popula o cache.
+
+Os passos 2 e 3, as regras de verificação e os números medidos estão em
+[arquitetura-leitura-de-arquivos-grandes.md](./arquitetura-leitura-de-arquivos-grandes.md).
 
 Invalidação do cache: limpeza total nos pontos de gc de buffers (avanço de `commit_generation` e
 refresh pós-pull — o HEAD mudou); remoção por inode em `unlink`, `write`, `truncate` e rename de
@@ -197,14 +207,14 @@ ler o path novo antes do commit caía num blob inexistente no HEAD e retornava `
 1. **TTL de 1s** no kernel mascara mudanças vindas do pull por até 1 segundo.
 2. **Sem FIFOs / hardlinks reais** (`link` é cópia). Symlinks são suportados: alvo opaco, nunca resolvido (no-follow); alvo absoluto quebra em outra máquina, como no Git puro.
 3. **Permissões e xattrs em memória** — `chmod` aceito mas não persiste entre montagens; `chown` ignorado.
-4. **mtime derivado do histórico** — arquivo não tocado na sessão expõe o timestamp do último commit que tocou o path (revwalk único com teto de 4096 commits; resíduo cai no timestamp do HEAD). Toques da sessão (flush/setattr) têm precedência e não persistem entre montagens. `atime`/`ctime`/`crtime` espelham o mtime disponível.
+4. **mtime derivado do histórico** — arquivo não tocado na sessão expõe o timestamp do último commit que tocou o path (revwalk único com teto de 4096 commits; resíduo cai no timestamp do HEAD). Toques da sessão (flush/setattr) têm precedência e não persistem entre montagens. `atime`/`ctime`/`crtime` espelham o mtime disponível, então setattr só de atime é descartado.
 5. **Escritas não-commitadas são perdidas em crash** antes do debounce drenar.
 6. **Swap implícito exige exatamente um arquivo-filho** no diretório de origem — ambiguidade retorna `EXDEV` e o app degrada para o fluxo de cópia.
-7. **Cache de blobs não cobre arquivos maiores que o orçamento** (`read_cache_mb`) — leituras deles vão ao repo a cada syscall, mas por um handle persistente (uma abertura por mount, não uma por syscall).
+7. **Arquivos de 4 MiB ou mais são lidos do working tree** — por faixa, verificados uma vez por sessão, sem passar pelo cache de blobs. Quando a cópia do working tree não é a versão do HEAD, a leitura cai no carregamento do blob inteiro pelo ODB (lento para arquivo grande; um aviso vai para o log).
 8. **Write buffers acima de `large_file_threshold_mb` vivem em spool** (`.git/git-drive-spool/`) com acesso randômico — pico de RAM limitado ao limiar; snapshot da fila é aplicado no drain com `rename`.
 9. **Arquivos ignorados pelo `.gitignore` do repo são local-only visíveis** — aparecem no mount, persistem no working tree entre remounts e nunca entram em commit/push.
 10. **Repo cifrado é transparente** — com `encryption_enabled`, índices nascem dos nomes decifrados, leituras abrem AEAD (chave errada/blob adulterado = `EIO`), readlink apresenta alvo claro e conflicted copies mostram o prefixo decifrado. Ignore/local-only ficam desativados nesse modo.
-11. **Arquivos chunkados são transparentes** — path com manifest expõe tamanho real e leitura remontada por chunk (sha256 verificado, mismatch = `EIO`); `.chunks/` é invisível no mount.
+11. **Arquivos chunkados são transparentes** — path com manifest expõe tamanho real e leitura por faixa em cada chunk (sha256 verificado uma vez por sessão, mismatch = `EIO`); `.chunks/` é invisível no mount.
 
 ---
 

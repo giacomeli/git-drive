@@ -10,3 +10,4 @@ Documentação arquitetural do projeto. Para build/run e visão de alto nível, 
 - [arquitetura.md](./arquitetura.md) — Visão geral do projeto, camadas (incluindo chunking e criptografia), estruturas de dados e limitações conhecidas
 - [fluxo-de-sincronizacao.md](./fluxo-de-sincronizacao.md) — `SyncManager`, fila causal, drain (chunking, criptografia e migrações), pull watcher e reconcile de push
 - [filesystem-fuse.md](./filesystem-fuse.md) — Mapeamento inode-path, operações FUSE implementadas, buffers (RAM/spool) e fluxos de leitura/escrita
+- [arquitetura-leitura-de-arquivos-grandes.md](./arquitetura-leitura-de-arquivos-grandes.md) — Leitura por faixa de arquivos grandes: verificação única por sessão, decifragem por trecho, desempenho medido no macOS e no Linux, como estender e medir de novo

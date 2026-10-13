@@ -7,6 +7,7 @@ pub mod journal;
 pub mod launchd;
 pub mod notify;
 pub mod paths;
+pub mod range_read;
 pub mod service;
 pub mod status;
 pub mod sync;

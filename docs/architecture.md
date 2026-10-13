@@ -186,9 +186,11 @@ pub struct Config {
 
 ## Performance Notes
 
-- Reads: inode buffer -> blob LRU cache (`read_cache_mb`) -> repo via a **persistent handle**
-  (one open per mount, not per syscall). A file larger than the budget never enters the cache;
-  chunked files use a last-chunk cache.
+- Reads: inode buffer -> chunked files and regular files of at least 4 MiB **by range from the
+  working tree** (each file verified once per session, then `pread` + range decryption of just the
+  requested bytes) -> for small files, blob LRU cache (`read_cache_mb`) -> repo via a **persistent
+  handle**. Random 1 MiB reads of large files take 1-3 ms (they took 0.4-24 s before 2026-10-13);
+  see [large-file-reads.md](./large-file-reads.md).
 - Writes: RAM peak of ~1x the file size (Arc shared between buffer and queue); above
   `large_file_threshold_mb` the buffer lives in an on-disk spool.
 - The pull watcher skips an iteration if there is a pending flush batch (avoids racing a local

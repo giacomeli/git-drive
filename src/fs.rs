@@ -298,12 +298,27 @@ pub struct GitDriveFS {
     /// chunked file (parsed manifest), `None` = checked and not chunked.
     /// Cleared together with the buffer gc (HEAD changed).
     manifests: parking_lot::Mutex<HashMap<u64, Option<Arc<crate::chunk::Manifest>>>>,
-    /// Last verified chunk served to `read` — sequential reads of a chunked
-    /// file pay hash+disk once per chunk, not per syscall.
-    last_chunk: Option<(u64, usize, Vec<u8>)>,
+    /// Verified open handles of the working-tree files that `read` serves by
+    /// range (chunks): each file is checked once, then only the requested
+    /// bytes are read and decrypted.
+    range: crate::range_read::RangeReader,
+    /// Blob id at HEAD of each large file served by range (cleared when
+    /// HEAD changes) and the inodes already warned about falling back to the
+    /// object store.
+    head_blob_ids: HashMap<u64, git2::Oid>,
+    range_fallbacks: HashSet<u64>,
     boot_time: SystemTime,
     xattrs: Arc<parking_lot::Mutex<XattrMap>>,
 }
+
+/// Regular files at least this large are read by range from the working
+/// tree; smaller ones go through the blob cache (whole-blob loads are cheap
+/// there and the cache serves repeated small reads from RAM).
+const RANGE_READ_MIN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Open working-tree handles kept by range reads (LRU). Bounds file
+/// descriptors; a handle evicted is reopened and checked again on demand.
+const RANGE_READ_HANDLES: usize = 64;
 
 /// Default read cache budget when the caller does not specify one
 /// (mirrors the `read_cache_mb` default in the config).
@@ -485,7 +500,9 @@ impl GitDriveFS {
             name_cache,
             indexed_head,
             manifests: parking_lot::Mutex::new(HashMap::new()),
-            last_chunk: None,
+            range: crate::range_read::RangeReader::new(RANGE_READ_HANDLES),
+            head_blob_ids: HashMap::new(),
+            range_fallbacks: HashSet::new(),
             boot_time: SystemTime::now(),
             xattrs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         };
@@ -796,29 +813,54 @@ impl GitDriveFS {
         self.maybe_open(data)
     }
 
-    /// Reassembled read of a chunked file, caching the last chunk
-    /// (sequential reads pay disk+hash once per chunk, not per syscall).
+    /// Reassembled read of a chunked file: per chunk, only the requested
+    /// range is read (and decrypted) from the chunk file, verified against
+    /// the manifest hash once per session. Interleaved readers on different
+    /// chunks no longer reload whole chunks.
     fn read_chunked(
         &mut self,
-        ino: u64,
         m: &crate::chunk::Manifest,
         offset: usize,
         size: usize,
     ) -> Result<Vec<u8>, i32> {
+        use crate::range_read::{Expect, RangeError};
         let mut out = Vec::new();
         let end = (offset as u64).saturating_add(size as u64).min(m.total_size);
         for idx in m.chunks_for_range(offset as u64, size as u64) {
-            let cached = matches!(&self.last_chunk,
-                Some((c_ino, c_idx, _)) if *c_ino == ino && *c_idx == idx);
-            if !cached {
-                let data = self.read_verified_chunk(m, idx)?;
-                self.last_chunk = Some((ino, idx, data));
-            }
-            let data = &self.last_chunk.as_ref().expect("filled above").2;
+            let hash = &m.hashes[idx];
             let chunk_start = idx as u64 * m.chunk_size;
+            let chunk_len = m.chunk_size.min(m.total_size - chunk_start);
             let s = (offset as u64).max(chunk_start) - chunk_start;
-            let e = end.min(chunk_start + data.len() as u64) - chunk_start;
-            out.extend_from_slice(&data[s as usize..e as usize]);
+            let e = end.min(chunk_start + chunk_len) - chunk_start;
+            let path =
+                std::path::Path::new(&self.repo_path).join(crate::chunk::shard_rel_path(hash));
+            let read = self.range.read(
+                &path,
+                &Expect::Sha256(hash.clone()),
+                self.crypto.as_deref(),
+                Some(chunk_len),
+                s,
+                (e - s) as usize,
+            );
+            match read {
+                Ok((data, _)) if data.len() as u64 == e - s => out.extend_from_slice(&data),
+                Ok(_) | Err(RangeError::Io) => {
+                    log::error!("chunk: cannot read chunk {} (idx {}) — EIO", hash, idx);
+                    return Err(libc::EIO);
+                }
+                Err(RangeError::Mismatch) => {
+                    log::error!("chunk: hash mismatch on chunk {} (idx {}) — EIO", hash, idx);
+                    return Err(libc::EIO);
+                }
+                Err(RangeError::Corrupt) => {
+                    log::error!(
+                        "chunk: chunk {} (idx {}) does not fit its manifest — EIO",
+                        hash,
+                        idx
+                    );
+                    return Err(libc::EIO);
+                }
+            }
         }
         Ok(out)
     }
@@ -932,6 +974,43 @@ impl GitDriveFS {
         Ok(())
     }
 
+    /// `setattr`: mode override, truncate and times. Returns the attributes
+    /// the kernel caches for the TTL.
+    pub fn apply_setattr(
+        &mut self,
+        ino: u64,
+        mode: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<SystemTime>,
+        mtime: Option<SystemTime>,
+    ) -> Result<FileAttr, i32> {
+        if let Some(m) = mode {
+            self.mode_overrides
+                .lock()
+                .insert(ino, (m as u16) & 0o7777);
+        }
+
+        if let Some(new_size) = size {
+            // Errors ignored on purpose: a size setattr on an unknown inode
+            // keeps the previous behavior (falls through to the reply below).
+            let _ = self.apply_truncate(ino, new_size);
+        }
+
+        // atime mirrors the mtime (single time slot), so an atime-only
+        // setattr — Finder/Quick Look stamping "last opened" — is accepted
+        // and dropped instead of passing for a modification.
+        if let Some(t) = mtime {
+            self.times.lock().insert(ino, t);
+        } else if mode.is_some() || size.is_some() {
+            self.touch(ino);
+        }
+
+        // The kernel caches this reply for the TTL: it must carry the same
+        // size getattr would (the real one for a chunked file, not the
+        // manifest's), or reads past the manifest size hit EOF meanwhile.
+        self.apply_getattr(ino)
+    }
+
     /// Reads a range of the file. Source order: write buffer (pending
     /// mutations), blob cache, blob at HEAD (a miss populates the cache).
     /// Git errors become EIO.
@@ -945,14 +1024,22 @@ impl GitDriveFS {
         if let Some(buf) = self.write_buffers.lock().get(&ino) {
             return Ok(buf.read_range(offset, size));
         }
-        let (path, local_only, kind) = match self.files_by_inode.get(&ino) {
-            Some(f) => (f.path.clone(), f.local_only, f.kind),
+        let (path, local_only, kind, file_size) = match self.files_by_inode.get(&ino) {
+            Some(f) => (f.path.clone(), f.local_only, f.kind, f.size),
             None => return Err(libc::ENOENT),
         };
         // Chunked: reassembled per-chunk read (hash verification);
         // the BlobCache never stores the raw manifest nor chunks.
         if let Some(m) = self.manifest_for(ino) {
-            return self.read_chunked(ino, &m, offset, size);
+            return self.read_chunked(&m, offset, size);
+        }
+        // Large file: range read from the working tree. Loading the whole
+        // blob per request (the old path, still the fallback) cost seconds
+        // per MiB once the file no longer fit the blob cache.
+        if kind == git::FileKind::Regular && file_size >= RANGE_READ_MIN_BYTES {
+            if let Some(result) = self.read_worktree_range(ino, &path, local_only, offset, size) {
+                return result;
+            }
         }
         if let Some(data) = self.read_cache.get(ino) {
             return Ok(slice_of(data, offset, size));
@@ -965,6 +1052,71 @@ impl GitDriveFS {
         let out = slice_of(&content, offset, size);
         self.read_cache.insert(ino, content);
         Ok(out)
+    }
+
+    /// Range read of a large file straight from its working-tree copy.
+    /// Committed: checked once against the blob id at HEAD (plus the AEAD tag
+    /// when sealed). Local-only: read as is. `None` = use the object store
+    /// instead (copy missing or not the committed version).
+    fn read_worktree_range(
+        &mut self,
+        ino: u64,
+        path: &str,
+        local_only: bool,
+        offset: usize,
+        size: usize,
+    ) -> Option<Result<Vec<u8>, i32>> {
+        use crate::range_read::{Expect, RangeError};
+        let (rel, expect) = if local_only {
+            (path.to_string(), Expect::Unverified)
+        } else {
+            let disk = self.disk_path(path);
+            let oid = self.head_blob_id(ino, &disk)?;
+            (disk, Expect::GitBlob(oid))
+        };
+        let full = std::path::Path::new(&self.repo_path).join(&rel);
+        match self.range.read(&full, &expect, self.crypto.as_deref(), None, offset as u64, size) {
+            Ok((data, _)) => Some(Ok(data)),
+            Err(RangeError::Corrupt) => {
+                log::error!("range read: {} fails its integrity check — EIO", path);
+                Some(Err(libc::EIO))
+            }
+            Err(RangeError::Mismatch) | Err(RangeError::Io) => {
+                if local_only {
+                    return Some(Err(libc::EIO));
+                }
+                if self.range_fallbacks.insert(ino) {
+                    log::warn!(
+                        "range read: working-tree copy of {} is not the committed version; \
+                         reading from the object store (slow for large files)",
+                        path
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// Blob id of `disk_path` at HEAD (tree lookup, no blob load), cached per
+    /// inode until HEAD changes.
+    fn head_blob_id(&mut self, ino: u64, disk_path: &str) -> Option<git2::Oid> {
+        if let Some(oid) = self.head_blob_ids.get(&ino) {
+            return Some(*oid);
+        }
+        if self.read_repo.is_none() {
+            self.read_repo = git::open_repo(&self.repo_path).ok();
+            if self.read_repo.is_some() {
+                self.read_repo_opens += 1;
+            }
+        }
+        let repo = self.read_repo.as_ref()?;
+        let oid = git::get_commit(repo, "HEAD")
+            .and_then(|c| c.tree())
+            .and_then(|t| t.get_path(std::path::Path::new(disk_path)))
+            .map(|e| e.id())
+            .ok()?;
+        self.head_blob_ids.insert(ino, oid);
+        Some(oid)
     }
 
     /// Target of a symlink (blob content = target text). EINVAL for a
@@ -1044,6 +1196,12 @@ impl GitDriveFS {
         }
     }
 
+    /// Whole-file checks done by range reads (introspection): one per
+    /// working-tree file served, not one per read.
+    pub fn range_verifications_for_test(&self) -> u64 {
+        self.range.verifications()
+    }
+
     /// Actual opens of the persistent read handle (introspection).
     pub fn read_repo_opens_for_test(&self) -> u64 {
         self.read_repo_opens
@@ -1078,7 +1236,11 @@ impl GitDriveFS {
         self.read_cache.clear();
         // HEAD changed: manifests may have changed content/state.
         self.manifests.lock().clear();
-        self.last_chunk = None;
+        // Handles of files gone from the working tree (deleted, GC'd
+        // chunks) would pin their disk space until evicted.
+        self.range.prune_missing();
+        self.head_blob_ids.clear();
+        self.range_fallbacks.clear();
     }
 
     /// Current content visible for reading (buffer or blob at HEAD).
@@ -2296,36 +2458,13 @@ impl Filesystem for GitDriveFS {
             size,
             mtime
         );
-
-        if let Some(m) = mode {
-            self.mode_overrides
-                .lock()
-                .insert(ino, (m as u16) & 0o7777);
-        }
-
-        if let Some(new_size) = size {
-            // Errors ignored on purpose: a size setattr on an unknown inode
-            // keeps the previous behavior (falls through to the reply below).
-            let _ = self.apply_truncate(ino, new_size);
-        }
-
-        let resolved = mtime.or(atime).map(|t| match t {
+        let resolve = |t: fuser::TimeOrNow| match t {
             fuser::TimeOrNow::Now => SystemTime::now(),
             fuser::TimeOrNow::SpecificTime(st) => st,
-        });
-        if let Some(t) = resolved {
-            self.times.lock().insert(ino, t);
-        } else if mode.is_some() || size.is_some() {
-            self.touch(ino);
-        }
-
-        if self.dirs_by_inode.contains_key(&ino) {
-            reply.attr(&TTL, &self.dir_attr_for(ino));
-        } else if let Some(entry) = self.files_by_inode.get(&ino) {
-            let size = entry.size;
-            reply.attr(&TTL, &self.file_attr_for(ino, size));
-        } else {
-            reply.error(libc::ENOENT);
+        };
+        match self.apply_setattr(ino, mode, size, atime.map(resolve), mtime.map(resolve)) {
+            Ok(attr) => reply.attr(&TTL, &attr),
+            Err(code) => reply.error(code),
         }
     }
 

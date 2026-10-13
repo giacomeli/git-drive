@@ -186,9 +186,12 @@ pub struct Config {
 
 ## Notas de Performance
 
-- Leitura: buffer do inode -> cache LRU de blobs (`read_cache_mb`) -> repo via **handle
-  persistente** (uma abertura por mount, não por syscall). Arquivo maior que o orçamento nunca
-  entra no cache; chunkados usam cache do último chunk.
+- Leitura: buffer do inode -> arquivos chunkados e regulares de 4 MiB ou mais **por faixa do
+  working tree** (cada arquivo verificado uma vez por sessão, depois `pread` + decifragem só dos
+  bytes pedidos) -> para arquivos pequenos, cache LRU de blobs (`read_cache_mb`) -> repo via
+  **handle persistente**. Leituras aleatórias de 1 MiB em arquivo grande levam 1-3 ms (antes de
+  13-10-2026 levavam de 0,4 a 24 s); ver
+  [arquitetura-leitura-de-arquivos-grandes.md](./arquitetura-leitura-de-arquivos-grandes.md).
 - Escrita: pico de RAM ~1x o tamanho do arquivo (Arc compartilhado buffer/fila); acima de
   `large_file_threshold_mb` o buffer vive em spool no disco.
 - Pull watcher pula iteração se há lote pendente (evita corrida com commit local).

@@ -125,11 +125,11 @@ Rules that sustain the model:
 | --- | --- | --- | --- |
 | `lookup` | `lookup` | `apply_lookup(parent, name)` | Finds the child in `dirs_by_inode[parent].children` by `leaf_name`. Refresh first. |
 | `getattr` | `getattr` | `apply_getattr(ino)` | Returns `FileAttr` with the process uid/gid and a stable mtime (derived from the last commit that touched the path; session touches take precedence). Refresh first. |
-| `setattr` | `setattr` | `apply_truncate(ino, size)` | `mode` goes to `mode_overrides` (in-memory); `size` truncates the buffer preserving content; times update `times`. |
+| `setattr` | `setattr` | `apply_setattr` (`apply_truncate` for `size`) | `mode` goes to `mode_overrides` (in-memory); `size` truncates the buffer preserving content; an explicit mtime updates `times` (an atime-only setattr is dropped). The reply is `apply_getattr` — the kernel caches it for the TTL, so it must carry the real size of a chunked file. |
 | `readdir` | `readdir` | `apply_readdir(ino)` | Lists `.`, `..` and children sorted by name. Refresh only on the first page (`offset == 0`). |
 | `readdirplus` | `readdirplus` | `apply_readdir(ino)` | Variant with inline attributes — Finder uses `getattrlistbulk`. |
 | `open` | `open` | — | Always accepts, fh = ino. |
-| `read` | `read` | `apply_read(ino, offset, size)` | Inode buffer (RAM or spool), blob cache, working tree (local-only) or blob at HEAD via a persistent repo handle (a miss populates the cache). Errors become `EIO`. |
+| `read` | `read` | `apply_read(ino, offset, size)` | Inode buffer (RAM or spool); chunked files and regular files of at least 4 MiB by range from the working tree (`RangeReader`, verified once per session); small files from the blob cache or the blob at HEAD via a persistent repo handle (a miss populates the cache). Errors become `EIO`. |
 | `write` | `write` | `apply_write(ino, offset, data)` | Buffer initialized from HEAD; write at offset; updates `entry.size`; marks dirty. |
 | `flush` | `flush` | `apply_flush(ino)` | Enqueues `queue_write` only if dirty; clears the mark; `touch`. |
 | `release` | `release` | — | Only logs. |
@@ -181,9 +181,19 @@ Not implemented (default `ENOSYS`): `mknod`, `fsync`, `fallocate`, `copy_file_ra
 `apply_read` in `src/fs.rs` (the `read` callback delegates). Source order:
 
 1. **Write buffer** of the inode (pending mutations, post-create/rename content not yet committed).
-2. **Blob cache** (`BlobCache`): LRU keyed by inode with a byte budget (`read_cache_mb` in
+2. **Chunked file** (manifest detected by `manifest_for`): `read_chunked` reads, per chunk, only
+   the requested range of the chunk file through `RangeReader`, checking each chunk's SHA-256
+   against the manifest once per session. Mismatch = `EIO`.
+3. **Regular file of at least 4 MiB** (`RANGE_READ_MIN_BYTES`): `read_worktree_range` reads the
+   range from the working-tree copy, checked once against the blob id at HEAD (plus the AEAD tag
+   when sealed). A copy that is not the HEAD version falls back to step 5; a bad tag is `EIO`.
+   Local-only files of that size are read by range without a check (they are outside Git).
+4. **Blob cache** (`BlobCache`): LRU keyed by inode with a byte budget (`read_cache_mb` in
    `config.json`, default 64 MiB; `0` disables). A blob larger than the budget does not enter.
-3. **Blob at HEAD**: reopens the repo and reads; the miss populates the cache.
+5. **Blob at HEAD**: reads through the persistent repo handle; the miss populates the cache.
+
+Steps 2 and 3, the verification rules and the measured numbers are detailed in
+[large-file-reads.md](./large-file-reads.md).
 
 Cache invalidation: full clear at the buffer gc points (`commit_generation` advance and
 post-pull refresh — HEAD changed); per-inode removal on `unlink`, `write`, `truncate` and file
@@ -197,14 +207,14 @@ this, reading the new path before the commit hit a blob that did not exist at HE
 1. **1s TTL** in the kernel masks changes coming from a pull for up to 1 second.
 2. **No FIFOs / real hardlinks** (`link` is a copy). Symlinks are supported: opaque target, never resolved (no-follow); an absolute target breaks on another machine, just like in plain Git.
 3. **Permissions and xattrs in memory** — `chmod` is accepted but does not persist across mounts; `chown` is ignored.
-4. **mtime derived from history** — a file untouched in the session exposes the timestamp of the last commit that touched the path (single revwalk with a 4096-commit ceiling; the residue falls back to the HEAD timestamp). Session touches (flush/setattr) take precedence and do not persist across mounts. `atime`/`ctime`/`crtime` mirror the available mtime.
+4. **mtime derived from history** — a file untouched in the session exposes the timestamp of the last commit that touched the path (single revwalk with a 4096-commit ceiling; the residue falls back to the HEAD timestamp). Session touches (flush/setattr) take precedence and do not persist across mounts. `atime`/`ctime`/`crtime` mirror the available mtime, so an atime-only setattr is dropped.
 5. **Uncommitted writes are lost on a crash** before the debounce drains.
 6. **The implicit swap requires exactly one child file** in the source directory — ambiguity returns `EXDEV` and the app degrades to the copy flow.
-7. **The blob cache does not cover files larger than the budget** (`read_cache_mb`) — their reads go to the repo on every syscall, but through a persistent handle (one open per mount, not one per syscall).
+7. **Files of 4 MiB or more are read from the working tree** — by range, verified once per session; they bypass the blob cache. When the working-tree copy is not the HEAD version, reads fall back to loading the whole blob from the object store (slow for large files; a warning is logged).
 8. **Write buffers above `large_file_threshold_mb` live in a spool** (`.git/git-drive-spool/`) with random access — RAM peak bounded by the threshold; the queue snapshot is applied at drain with `rename`.
 9. **Files ignored by the repo's `.gitignore` are visible local-only** — they appear in the mount, persist in the working tree across remounts and never enter a commit/push.
 10. **An encrypted repo is transparent** — with `encryption_enabled`, indexes are born from the decrypted names, reads open AEAD (wrong key/tampered blob = `EIO`), readlink presents the plaintext target and conflicted copies show the decrypted prefix. Ignore/local-only are disabled in this mode.
-11. **Chunked files are transparent** — a path with a manifest exposes the real size and reads reassembled per chunk (sha256 verified, mismatch = `EIO`); `.chunks/` is invisible in the mount.
+11. **Chunked files are transparent** — a path with a manifest exposes the real size and reads by range per chunk (sha256 verified once per session, mismatch = `EIO`); `.chunks/` is invisible in the mount.
 
 ---
 

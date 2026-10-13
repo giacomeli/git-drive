@@ -172,6 +172,8 @@ End-to-end tests that mount through the FUSE kernel are **manual** — the archi
   and migrations in the drain
 - [docs/fuse-filesystem.md](./docs/fuse-filesystem.md) — hierarchical inode mapping and FUSE
   operations
+- [docs/large-file-reads.md](./docs/large-file-reads.md) — range reads of large files,
+  verification, measured performance on macOS and Linux
 
 Portuguese versions of all docs live under [docs/pt-br/](./docs/pt-br/).
 

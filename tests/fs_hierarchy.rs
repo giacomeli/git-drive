@@ -1164,6 +1164,34 @@ async fn mtime_derived_updates_after_refresh() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn setattr_atime_only_keeps_mtime() {
+    // Finder and Quick Look stamp "last opened" through an atime-only
+    // setattr; it must not pass for a modification.
+    let test = init_repo();
+    common::commit_file_at(&test.repo, "a.txt", b"v1", 1_600_000_000, "add");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("a.txt").unwrap();
+
+    let attr = fs
+        .apply_setattr(ino, None, None, Some(epoch_time(1_800_000_000)), None)
+        .unwrap();
+    assert_eq!(attr.mtime, epoch_time(1_600_000_000), "setattr reply");
+    assert_eq!(
+        fs.apply_getattr(ino).unwrap().mtime,
+        epoch_time(1_600_000_000),
+        "an atime-only setattr must not move the mtime"
+    );
+
+    fs.apply_setattr(ino, None, None, None, Some(epoch_time(1_700_000_000)))
+        .unwrap();
+    assert_eq!(
+        fs.apply_getattr(ino).unwrap().mtime,
+        epoch_time(1_700_000_000),
+        "an explicit mtime still applies"
+    );
+}
+
 // ---- Phase 2.5, Block E: content shared between buffer and queue ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1361,6 +1389,63 @@ async fn chunked_file_exposes_real_size_and_reads_reassembled() {
         "read crossing a chunk boundary"
     );
     assert_eq!(fs.apply_read(ino, 240, 100).unwrap(), payload[240..].to_vec());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn setattr_times_on_chunked_file_reports_real_size() {
+    // The kernel caches the setattr reply for the TTL: a manifest-sized
+    // reply made the file shrink to a few hundred bytes (reads past it hit
+    // EOF) whenever Finder or Quick Look stamped its times.
+    let test = init_repo();
+    commit_chunked(&test.repo, "big.bin", &chunk_payload(), 100);
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("big.bin").unwrap();
+
+    let now = std::time::SystemTime::now();
+    let attr = fs.apply_setattr(ino, None, None, Some(now), Some(now)).unwrap();
+    assert_eq!(attr.size, 250, "setattr must reply with the REAL size, not the manifest's");
+    let attr = fs.apply_setattr(ino, Some(0o600), None, None, None).unwrap();
+    assert_eq!(attr.size, 250, "chmod reply");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn interleaved_reads_across_chunks_read_each_chunk_once() {
+    // Concurrent readers (Quick Look, thumbnailer, a player jumping between
+    // moov and mdat) interleave requests on different chunks. A one-slot
+    // chunk cache reloaded (disk + hash + decrypt) a whole chunk on every
+    // switch — 0.5 s per 80 MB chunk, with the FUSE loop blocked.
+    let test = init_repo();
+    let payload = chunk_payload();
+    commit_chunked(&test.repo, "big.bin", &payload, 100);
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("big.bin").unwrap();
+
+    for _ in 0..3 {
+        assert_eq!(fs.apply_read(ino, 10, 5).unwrap(), payload[10..15].to_vec());
+        assert_eq!(fs.apply_read(ino, 210, 5).unwrap(), payload[210..215].to_vec());
+    }
+    assert_eq!(
+        fs.range_verifications_for_test(),
+        2,
+        "each chunk is read whole (verified) once, not on every switch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn chunk_damaged_after_first_read_is_eio() {
+    let test = init_repo();
+    let payload = chunk_payload();
+    let m = commit_chunked(&test.repo, "big.bin", &payload, 100);
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("big.bin").unwrap();
+    assert_eq!(fs.apply_read(ino, 100, 10).unwrap(), payload[100..110].to_vec());
+
+    std::fs::write(test.dir.path().join(shard_rel_path(&m.hashes[1])), b"damaged").unwrap();
+    assert_eq!(
+        fs.apply_read(ino, 100, 10),
+        Err(libc::EIO),
+        "a chunk changed on disk after its check is checked again"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1630,10 +1715,28 @@ async fn encrypted_chunked_file_reads_reassembled_plaintext() {
     // Tampered chunk: the ciphertext hash detects it before decrypting
     let victim = workdir.join(shard_rel_path(&manifest.hashes[1]));
     std::fs::write(&victim, b"lixo").unwrap();
-    fs.refresh_if_needed(); // clears the last-chunk cache? direct read:
+    // A fresh mount checks the chunk on its first read:
     let mut fs2 = new_encrypted_fs(test.dir.path().to_str().unwrap(), crypto);
     let ino2 = fs2.find_inode("grande.bin").unwrap();
     assert_eq!(fs2.apply_read(ino2, 100, 100), Err(libc::EIO));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn encrypted_manifest_with_cleartext_chunks_reads_correctly() {
+    // Mixed state mid-migration: sealed manifest, chunks still in the clear.
+    let test = init_repo();
+    let crypto = fs_crypto();
+    let workdir = test.repo.workdir().unwrap();
+    let payload: Vec<u8> = (0..250u32).map(|i| (i % 251) as u8).collect();
+    let manifest = chunk_reader_into_repo(&mut payload.as_slice(), 100, workdir).unwrap();
+    let cipher_rel = crypto.enc_path("misto.bin");
+    std::fs::write(workdir.join(&cipher_rel), crypto.seal(&manifest.serialize())).unwrap();
+    commit_all(&test.repo, "add misto");
+
+    let mut fs = new_encrypted_fs(test.dir.path().to_str().unwrap(), crypto);
+    let ino = fs.find_inode("misto.bin").unwrap();
+    assert_eq!(fs.apply_getattr(ino).unwrap().size, 250);
+    assert_eq!(fs.apply_read(ino, 90, 20).unwrap(), payload[90..110].to_vec());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1668,4 +1771,95 @@ async fn encrypted_conflicted_copy_shows_clear_prefix() {
         .find_inode("nota.txt.conflict-mac-99")
         .expect("decrypted prefix + clear suffix");
     assert_eq!(fs.apply_read(ino, 0, 100).unwrap(), b"versao local".to_vec());
+}
+
+// ---- Range reads of large files from the working tree ----
+
+/// Above the range-read threshold (4 MiB).
+fn large_payload() -> Vec<u8> {
+    (0..5 * 1024 * 1024u32).map(|i| (i.wrapping_mul(131) + 17) as u8).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn large_committed_file_reads_by_range_after_one_check() {
+    // Above the blob cache budget, every read used to load and inflate the
+    // whole blob from the object store (21.5 s per MiB on a 70 MB video).
+    let test = init_repo();
+    let payload = large_payload();
+    commit_file(&test.repo, "video.mp4", &payload, "add video");
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("video.mp4").unwrap();
+
+    for off in [0usize, 4_000_000, 1_000, 5 * 1024 * 1024 - 10] {
+        assert_eq!(
+            fs.apply_read(ino, off, 64 * 1024).unwrap(),
+            payload[off..(off + 64 * 1024).min(payload.len())].to_vec()
+        );
+    }
+    assert_eq!(fs.range_verifications_for_test(), 1, "checked once, then read by range");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn large_file_diverging_from_head_serves_head_content() {
+    // Working tree edited behind the drive's back (or mid-checkout): the
+    // range read must not serve it as the committed version.
+    let test = init_repo();
+    let payload = large_payload();
+    commit_file(&test.repo, "video.mp4", &payload, "add video");
+    std::fs::write(test.dir.path().join("video.mp4"), vec![0u8; payload.len()]).unwrap();
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("video.mp4").unwrap();
+    assert_eq!(fs.apply_read(ino, 1000, 100).unwrap(), payload[1000..1100].to_vec());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn encrypted_large_file_reads_plaintext_by_range() {
+    let test = init_repo();
+    let crypto = fs_crypto();
+    let payload = large_payload();
+    commit_encrypted_file(&test.repo, &crypto, "aulas/video.mp4", &payload);
+    let mut fs = new_encrypted_fs(test.dir.path().to_str().unwrap(), crypto);
+    let ino = fs.find_inode("aulas/video.mp4").unwrap();
+
+    assert_eq!(fs.apply_getattr(ino).unwrap().size, payload.len() as u64);
+    for off in [3_000_000usize, 17, 5 * 1024 * 1024 - 100] {
+        assert_eq!(
+            fs.apply_read(ino, off, 4096).unwrap(),
+            payload[off..(off + 4096).min(payload.len())].to_vec()
+        );
+    }
+    assert_eq!(fs.range_verifications_for_test(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn encrypted_large_file_with_bad_tag_is_eio() {
+    // A tampered blob committed (e.g. pushed to the remote by someone without
+    // the key) matches its own blob id; the tag check must still refuse it.
+    let test = init_repo();
+    let crypto = fs_crypto();
+    let workdir = test.repo.workdir().unwrap();
+    let enc = crypto.enc_path_full("video.mp4");
+    let mut sealed = crypto.seal(&large_payload());
+    sealed[1_000_000] ^= 0x01;
+    std::fs::write(workdir.join(&enc.disk), &sealed).unwrap();
+    for sc in &enc.sidecars {
+        std::fs::write(workdir.join(&sc.path), sc.content.as_bytes()).unwrap();
+    }
+    commit_all(&test.repo, "add tampered");
+
+    let mut fs = new_encrypted_fs(test.dir.path().to_str().unwrap(), crypto);
+    let ino = fs.find_inode("video.mp4").unwrap();
+    assert_eq!(fs.apply_read(ino, 0, 100), Err(libc::EIO));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn large_local_only_file_reads_by_range() {
+    let test = init_repo();
+    commit_file(&test.repo, ".gitignore", b"*.iso\n", "add gitignore");
+    let payload = large_payload();
+    std::fs::write(test.dir.path().join("disco.iso"), &payload).unwrap();
+    let mut fs = new_fs(test.dir.path().to_str().unwrap(), "main");
+    let ino = fs.find_inode("disco.iso").unwrap();
+    assert_eq!(fs.apply_read(ino, 2_000_000, 300).unwrap(), payload[2_000_000..2_000_300].to_vec());
+    assert_eq!(fs.range_verifications_for_test(), 0, "local-only content has nothing to check against");
 }

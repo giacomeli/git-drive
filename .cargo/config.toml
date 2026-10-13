@@ -1,0 +1,10 @@
+# chacha20 0.9 only enables its NEON backend on aarch64 under this cfg: 2x the
+# keystream throughput measured on an M1 (643 -> 1208 MB/s), which bounds range
+# decryption of large files. x86_64 picks AVX2 at runtime without any flag.
+# The sealed format is pinned by `crypt::tests::sealed_format_known_answer`:
+# a backend that changed one byte would fail there before reaching a repo.
+[target.aarch64-apple-darwin]
+rustflags = ["--cfg", "chacha20_force_neon"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["--cfg", "chacha20_force_neon"]

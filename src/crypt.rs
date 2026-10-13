@@ -7,8 +7,11 @@
 //! dedup and blob stability in Git. Decisions recorded in the Phase 2.7 planning notes (internal,
 //! kept outside the repository).
 
+use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
+use poly1305::universal_hash::UniversalHash;
+use poly1305::Poly1305;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -22,6 +25,13 @@ pub const CONTENT_MAGIC: &[u8] = b"drive-sync-encrypted v1\n";
 
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
+/// Bytes before the ciphertext in a sealed blob: magic + nonce.
+pub const SEALED_HEADER_LEN: usize = CONTENT_MAGIC.len() + NONCE_LEN;
+/// Bytes after the ciphertext in a sealed blob: the Poly1305 tag.
+pub const SEALED_TAG_LEN: usize = TAG_LEN;
+/// XChaCha20-Poly1305 spends keystream block 0 on the Poly1305 key; the
+/// content is encrypted from this keystream offset on.
+const CONTENT_KEYSTREAM_START: u64 = 64;
 /// Maximum length of an encrypted component ON DISK before it collapses into
 /// a hashed `dslong_` entry. The binding limit is NOT the per-component
 /// NAME_MAX (255): it is macOS's PATH_MAX of 1024 bytes for the FULL path.
@@ -54,6 +64,9 @@ const BASE32_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 type HmacSha256 = Hmac<Sha256>;
 
 pub struct Crypto {
+    /// Raw content subkey, kept for range decryption and the streaming tag
+    /// check (`content_cipher` only exposes whole-blob AEAD).
+    content_key: [u8; 32],
     content_cipher: XChaCha20Poly1305,
     name_cipher: XChaCha20Poly1305,
     content_nonce_key: [u8; 32],
@@ -123,6 +136,7 @@ impl Crypto {
             .expect("hkdf");
         hk.expand(b"name-nonce-key", &mut name_nonce_key).expect("hkdf");
         Crypto {
+            content_key,
             content_cipher: XChaCha20Poly1305::new((&content_key).into()),
             name_cipher: XChaCha20Poly1305::new((&name_key).into()),
             content_nonce_key,
@@ -173,6 +187,40 @@ impl Crypto {
         self.content_cipher
             .decrypt(XNonce::from_slice(nonce), ct)
             .map_err(|_| CryptError::OpenFailed)
+    }
+
+    /// Nonce of a sealed blob from its first `SEALED_HEADER_LEN` bytes.
+    /// `None` without the magic (cleartext content) or with a short header.
+    pub fn sealed_nonce(header: &[u8]) -> Option<[u8; NONCE_LEN]> {
+        let body = header.strip_prefix(CONTENT_MAGIC)?;
+        body.get(..NONCE_LEN)?.try_into().ok()
+    }
+
+    /// Decrypts, in place, the ciphertext bytes that start at plaintext
+    /// `offset` of a blob sealed with `nonce` — the same keystream `open`
+    /// applies, positioned past the Poly1305 key block. Does NOT authenticate:
+    /// callers serve ranges only from content whose tag (`tag_verifier`) or
+    /// hash was checked first.
+    pub fn decrypt_range_in_place(&self, nonce: &[u8; NONCE_LEN], offset: u64, buf: &mut [u8]) {
+        let mut cipher = chacha20::XChaCha20::new((&self.content_key).into(), nonce.into());
+        cipher.seek(CONTENT_KEYSTREAM_START + offset);
+        cipher.apply_keystream(buf);
+    }
+
+    /// Streaming check of a sealed blob's tag: feed the ciphertext (the
+    /// bytes between the header and the tag) in pieces of any size, then
+    /// `verify` the tag. Same Poly1305 construction as `open` (RFC 8439,
+    /// empty AAD), without holding the blob in memory.
+    pub fn tag_verifier(&self, nonce: &[u8; NONCE_LEN]) -> SealedTagVerifier {
+        let mut cipher = chacha20::XChaCha20::new((&self.content_key).into(), nonce.into());
+        let mut mac_key = poly1305::Key::default();
+        cipher.apply_keystream(&mut mac_key);
+        SealedTagVerifier {
+            mac: Poly1305::new(&mac_key),
+            pending: [0u8; 16],
+            pending_len: 0,
+            ct_len: 0,
+        }
     }
 
     /// Encrypts a name component: deterministic AEAD + lowercase base32.
@@ -351,6 +399,53 @@ impl Crypto {
         }
         // Literal fallback: mixed state during migration and internal artifacts.
         component.to_string()
+    }
+}
+
+/// Incremental Poly1305 over a sealed blob's ciphertext (`Crypto::tag_verifier`).
+pub struct SealedTagVerifier {
+    mac: Poly1305,
+    /// Ciphertext bytes short of a full 16-byte block, carried to the next
+    /// `update` — padding mid-stream would change the tag.
+    pending: [u8; 16],
+    pending_len: usize,
+    ct_len: u64,
+}
+
+impl SealedTagVerifier {
+    pub fn update(&mut self, mut ct: &[u8]) {
+        self.ct_len += ct.len() as u64;
+        if self.pending_len > 0 {
+            let take = (16 - self.pending_len).min(ct.len());
+            self.pending[self.pending_len..self.pending_len + take].copy_from_slice(&ct[..take]);
+            self.pending_len += take;
+            ct = &ct[take..];
+            if self.pending_len < 16 {
+                return;
+            }
+            self.mac.update_padded(&self.pending);
+            self.pending_len = 0;
+        }
+        let aligned = ct.len() - ct.len() % 16;
+        // A whole number of blocks: `update_padded` adds no padding here.
+        self.mac.update_padded(&ct[..aligned]);
+        let rest = &ct[aligned..];
+        self.pending[..rest.len()].copy_from_slice(rest);
+        self.pending_len = rest.len();
+    }
+
+    /// `true` if `tag` authenticates everything fed so far (constant-time
+    /// comparison).
+    pub fn verify(mut self, tag: &[u8]) -> bool {
+        if tag.len() != TAG_LEN {
+            return false;
+        }
+        self.mac.update_padded(&self.pending[..self.pending_len]);
+        let mut lengths = poly1305::Block::default();
+        // AAD length (always 0 here) || ciphertext length, both u64 LE.
+        lengths[8..].copy_from_slice(&self.ct_len.to_le_bytes());
+        self.mac.update(&[lengths]);
+        self.mac.verify(poly1305::Block::from_slice(tag)).is_ok()
     }
 }
 
@@ -535,6 +630,100 @@ mod tests {
         assert_ne!(c.seal(b"one"), c.seal(b"other"));
         // Different keys diverge even for identical plaintext
         assert_ne!(crypto().seal(b"x"), other_crypto().seal(b"x"));
+    }
+
+    /// Known-answer test: pins the sealed bytes and the encrypted name of a
+    /// fixed input. Machines sharing a repo build different cipher backends
+    /// (NEON on aarch64, AVX2 or soft on x86_64); a backend or construction
+    /// change that alters one byte breaks every existing encrypted repo and
+    /// must fail here first.
+    #[test]
+    fn sealed_format_known_answer() {
+        let c = crypto();
+        let plain: Vec<u8> = (0..300u32).map(|i| (i * 31 + 7) as u8).collect();
+        assert_eq!(
+            crate::chunk::sha256_hex(&c.seal(&plain)),
+            "b4ead9390758f2dcbd48fe18af7b85fc24c37dee21c8ff3c72a5cdeef21d5b70"
+        );
+        assert_eq!(
+            c.enc_path("docs/relatorio final.pdf"),
+            "ovz4fqsk64u5m22mpj3uuctqxj45fs42cybngfagcsjq3xfne5lmckcltagel7dbz5slwby/dslong_zrciyxeiksqatpx5dgubn52wpro7yeju"
+        );
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 131 + 17) as u8).collect()
+    }
+
+    #[test]
+    fn decrypt_range_matches_open_at_any_offset() {
+        let c = crypto();
+        for len in [0usize, 1, 15, 16, 63, 64, 65, 200, 4096 + 33] {
+            let plain = pattern(len);
+            let sealed = c.seal(&plain);
+            let nonce = Crypto::sealed_nonce(&sealed[..SEALED_HEADER_LEN]).unwrap();
+            let ct = &sealed[SEALED_HEADER_LEN..sealed.len() - SEALED_TAG_LEN];
+            assert_eq!(ct.len(), len, "ciphertext is as long as the plaintext");
+            for (off, n) in [(0, len), (1, 7), (63, 2), (64, 64), (100, 1000), (len / 2, len)] {
+                let off = off.min(len);
+                let end = (off + n).min(len);
+                let mut buf = ct[off..end].to_vec();
+                c.decrypt_range_in_place(&nonce, off as u64, &mut buf);
+                assert_eq!(buf, plain[off..end], "len {} range {}..{}", len, off, end);
+            }
+        }
+    }
+
+    #[test]
+    fn sealed_nonce_requires_magic_and_full_header() {
+        let sealed = crypto().seal(b"x");
+        assert_eq!(
+            Crypto::sealed_nonce(&sealed[..SEALED_HEADER_LEN]).unwrap(),
+            sealed[CONTENT_MAGIC.len()..SEALED_HEADER_LEN]
+        );
+        assert_eq!(Crypto::sealed_nonce(&sealed[..SEALED_HEADER_LEN - 1]), None);
+        assert_eq!(Crypto::sealed_nonce(b"plain content, no magic at all here..."), None);
+    }
+
+    /// Feeds the ciphertext in pieces of `step` bytes.
+    fn tag_ok(c: &Crypto, sealed: &[u8], step: usize) -> bool {
+        let Some(nonce) = Crypto::sealed_nonce(sealed) else {
+            return false;
+        };
+        let body = &sealed[SEALED_HEADER_LEN..];
+        let (ct, tag) = body.split_at(body.len() - SEALED_TAG_LEN);
+        let mut v = c.tag_verifier(&nonce);
+        for piece in ct.chunks(step.max(1)) {
+            v.update(piece);
+        }
+        v.verify(tag)
+    }
+
+    #[test]
+    fn tag_verifier_accepts_sealed_blob_in_any_piece_size() {
+        let c = crypto();
+        for len in [0usize, 1, 15, 16, 17, 100, 4096 + 33] {
+            let sealed = c.seal(&pattern(len));
+            for step in [1, 3, 16, 17, 1000, 1 << 20] {
+                assert!(tag_ok(&c, &sealed, step), "len {} step {}", len, step);
+            }
+        }
+    }
+
+    #[test]
+    fn tag_verifier_rejects_any_altered_byte_and_wrong_key() {
+        let c = crypto();
+        let sealed = c.seal(&pattern(300));
+        // Every byte after the magic: nonce, ciphertext and tag.
+        for i in CONTENT_MAGIC.len()..sealed.len() {
+            let mut bad = sealed.clone();
+            bad[i] ^= 0x01;
+            assert!(!tag_ok(&c, &bad, 17), "flipped byte {} must fail", i);
+        }
+        assert!(!tag_ok(&other_crypto(), &sealed, 17));
+        let mut v = c.tag_verifier(&Crypto::sealed_nonce(&sealed).unwrap());
+        v.update(&sealed[SEALED_HEADER_LEN..sealed.len() - SEALED_TAG_LEN]);
+        assert!(!v.verify(&[0u8; 15]), "a short tag never verifies");
     }
 
     #[test]
