@@ -136,6 +136,27 @@ fn gui_domain() -> String {
     format!("gui/{}", unsafe { libc::getuid() })
 }
 
+/// `launchctl bootout` and WAIT until the label has left the domain.
+/// bootout returns while the old daemon is still stopping (unmount + final
+/// drain can take seconds, up to ExitTimeOut); a bootstrap issued in that
+/// window fails with "Bootstrap failed: 5: Input/output error" and leaves
+/// the drive with no agent at all (seen re-installing over a live daemon).
+fn bootout_and_wait(label: &str) {
+    let target = format!("{}/{}", gui_domain(), label);
+    let _ = launchctl(&["bootout", &target]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while std::time::Instant::now() < deadline {
+        let still_there = launchctl(&["print", &target])
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !still_there {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    log::warn!("install: {} still registered after 90 s — bootstrapping anyway", label);
+}
+
 /// Installs the LaunchAgent: resolves absolute paths, prepares standard
 /// directories, copies the config if needed, writes the plist and registers
 /// it with launchd. `with_tray` registers a second agent that starts the tray
@@ -165,13 +186,13 @@ pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
 
     // Pre-rename agents: take down and remove so they never race the new ones.
     for legacy in LEGACY_LABELS {
-        let _ = launchctl(&["bootout", &format!("{}/{}", gui_domain(), legacy)]);
+        bootout_and_wait(legacy);
         let _ = std::fs::remove_file(launch_agents_dir().join(format!("{legacy}.plist")));
     }
 
     // Idempotent re-install: takes down the previous instance (if any) before
     // registering again. bootout of a nonexistent agent fails — ignored.
-    let _ = launchctl(&["bootout", &format!("{}/{}", gui_domain(), LABEL)]);
+    bootout_and_wait(LABEL);
     let out = launchctl(&["bootstrap", &gui_domain(), plist_path.to_str().unwrap()])?;
     if !out.status.success() {
         anyhow::bail!(
@@ -184,7 +205,7 @@ pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
         let tray_plist = render_tray_plist(&binary, &status_file);
         let tray_path = tray_plist_path();
         std::fs::write(&tray_path, tray_plist)?;
-        let _ = launchctl(&["bootout", &format!("{}/{}", gui_domain(), TRAY_LABEL)]);
+        bootout_and_wait(TRAY_LABEL);
         let out = launchctl(&["bootstrap", &gui_domain(), tray_path.to_str().unwrap()])?;
         if !out.status.success() {
             log::error!(
