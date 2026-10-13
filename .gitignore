@@ -17,3 +17,4 @@ specs/
 # security audit stays local -- not published
 docs/security-audit.md
 docs/pt-br/auditoria-seguranca.md
+ssh_session_logs/

@@ -1,6 +1,6 @@
 [package]
 name = "git-drive"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Mount a Git repository as a filesystem: a FUSE drive with automatic bidirectional Git sync"
 license = "MIT"
