@@ -1863,3 +1863,26 @@ async fn large_local_only_file_reads_by_range() {
     assert_eq!(fs.apply_read(ino, 2_000_000, 300).unwrap(), payload[2_000_000..2_000_300].to_vec());
     assert_eq!(fs.range_verifications_for_test(), 0, "local-only content has nothing to check against");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async
+fn boot_index_waits_for_the_repo_lock() {
+    // The boot decrypts names by reading sidecars from the working tree.
+    // The pull watcher's first fast-forward rewrote them meanwhile: a
+    // directory and a file under it decoded differently and the boot
+    // panicked ("file parent must exist", Mac drive 2026-10-14). The boot
+    // listing must hold the repo lock the pull and the drain take.
+    let test = init_repo();
+    commit_file(&test.repo, "foo/bar.txt", b"x", "add bar");
+    let path = test.dir.path().to_str().unwrap().to_string();
+    let sync = SyncManager::new(&path, 5);
+    let holder = sync.clone();
+    let guard = holder.lock_repo();
+    let handle = std::thread::spawn(move || {
+        GitDriveFS::new(&path, "main".to_string(), sync).map(|fs| fs.file_count())
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!handle.is_finished(), "the boot listing must wait for the repo lock");
+    drop(guard);
+    assert_eq!(handle.join().unwrap().unwrap(), 1);
+}

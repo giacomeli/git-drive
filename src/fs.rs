@@ -374,6 +374,12 @@ impl GitDriveFS {
         crypto: Option<Arc<crate::crypt::Crypto>>,
     ) -> anyhow::Result<Self> {
         let t0 = std::time::Instant::now();
+        // Names are decrypted from sidecars in the WORKING TREE: a pull
+        // rewriting it meanwhile made a directory and a file under it decode
+        // differently, and the boot panicked on the orphan file (Mac drive,
+        // 2026-10-14). The repo lock keeps the pull and the drain out until
+        // the listing is consistent.
+        let repo_guard = sync.lock_repo();
         let repo = git::open_repo(repo_path)?;
         let commit = git::get_commit(&repo, "HEAD")?;
         let dirs = git::list_dirs_at_commit(&repo, &commit)?;
@@ -382,6 +388,7 @@ impl GitDriveFS {
         let t_list = t0.elapsed();
         let (dirs, files, name_cache) =
             decrypt_listing_cached(crypto.as_deref(), repo_path, dirs, files, &HashMap::new());
+        drop(repo_guard);
         let t_decrypt = t0.elapsed();
         let n_files = files.len();
 

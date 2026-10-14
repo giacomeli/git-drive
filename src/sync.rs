@@ -297,6 +297,12 @@ impl SyncManager {
         }
     }
 
+    /// Holds the repo lock: no drain or pull rewrites the working tree
+    /// until the guard drops.
+    pub fn lock_repo(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.repo_lock.lock()
+    }
+
     /// Drains the queue NOW, synchronously (apply + commit + push, under the
     /// `repo_lock`). Used during clean shutdown: after the unmount, it
     /// guarantees no queued op is lost when the process dies.
@@ -416,6 +422,16 @@ impl SyncManager {
                         continue;
                     }
                 };
+
+                // An update a crash or I/O error cut short is finished or
+                // undone before the clean-tree check: its half-moved index
+                // reads as "dirty", and an idle machine (no local write, so
+                // no drain) would skip every pull from then on.
+                match git::recover_interrupted_update(&repo) {
+                    Ok(true) => refresh_flag.store(true, Ordering::SeqCst),
+                    Ok(false) => {}
+                    Err(e) => log::error!("pull: recovering an interrupted update failed: {}", e),
+                }
 
                 // RF6 guard: merge/checkout force only with a clean working
                 // tree. A dirty tree = local changes not yet committed
@@ -707,6 +723,7 @@ impl DrainCtx {
         }
         let mut last_commit: Option<git2::Oid> = None;
         let mut commits_created = 0usize;
+        let mut commit_error: Option<String> = None;
         for (i, batch) in batches.into_iter().enumerate() {
             // Apply in arrival order — the queue is already causal. With
             // encryption, the cleartext->encrypted translation of paths and
@@ -788,14 +805,20 @@ impl DrainCtx {
                     crypto.as_deref().or(migration_crypto.as_deref()),
                 );
             }
-            let commit_oid = commit_batch(
+            let commit_oid = match commit_batch(
                 &self.repo_path,
                 &self.branch,
                 &self.user_name,
                 &self.user_email,
                 &ops,
                 crypto.is_some(),
-            );
+            ) {
+                Ok(oid) => oid,
+                Err(reason) => {
+                    commit_error = Some(reason);
+                    None
+                }
+            };
             // The tree is conforming now: record it, so the next drain only
             // sweeps what changes after this HEAD. Without a commit, only a
             // clean tree (nothing to commit) proves HEAD itself conforms.
@@ -845,13 +868,22 @@ impl DrainCtx {
         // Every taken op is now applied and committed (or applied without a
         // commit in identity-less mode — the working tree holds it): its
         // journal records are no longer needed. Still under the repo lock, so
-        // no pull can land between the commit and this cleanup.
-        if let Some(boundary) = journal_boundary {
-            let journal = self.inner.lock().journal.clone();
-            if let Some(j) = journal {
-                j.truncate_through(boundary);
+        // no pull can land between the commit and this cleanup. A commit that
+        // FAILED keeps them: the working tree may be the inconsistent one the
+        // guard refused, and a repair by checkout would wipe the writes.
+        if let Some(reason) = &commit_error {
+            log::error!("drain: commit blocked — journal kept: {}", reason);
+            self.notifier.notify(NotifyEvent::CommitFailed);
+        } else {
+            self.notifier.reset(notify::KEY_COMMIT_FAILED);
+            if let Some(boundary) = journal_boundary {
+                let journal = self.inner.lock().journal.clone();
+                if let Some(j) = journal {
+                    j.truncate_through(boundary);
+                }
             }
         }
+        self.status.set_commit_blocked(commit_error);
 
         // Phase B (publish): push commit by commit — every pack stays around
         // one batch. A mid-catch-up failure leaves the remote on an
@@ -1353,33 +1385,33 @@ fn commit_batch(
     user_email: &Option<String>,
     ops: &[&SyncOp],
     redact_paths: bool,
-) -> Option<git2::Oid> {
+) -> Result<Option<git2::Oid>, String> {
     let (Some(name), Some(email)) = (user_name.as_deref(), user_email.as_deref()) else {
         log::warn!(
             "commit: user_name/user_email missing — skipping commit"
         );
-        return None;
+        return Ok(None);
     };
     let repo = match git::open_repo(repo_path.to_str().unwrap_or("")) {
         Ok(r) => r,
         Err(e) => {
             log::error!("commit: error opening repo: {}", e);
-            return None;
+            return Err(e.message().to_string());
         }
     };
     let message = build_commit_message(ops, redact_paths);
     match git::commit_working_tree(&repo, branch, name, email, &message) {
         Ok(Some(oid)) => {
             log::info!("commit: created {}", oid);
-            Some(oid)
+            Ok(Some(oid))
         }
         Ok(None) => {
             log::info!("commit: clean tree, nothing to commit");
-            None
+            Ok(None)
         }
         Err(e) => {
             log::error!("commit: error: {}", e);
-            None
+            Err(e.message().to_string())
         }
     }
 }

@@ -14,6 +14,7 @@ const RATE_LIMIT_SECS: u64 = 3600;
 
 pub const KEY_PULL_BLOCKED: &str = "pull_blocked";
 pub const KEY_PUSH_FAILED: &str = "push_failed";
+pub const KEY_COMMIT_FAILED: &str = "commit_failed";
 
 #[derive(Debug, Clone)]
 pub enum NotifyEvent {
@@ -27,6 +28,9 @@ pub enum NotifyEvent {
     Stopped,
     /// Pull skipped due to dirty working tree (persistent, rate-limited).
     PullBlocked,
+    /// The drain could not commit (persistent, rate-limited): writes are
+    /// applied and journaled but not committed.
+    CommitFailed,
 }
 
 impl NotifyEvent {
@@ -37,6 +41,7 @@ impl NotifyEvent {
             // Persistent too: while offline every drain and every pull cycle
             // retries the push — one notification per hour, not per minute.
             NotifyEvent::PushFailed => Some(KEY_PUSH_FAILED),
+            NotifyEvent::CommitFailed => Some(KEY_COMMIT_FAILED),
             _ => None,
         }
     }
@@ -80,6 +85,10 @@ pub fn format_event(event: &NotifyEvent) -> (String, String) {
         NotifyEvent::PullBlocked => (
             "git-drive: pull blocked".to_string(),
             "Uncommitted local changes are blocking the pull (identity-less mode?). Sync is one-way for now.".to_string(),
+        ),
+        NotifyEvent::CommitFailed => (
+            "git-drive: commit blocked".to_string(),
+            "Local changes are saved but not committed or synced. See git-drive status and the log.".to_string(),
         ),
     }
 }
@@ -216,6 +225,15 @@ mod tests {
         assert!(title.contains("conflict"));
         assert!(body.contains("f0.conflict-h-1"));
         assert!(body.contains("(+2)"), "{}", body);
+    }
+
+    #[test]
+    fn commit_failed_is_a_persistent_event_pointing_to_status() {
+        let ev = NotifyEvent::CommitFailed;
+        assert_eq!(ev.persistent_key(), Some(KEY_COMMIT_FAILED));
+        let (title, body) = format_event(&ev);
+        assert!(title.contains("commit"), "{}", title);
+        assert!(body.contains("git-drive status"), "{}", body);
     }
 
     #[test]

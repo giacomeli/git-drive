@@ -1,5 +1,5 @@
 use git2::{Repository, ObjectType, Error};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 
 pub fn open_repo(path: &str) -> Result<Repository, Error> {
@@ -106,7 +106,30 @@ pub fn commit_working_tree(
     user_email: &str,
     message: &str,
 ) -> Result<Option<git2::Oid>, Error> {
+    // An update a crash or I/O error cut short is finished or undone first,
+    // so the guard below only sees states no git-drive update explains.
+    recover_interrupted_update(repo)?;
     let mut index = repo.index()?;
+    // libgit2 keeps one index per repository handle: drop whatever an earlier
+    // failed attempt staged in memory and start from the on-disk one.
+    index.read(true)?;
+    // The index holds the tree the working tree was last synced to. When it
+    // is not HEAD's, the working tree sits between two commits (a checkout
+    // or merge that died midway): its difference to HEAD is not a local
+    // edit, and committing it reverts HEAD's changes. The 2026-10-14
+    // incident would have committed and pushed 18k deletions this way.
+    if let Ok(head_tree) = repo.head().and_then(|h| h.peel_to_tree()) {
+        let index_tree = index.write_tree()?;
+        if index_tree != head_tree.id() {
+            return Err(Error::from_str(&format!(
+                "index tree {} does not match HEAD's tree {}: the working tree was left \
+                 between two commits (interrupted checkout or merge) — refusing to commit, \
+                 it would revert HEAD's changes",
+                index_tree,
+                head_tree.id()
+            )));
+        }
+    }
     // Callback that skips nested `.git/` paths when the user pastes a complete
     // git repository inside the mount (e.g. `athena-docs/` with `.git/objects/...`).
     // Without the filter, libgit2 treats `athena-docs/` as a submodule with no
@@ -131,21 +154,36 @@ pub fn commit_working_tree(
         git2::IndexAddOption::DEFAULT,
         Some(&mut filter),
     )?;
-    index.write()?;
     let tree_id = index.write_tree()?;
     let tree = repo.find_tree(tree_id)?;
 
     let parent_commit = repo.head()?.peel_to_commit().ok();
     if let Some(ref parent) = parent_commit {
         if parent.tree_id() == tree_id {
+            index.write()?;
             return Ok(None);
         }
     }
 
     let sig = git2::Signature::now(user_name, user_email)?;
     let parents: Vec<&git2::Commit> = parent_commit.as_ref().map(|c| vec![c]).unwrap_or_default();
-    let ref_name = format!("refs/heads/{}", branch);
-    let oid = repo.commit(Some(&ref_name), &sig, &sig, message, &tree, &parents)?;
+    let oid = repo.commit(None, &sig, &sig, message, &tree, &parents)?;
+    // Index first, ref last, under the update marker: a failed index write
+    // leaves HEAD untouched (the next drain retries); a failed ref move
+    // leaves the marker, and recovery completes it.
+    begin_update(repo, UpdateKind::Commit, oid)?;
+    if let Err(e) = index.write() {
+        end_update(repo);
+        return Err(e);
+    }
+    let summary = message.lines().next().unwrap_or("");
+    repo.reference(
+        &format!("refs/heads/{}", branch),
+        oid,
+        true,
+        &format!("commit: {}", summary),
+    )?;
+    end_update(repo);
     Ok(Some(oid))
 }
 
@@ -733,15 +771,227 @@ pub fn merge_ff_only(repo: &Repository, branch: &str) -> Result<bool, Error> {
         ));
     }
 
-    let local_ref_name = format!("refs/heads/{}", branch);
-    let mut local_ref = repo.find_reference(&local_ref_name)?;
-    let target_oid = fetch_commit.id();
-    local_ref.set_target(target_oid, "git-drive: fast-forward")?;
-    repo.set_head(&local_ref_name)?;
-    repo.checkout_head(Some(
-        git2::build::CheckoutBuilder::default().force(),
-    ))?;
+    fast_forward(repo, fetch_commit.id())?;
     Ok(true)
+}
+
+/// Advances `refs/heads/<branch>` to `target`: working tree and index first,
+/// the ref last, and a checkout that fails midway is rolled back — HEAD never
+/// points at a tree the working tree did not reach. Moving the ref first is
+/// what turned the 2026-10-14 checkout failure (a path too long for macOS)
+/// into a half-written tree that looked like 18k local deletions.
+fn fast_forward(repo: &Repository, target: git2::Oid) -> Result<(), Error> {
+    let commit = repo.find_commit(target)?;
+    let tree = commit.tree()?;
+    ensure_materializable(repo, &tree)?;
+    begin_update(repo, UpdateKind::Checkout, target)?;
+    let advanced = repo
+        .checkout_tree(
+            commit.as_object(),
+            Some(git2::build::CheckoutBuilder::new().force()),
+        )
+        .and_then(|()| move_head_branch(repo, target, "git-drive: fast-forward"));
+    if let Err(e) = advanced {
+        if rollback_to_head(repo, &tree) {
+            end_update(repo);
+        }
+        return Err(e);
+    }
+    end_update(repo);
+    Ok(())
+}
+
+/// `.git/git-drive-update`: the commit an update is moving HEAD to. Every
+/// update writes it first, then the working tree and index, and moves the ref
+/// last — a crash or I/O error in between leaves the marker behind for
+/// `recover_interrupted_update`. Without it, an index that differs from HEAD
+/// is indistinguishable from the 2026-10-14 incident and the commit guard
+/// would refuse forever.
+const UPDATE_MARKER: &str = "git-drive-update";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateKind {
+    /// A local commit: the working tree holds the user's edits, never undone.
+    Commit,
+    /// A fast-forward or merge checkout: the working tree may be half written.
+    Checkout,
+}
+
+fn begin_update(repo: &Repository, kind: UpdateKind, target: git2::Oid) -> Result<(), Error> {
+    let kind = match kind {
+        UpdateKind::Commit => "commit",
+        UpdateKind::Checkout => "checkout",
+    };
+    std::fs::write(repo.path().join(UPDATE_MARKER), format!("{} {}\n", kind, target))
+        .map_err(|e| Error::from_str(&format!("writing the update marker: {}", e)))
+}
+
+fn end_update(repo: &Repository) {
+    let _ = std::fs::remove_file(repo.path().join(UPDATE_MARKER));
+}
+
+fn read_update_marker(repo: &Repository) -> Option<(UpdateKind, git2::Oid)> {
+    let text = std::fs::read_to_string(repo.path().join(UPDATE_MARKER)).ok()?;
+    let (kind, oid) = text.trim().split_once(' ')?;
+    let kind = match kind {
+        "commit" => UpdateKind::Commit,
+        "checkout" => UpdateKind::Checkout,
+        _ => return None,
+    };
+    Some((kind, git2::Oid::from_str(oid).ok()?))
+}
+
+/// Points the branch HEAD is on at `target` (creating it on an unborn HEAD).
+fn move_head_branch(repo: &Repository, target: git2::Oid, log: &str) -> Result<(), Error> {
+    let head = repo.find_reference("HEAD")?;
+    let branch = head
+        .symbolic_target()
+        .ok_or_else(|| Error::from_str("detached HEAD - git-drive requires a branch"))?;
+    repo.reference(branch, target, true, log)?;
+    Ok(())
+}
+
+/// Finishes or undoes an update a crash or I/O error cut short (see
+/// `UPDATE_MARKER`). If index and working tree already reached the target,
+/// only the ref move was lost: it is completed. Otherwise a checkout is
+/// rolled back to HEAD, and a commit is simply dropped (the working tree
+/// still holds the edits, the next drain commits them). Returns `true` when
+/// HEAD moved — the caller must refresh what it built from HEAD.
+pub fn recover_interrupted_update(repo: &Repository) -> Result<bool, Error> {
+    let Some((kind, target)) = read_update_marker(repo) else {
+        return Ok(false);
+    };
+    let target_commit = repo.find_commit(target)?;
+    let head = repo.head().ok().and_then(|h| h.target());
+    let mut index = repo.index()?;
+    index.read(true)?;
+    let reached = !index.has_conflicts() && index.write_tree()? == target_commit.tree_id();
+    let advances = match head {
+        Some(h) => h != target && repo.graph_descendant_of(target, h)?,
+        None => true,
+    };
+    let mut moved = false;
+    if head == Some(target) {
+        // Only the marker removal was lost.
+    } else if reached && advances {
+        move_head_branch(repo, target, "git-drive: finish interrupted update")?;
+        log::warn!("recovery: completed an interrupted update to {}", target);
+        moved = true;
+    } else if kind == UpdateKind::Checkout {
+        if !rollback_to_head(repo, &target_commit.tree()?) {
+            return Err(Error::from_str("rollback of an interrupted checkout failed"));
+        }
+    } else {
+        log::warn!("recovery: dropped an interrupted commit; the working tree keeps the edits");
+    }
+    repo.cleanup_state()?;
+    end_update(repo);
+    Ok(moved)
+}
+
+/// Refuses a tree holding a path this platform cannot create under the
+/// working tree — checked BEFORE a checkout touches anything, since libgit2
+/// aborts a checkout midway on ENAMETOOLONG. Encrypted names make it real:
+/// ~64 bytes per component, so 15+ levels created on Linux (PATH_MAX 4096)
+/// do not fit macOS's 1024.
+fn ensure_materializable(repo: &Repository, tree: &git2::Tree) -> Result<(), Error> {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(workdir) = repo.workdir() else {
+        return Ok(());
+    };
+    let workdir = workdir.as_os_str().as_bytes();
+    let base = workdir.len() + usize::from(!workdir.ends_with(b"/"));
+    // PATH_MAX counts the terminating NUL.
+    let max = libc::PATH_MAX as usize - 1;
+    let mut over = 0usize;
+    let mut longest: Option<(usize, String)> = None;
+    tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+        if entry.kind() != Some(git2::ObjectType::Tree) {
+            let len = base + root.len() + entry.name_bytes().len();
+            if len > max {
+                over += 1;
+                if longest.as_ref().is_none_or(|(l, _)| len > *l) {
+                    let name = String::from_utf8_lossy(entry.name_bytes());
+                    longest = Some((len, format!("{}{}", root, name)));
+                }
+            }
+        }
+        git2::TreeWalkResult::Ok
+    })?;
+    match longest {
+        None => Ok(()),
+        Some((len, path)) => Err(Error::from_str(&format!(
+            "{} path(s) exceed this platform's path limit ({} bytes); the longest has {} \
+             bytes: '{}' — refused before touching the working tree",
+            over, max, len, path
+        ))),
+    }
+}
+
+/// Puts index and working tree back on HEAD after a checkout or merge
+/// towards `attempted` failed midway (HEAD itself never moved). Best effort:
+/// a failure is logged.
+fn rollback_to_head(repo: &Repository, attempted: &git2::Tree) -> bool {
+    let result = (|| -> Result<(), Error> {
+        let head_tree = repo.head()?.peel_to_tree()?;
+        // A forced checkout of HEAD restores what the partial one changed or
+        // deleted, but leaves the files it created (git2 0.18 has no
+        // checkout baseline): remove the paths only `attempted` has — and
+        // only when they hold what the checkout writes, so an ignored
+        // local-only file the checkout never reached stays.
+        if let Some(workdir) = repo.workdir() {
+            let diff = repo.diff_tree_to_tree(Some(&head_tree), Some(attempted), None)?;
+            for delta in diff.deltas().filter(|d| d.status() == git2::Delta::Added) {
+                let Some(rel) = delta.new_file().path() else { continue };
+                let full = workdir.join(rel);
+                if written_by_checkout(&full, &delta.new_file()) && std::fs::remove_file(&full).is_ok() {
+                    remove_empty_parents(&full, workdir);
+                }
+            }
+        }
+        let mut index = repo.index()?;
+        index.read_tree(&head_tree)?;
+        index.write()?;
+        repo.checkout_tree(
+            head_tree.as_object(),
+            Some(git2::build::CheckoutBuilder::new().force()),
+        )?;
+        repo.cleanup_state()
+    })();
+    match result {
+        Ok(()) => {
+            log::warn!("checkout failed midway — working tree rolled back to HEAD");
+            true
+        }
+        Err(e) => {
+            log::error!("checkout failed midway and the rollback to HEAD failed too: {}", e);
+            false
+        }
+    }
+}
+
+/// Whether `full` holds exactly the blob a checkout of `entry` writes.
+fn written_by_checkout(full: &Path, entry: &git2::DiffFile) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let on_disk = if entry.mode() == git2::FileMode::Link {
+        std::fs::read_link(full).ok().and_then(|t| {
+            git2::Oid::hash_object(git2::ObjectType::Blob, t.as_os_str().as_bytes()).ok()
+        })
+    } else {
+        git2::Oid::hash_file(git2::ObjectType::Blob, full).ok()
+    };
+    on_disk == Some(entry.id())
+}
+
+/// Removes the directories above `file` that became empty, up to `workdir`.
+fn remove_empty_parents(file: &Path, workdir: &Path) {
+    let mut dir = file.parent();
+    while let Some(d) = dir.filter(|d| *d != workdir) {
+        if std::fs::remove_dir(d).is_err() {
+            break; // not empty
+        }
+        dir = d.parent();
+    }
 }
 
 /// Outcome of a pull attempt (fetch + merge).
@@ -796,11 +1046,7 @@ pub fn pull_and_merge(
     }
 
     if analysis.is_fast_forward() {
-        let local_ref_name = format!("refs/heads/{}", branch);
-        let mut local_ref = repo.find_reference(&local_ref_name)?;
-        local_ref.set_target(fetch_commit.id(), "git-drive: fast-forward")?;
-        repo.set_head(&local_ref_name)?;
-        repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
+        fast_forward(repo, fetch_commit.id())?;
         return Ok(MergeOutcome::FastForwarded);
     }
 
@@ -808,7 +1054,57 @@ pub fn pull_and_merge(
         return Err(Error::from_str("merge analysis: unexpected state"));
     }
 
-    repo.merge(&[&fetch_commit], None, None)?;
+    // The merge result holds the remote's paths: refuse the ones this
+    // platform cannot create before the merge writes anything.
+    let their_tree = repo.find_commit(fetch_commit.id())?.tree()?;
+    ensure_materializable(repo, &their_tree)?;
+    // A crash mid-merge leaves the marker: recovery rolls the merge back.
+    begin_update(repo, UpdateKind::Checkout, fetch_commit.id())?;
+    let mut copies: Vec<PathBuf> = Vec::new();
+    match merge_into_head(
+        repo,
+        &fetch_commit,
+        branch,
+        remote_name,
+        user_name,
+        user_email,
+        conflict_suffix,
+        &mut copies,
+    ) {
+        Ok(outcome) => {
+            end_update(repo);
+            Ok(outcome)
+        }
+        Err(e) => {
+            // Conflicted copies are in neither HEAD nor the remote tree: the
+            // rollback below cannot see them.
+            for copy in &copies {
+                let _ = std::fs::remove_file(copy);
+            }
+            if rollback_to_head(repo, &their_tree) {
+                end_update(repo);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The 3-way half of `pull_and_merge`: merges, resolves conflicts, commits,
+/// checks the result out and only then moves the branch (see `fast_forward`).
+/// Any error leaves the repo mid-merge — the caller rolls it back, removing
+/// the conflicted copies recorded in `copies`.
+#[allow(clippy::too_many_arguments)]
+fn merge_into_head(
+    repo: &Repository,
+    fetch_commit: &git2::AnnotatedCommit,
+    branch: &str,
+    remote_name: &str,
+    user_name: &str,
+    user_email: &str,
+    conflict_suffix: &str,
+    copies: &mut Vec<PathBuf>,
+) -> Result<MergeOutcome, Error> {
+    repo.merge(&[fetch_commit], None, None)?;
     let mut index = repo.index()?;
     let mut conflicted_paths: Vec<String> = Vec::new();
 
@@ -841,6 +1137,7 @@ pub fn pull_and_merge(
                 (Some(our_entry), Some(their_entry)) => {
                     let our_blob = repo.find_blob(our_entry.id)?;
                     let conflict_name = format!("{}.{}", path_str, conflict_suffix);
+                    copies.push(workdir.join(&conflict_name));
                     write_workdir_file(&workdir.join(&conflict_name), our_blob.content())?;
                     index.add_path(Path::new(&conflict_name))?;
                     let their_blob = repo.find_blob(their_entry.id)?;
@@ -893,9 +1190,8 @@ pub fn pull_and_merge(
         )
     };
 
-    let ref_name = format!("refs/heads/{}", branch);
-    repo.commit(
-        Some(&ref_name),
+    let merge_oid = repo.commit(
+        None,
         &sig,
         &sig,
         &message,
@@ -903,7 +1199,13 @@ pub fn pull_and_merge(
         &[&head_commit, &their_commit],
     )?;
 
-    repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
+    // Working tree first, ref last (see `fast_forward`).
+    begin_update(repo, UpdateKind::Checkout, merge_oid)?;
+    repo.checkout_tree(
+        tree.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )?;
+    move_head_branch(repo, merge_oid, &message)?;
     repo.cleanup_state()?;
 
     if conflicted_paths.is_empty() {
@@ -1851,6 +2153,363 @@ mod tests {
         assert_eq!(head.parent_count(), 2, "conflict merge commit must have 2 parents");
         // Merge state must be clean (no dangling MERGE_HEAD)
         assert!(repo_a.state() == git2::RepositoryState::Clean);
+    }
+
+    /// Commits `relpath` without touching the working tree (blob and index
+    /// entry go straight to the repo) — builds a commit holding a path this
+    /// platform cannot create.
+    fn commit_blob_only(repo: &Repository, relpath: &str, content: &[u8]) {
+        let entry = git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            file_size: content.len() as u32,
+            id: git2::Oid::zero(),
+            flags: 0,
+            flags_extended: 0,
+            path: relpath.as_bytes().to_vec(),
+        };
+        let mut index = repo.index().unwrap();
+        index.add_frombuffer(&entry, content).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let parent_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "deep", &tree, &[&parent_commit])
+            .unwrap();
+    }
+
+    /// A relative path that no working tree on this platform can hold: its
+    /// components fit NAME_MAX, the whole exceeds PATH_MAX.
+    fn path_beyond_platform_limit() -> String {
+        let component = "d".repeat(200);
+        let depth = libc::PATH_MAX as usize / 201 + 2;
+        let mut parts = vec![component.as_str(); depth];
+        parts.push("f.txt");
+        parts.join("/")
+    }
+
+    /// B pushes one commit with a creatable file plus one with a path beyond
+    /// the platform limit (the 2026-10-14 incident: 15-16 encrypted levels
+    /// committed on Linux, 1103-1134 bytes against macOS's 1024).
+    fn remote_pushes_unmaterializable_path(bare: &tempfile::TempDir) -> (tempfile::TempDir, Repository) {
+        let (dir_b, repo_b) = clone_of(bare, "Bob");
+        commit_file(&repo_b, "fits.txt", b"ok");
+        commit_blob_only(&repo_b, &path_beyond_platform_limit(), b"deep");
+        let branch = current_branch_name(&repo_b).unwrap();
+        push_to_remote(&repo_b, &branch, "origin", None).unwrap();
+        (dir_b, repo_b)
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn pull_and_merge_refuses_fast_forward_to_a_path_beyond_the_platform_limit() {
+        let (_local_a, repo_a, bare) = setup_local_with_bare_remote();
+        let before = repo_a.head().unwrap().target().unwrap();
+        let _b = remote_pushes_unmaterializable_path(&bare);
+        let branch = current_branch_name(&repo_a).unwrap();
+        fetch_remote(&repo_a, &branch, "origin", None).unwrap();
+
+        let err = pull_and_merge(&repo_a, &branch, "origin", "A", "a@x.com", "conflict-test")
+            .unwrap_err();
+        assert!(err.message().contains("path limit"), "unexpected error: {}", err);
+        assert_eq!(repo_a.head().unwrap().target().unwrap(), before, "HEAD must not move");
+        assert!(
+            !repo_a.workdir().unwrap().join("fits.txt").exists(),
+            "nothing may be checked out before the refusal"
+        );
+        assert!(is_working_tree_clean(&repo_a).unwrap());
+    }
+
+    #[test]
+    fn merge_ff_only_refuses_a_path_beyond_the_platform_limit() {
+        let (_local_a, repo_a, bare) = setup_local_with_bare_remote();
+        let before = repo_a.head().unwrap().target().unwrap();
+        let _b = remote_pushes_unmaterializable_path(&bare);
+        let branch = current_branch_name(&repo_a).unwrap();
+        fetch_remote(&repo_a, &branch, "origin", None).unwrap();
+
+        let err = merge_ff_only(&repo_a, &branch).unwrap_err();
+        assert!(err.message().contains("path limit"), "unexpected error: {}", err);
+        assert_eq!(repo_a.head().unwrap().target().unwrap(), before, "HEAD must not move");
+        assert!(is_working_tree_clean(&repo_a).unwrap());
+    }
+
+    #[test]
+    fn pull_and_merge_refuses_3way_merge_with_a_path_beyond_the_platform_limit() {
+        let (_local_a, repo_a, bare) = setup_local_with_bare_remote();
+        commit_file(&repo_a, "only_a.txt", b"local");
+        let before = repo_a.head().unwrap().target().unwrap();
+        let _b = remote_pushes_unmaterializable_path(&bare);
+        let branch = current_branch_name(&repo_a).unwrap();
+        fetch_remote(&repo_a, &branch, "origin", None).unwrap();
+
+        let err = pull_and_merge(&repo_a, &branch, "origin", "A", "a@x.com", "conflict-test")
+            .unwrap_err();
+        assert!(err.message().contains("path limit"), "unexpected error: {}", err);
+        assert_eq!(repo_a.head().unwrap().target().unwrap(), before, "HEAD must not move");
+        assert!(repo_a.state() == git2::RepositoryState::Clean, "no dangling MERGE_HEAD");
+        assert!(is_working_tree_clean(&repo_a).unwrap());
+    }
+
+    /// Base `a.txt` + `locked/keep.txt`; B rewrites `a.txt` and adds
+    /// `added/new.txt` and `locked/new.txt`; A's `locked/` is read-only, so
+    /// the checkout fails midway — a failure the path pre-flight cannot foresee.
+    fn remote_change_into_read_only_dir(
+        local: &dyn Fn(&Repository),
+    ) -> (Vec<tempfile::TempDir>, Repository, git2::Oid, Result<MergeOutcome, Error>) {
+        let (local_a, repo_a, bare) = setup_local_with_bare_remote();
+        let branch = current_branch_name(&repo_a).unwrap();
+        commit_file(&repo_a, "a.txt", b"old");
+        commit_file(&repo_a, "locked/keep.txt", b"keep");
+        push_to_remote(&repo_a, &branch, "origin", None).unwrap();
+        let (dir_b, repo_b) = clone_of(&bare, "Bob");
+        commit_file(&repo_b, "a.txt", b"new");
+        commit_file(&repo_b, "added/new.txt", b"created before the failure");
+        commit_file(&repo_b, "locked/new.txt", b"blocked");
+        push_to_remote(&repo_b, &branch, "origin", None).unwrap();
+        local(&repo_a);
+        let before = repo_a.head().unwrap().target().unwrap();
+
+        let locked = repo_a.workdir().unwrap().join("locked");
+        set_mode(&locked, 0o555);
+        fetch_remote(&repo_a, &branch, "origin", None).unwrap();
+        let result = pull_and_merge(&repo_a, &branch, "origin", "A", "a@x.com", "conflict-test");
+        set_mode(&locked, 0o755);
+        (vec![local_a, bare, dir_b], repo_a, before, result)
+    }
+
+    #[test]
+    fn pull_and_merge_rolls_back_a_fast_forward_whose_checkout_fails() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root writes into read-only directories
+        }
+        let (_keep, repo_a, before, result) = remote_change_into_read_only_dir(&|_| {});
+        assert!(result.is_err(), "the failed checkout must surface, got {:?}", result);
+        assert_eq!(repo_a.head().unwrap().target().unwrap(), before, "HEAD must not move");
+        let wd = repo_a.workdir().unwrap();
+        assert_eq!(std::fs::read(wd.join("a.txt")).unwrap(), b"old");
+        assert!(!wd.join("added").exists(), "files the partial checkout created are removed");
+        assert!(is_working_tree_clean(&repo_a).unwrap(), "working tree back on HEAD");
+    }
+
+    #[test]
+    fn pull_and_merge_rolls_back_a_3way_merge_whose_checkout_fails() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root writes into read-only directories
+        }
+        let (_keep, repo_a, before, result) =
+            remote_change_into_read_only_dir(&|a| commit_file(a, "only_a.txt", b"local"));
+        assert!(result.is_err(), "the failed checkout must surface, got {:?}", result);
+        assert_eq!(repo_a.head().unwrap().target().unwrap(), before, "HEAD must not move");
+        assert!(repo_a.state() == git2::RepositoryState::Clean, "no dangling MERGE_HEAD");
+        let wd = repo_a.workdir().unwrap();
+        assert_eq!(std::fs::read(wd.join("a.txt")).unwrap(), b"old");
+        assert!(!wd.join("added").exists(), "files the partial checkout created are removed");
+        assert!(is_working_tree_clean(&repo_a).unwrap(), "working tree back on HEAD");
+    }
+
+    #[test]
+    fn commit_working_tree_refuses_when_the_index_does_not_match_head() {
+        // Shape left by the 2026-10-14 incident: HEAD advanced, the index
+        // stayed on the old tree and the working tree misses files of HEAD.
+        // Committing it would delete them and push the deletion.
+        let (_dir, repo) = init_repo_with_commit();
+        commit_file(&repo, "a.txt", b"a");
+        let old_tree = repo.head().unwrap().peel_to_tree().unwrap();
+        commit_file(&repo, "b.txt", b"b");
+        let head = repo.head().unwrap().target().unwrap();
+        let mut index = repo.index().unwrap();
+        index.read_tree(&old_tree).unwrap();
+        index.write().unwrap();
+        std::fs::remove_file(repo.workdir().unwrap().join("b.txt")).unwrap();
+
+        let branch = current_branch_name(&repo).unwrap();
+        let result = commit_working_tree(&repo, &branch, "T", "t@x.com", "msg");
+        assert!(result.is_err(), "expected a refusal, got {:?}", result);
+        assert_eq!(repo.head().unwrap().target().unwrap(), head, "no commit may be created");
+    }
+
+    #[test]
+    fn commit_working_tree_failure_leaves_the_index_on_head() {
+        // A commit that fails after staging must not leave the index ahead
+        // of HEAD — the guard above would then refuse every later commit.
+        let (_dir, repo) = init_repo_with_commit();
+        commit_file(&repo, "a.txt", b"a");
+        std::fs::write(repo.workdir().unwrap().join("a.txt"), b"edited").unwrap();
+        let branch = current_branch_name(&repo).unwrap();
+
+        assert!(commit_working_tree(&repo, &branch, "", "", "msg").is_err(), "empty identity");
+        let next = commit_working_tree(&repo, &branch, "T", "t@x.com", "msg").unwrap();
+        assert!(next.is_some(), "the edit is still committed on the next attempt");
+    }
+
+    #[test]
+    fn commit_working_tree_with_a_locked_index_leaves_head_and_retries() {
+        // `.git/index.lock` held by a concurrent `git status`: moving HEAD
+        // and then failing to persist the index left the guard refusing
+        // every later commit (finding of the 2026-10-14 review).
+        let (_dir, repo) = init_repo_with_commit();
+        commit_file(&repo, "a.txt", b"a");
+        let head = repo.head().unwrap().target().unwrap();
+        std::fs::write(repo.workdir().unwrap().join("a.txt"), b"edited").unwrap();
+        let branch = current_branch_name(&repo).unwrap();
+        let lock = repo.path().join("index.lock");
+        std::fs::write(&lock, b"").unwrap();
+
+        assert!(commit_working_tree(&repo, &branch, "T", "t@x.com", "msg").is_err());
+        assert_eq!(repo.head().unwrap().target().unwrap(), head, "HEAD must wait for the index");
+        std::fs::remove_file(&lock).unwrap();
+        let next = commit_working_tree(&repo, &branch, "T", "t@x.com", "msg").unwrap();
+        assert!(next.is_some(), "the edit is committed once the lock is gone");
+    }
+
+    #[test]
+    fn commit_working_tree_finishes_a_commit_whose_ref_move_was_lost() {
+        // Crash between persisting the index and moving the ref: the index
+        // holds the new commit's tree, HEAD the old one. The update marker
+        // names the commit, so the next attempt completes it.
+        let (_dir, repo) = init_repo_with_commit();
+        commit_file(&repo, "a.txt", b"a");
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        std::fs::write(repo.workdir().unwrap().join("b.txt"), b"b").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("b.txt")).unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = Signature::now("T", "t@x.com").unwrap();
+        let target = repo.commit(None, &sig, &sig, "msg", &tree, &[&head]).unwrap();
+        begin_update(&repo, UpdateKind::Commit, target).unwrap();
+        index.write().unwrap();
+
+        let branch = current_branch_name(&repo).unwrap();
+        let result = commit_working_tree(&repo, &branch, "T", "t@x.com", "msg").unwrap();
+        assert_eq!(result, None, "nothing left to commit");
+        assert_eq!(repo.head().unwrap().target().unwrap(), target, "lost ref move completed");
+        assert!(is_working_tree_clean(&repo).unwrap());
+    }
+
+    /// A on the base, B pushed a rewrite of `a.txt` plus `added/new.txt`,
+    /// A fetched. Returns A and the fast-forward target.
+    fn fetched_fast_forward() -> (Vec<tempfile::TempDir>, Repository, git2::Oid) {
+        let (local_a, repo_a, bare) = setup_local_with_bare_remote();
+        let branch = current_branch_name(&repo_a).unwrap();
+        commit_file(&repo_a, "a.txt", b"old");
+        push_to_remote(&repo_a, &branch, "origin", None).unwrap();
+        let (dir_b, repo_b) = clone_of(&bare, "Bob");
+        commit_file(&repo_b, "a.txt", b"new");
+        commit_file(&repo_b, "added/new.txt", b"from B");
+        push_to_remote(&repo_b, &branch, "origin", None).unwrap();
+        fetch_remote(&repo_a, &branch, "origin", None).unwrap();
+        let target = repo_a
+            .refname_to_id(&format!("refs/remotes/origin/{}", branch))
+            .unwrap();
+        (vec![local_a, bare, dir_b], repo_a, target)
+    }
+
+    #[test]
+    fn recover_interrupted_update_undoes_a_checkout_that_died_midway() {
+        // kill -9 during a fast-forward's checkout: part of the target is on
+        // disk, index and HEAD still on the base.
+        let (_keep, repo, target) = fetched_fast_forward();
+        let before = repo.head().unwrap().target().unwrap();
+        begin_update(&repo, UpdateKind::Checkout, target).unwrap();
+        let wd = repo.workdir().unwrap();
+        std::fs::create_dir_all(wd.join("added")).unwrap();
+        std::fs::write(wd.join("added/new.txt"), b"from B").unwrap();
+        std::fs::write(wd.join("a.txt"), b"new").unwrap();
+
+        assert!(!recover_interrupted_update(&repo).unwrap(), "HEAD stays");
+        assert_eq!(repo.head().unwrap().target().unwrap(), before);
+        assert_eq!(std::fs::read(wd.join("a.txt")).unwrap(), b"old");
+        assert!(!wd.join("added").exists(), "files of the dead checkout removed");
+        assert!(is_working_tree_clean(&repo).unwrap());
+        assert!(!recover_interrupted_update(&repo).unwrap(), "marker consumed");
+    }
+
+    #[test]
+    fn recover_interrupted_update_finishes_a_checkout_whose_ref_move_was_lost() {
+        let (_keep, repo, target) = fetched_fast_forward();
+        begin_update(&repo, UpdateKind::Checkout, target).unwrap();
+        let commit = repo.find_commit(target).unwrap();
+        repo.checkout_tree(
+            commit.as_object(),
+            Some(git2::build::CheckoutBuilder::new().force()),
+        )
+        .unwrap();
+
+        assert!(recover_interrupted_update(&repo).unwrap(), "HEAD moved to the target");
+        assert_eq!(repo.head().unwrap().target().unwrap(), target);
+        assert!(is_working_tree_clean(&repo).unwrap());
+    }
+
+    #[test]
+    fn pull_and_merge_rollback_removes_the_conflict_copies_it_wrote() {
+        // The merge fails after the conflict loop (branch ref locked): the
+        // conflicted copy must go with the rollback, or the next drain
+        // commits a copy of a merge that never happened.
+        let (_local_a, repo_a, bare) = setup_local_with_bare_remote();
+        let branch = current_branch_name(&repo_a).unwrap();
+        commit_file(&repo_a, "shared.txt", b"base");
+        push_to_remote(&repo_a, &branch, "origin", None).unwrap();
+        let (_dir_b, repo_b) = clone_of(&bare, "Bob");
+        commit_file(&repo_b, "shared.txt", b"remote version");
+        push_to_remote(&repo_b, &branch, "origin", None).unwrap();
+        commit_file(&repo_a, "shared.txt", b"local version");
+        let before = repo_a.head().unwrap().target().unwrap();
+        fetch_remote(&repo_a, &branch, "origin", None).unwrap();
+
+        let lock = repo_a.path().join(format!("refs/heads/{}.lock", branch));
+        std::fs::write(&lock, b"").unwrap();
+        let result = pull_and_merge(&repo_a, &branch, "origin", "A", "a@x.com", "conflict-xyz");
+        std::fs::remove_file(&lock).unwrap();
+
+        assert!(result.is_err(), "the ref move failed, got {:?}", result);
+        assert_eq!(repo_a.head().unwrap().target().unwrap(), before);
+        let wd = repo_a.workdir().unwrap();
+        assert!(!wd.join("shared.txt.conflict-xyz").exists(), "no leftover conflicted copy");
+        assert_eq!(std::fs::read(wd.join("shared.txt")).unwrap(), b"local version");
+        assert!(repo_a.state() == git2::RepositoryState::Clean);
+        assert!(is_working_tree_clean(&repo_a).unwrap());
+    }
+
+    #[test]
+    fn rollback_keeps_an_ignored_local_file_the_checkout_never_reached() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root writes into read-only directories
+        }
+        // Plaintext drive: `local/` is ignored, so A's `local/note.txt` is a
+        // local-only file the clean-tree check does not see. B commits the
+        // same path; A's checkout fails earlier (read-only `a_locked/`) and
+        // the rollback must not take the local file with it.
+        let (_local_a, repo_a, bare) = setup_local_with_bare_remote();
+        let branch = current_branch_name(&repo_a).unwrap();
+        commit_file(&repo_a, ".gitignore", b"local/\n");
+        commit_file(&repo_a, "a_locked/keep.txt", b"keep");
+        push_to_remote(&repo_a, &branch, "origin", None).unwrap();
+        let (_dir_b, repo_b) = clone_of(&bare, "Bob");
+        commit_file(&repo_b, "a_locked/new.txt", b"blocked");
+        commit_file(&repo_b, "local/note.txt", b"remote note");
+        push_to_remote(&repo_b, &branch, "origin", None).unwrap();
+
+        let wd = repo_a.workdir().unwrap();
+        std::fs::create_dir_all(wd.join("local")).unwrap();
+        std::fs::write(wd.join("local/note.txt"), b"my local note").unwrap();
+        assert!(is_working_tree_clean(&repo_a).unwrap(), "ignored: the tree counts as clean");
+        set_mode(&wd.join("a_locked"), 0o555);
+        fetch_remote(&repo_a, &branch, "origin", None).unwrap();
+        let result = pull_and_merge(&repo_a, &branch, "origin", "A", "a@x.com", "conflict-test");
+        set_mode(&wd.join("a_locked"), 0o755);
+
+        assert!(result.is_err(), "got {:?}", result);
+        assert_eq!(std::fs::read(wd.join("local/note.txt")).unwrap(), b"my local note");
     }
 
     #[test]

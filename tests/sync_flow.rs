@@ -1512,3 +1512,72 @@ async fn boot_recovery_commits_a_dirty_working_tree() {
     assert_eq!(head.message().unwrap(), "git-drive: recover uncommitted changes");
     assert!(head.tree().unwrap().get_path(std::path::Path::new("left-dirty.txt")).is_ok());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn pull_watcher_completes_a_fast_forward_whose_ref_move_was_lost() {
+    // A crash after the fast-forward's checkout, before the ref moved: index
+    // and working tree are on the remote commit, HEAD on the old one, and
+    // `.git/git-drive-update` names the target. An idle machine (no local
+    // write, so no drain) must not stay stuck on "dirty working tree".
+    let test = init_repo();
+    let bare = init_bare_remote();
+    let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+    test.repo.remote("origin", &bare_url).unwrap();
+    git_drive::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let repo_b = git2::Repository::clone(&bare_url, dir_b.path()).unwrap();
+    commit_file(&repo_b, "from_b.txt", b"hi", "from B");
+    git_drive::git::push_to_remote(&repo_b, "main", "origin", None).unwrap();
+    git_drive::git::fetch_remote(&test.repo, "main", "origin", None).unwrap();
+    let target = test.repo.refname_to_id("refs/remotes/origin/main").unwrap();
+    std::fs::write(
+        test.dir.path().join(".git/git-drive-update"),
+        format!("checkout {}\n", target),
+    )
+    .unwrap();
+    let commit = test.repo.find_commit(target).unwrap();
+    test.repo
+        .checkout_tree(commit.as_object(), Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    let sync = SyncManager::new_full_with_pull(
+        test.dir.path().to_str().unwrap(),
+        "main".to_string(),
+        60,
+        Some("Alice".to_string()),
+        Some("a@x.com".to_string()),
+        Some("origin".to_string()),
+        None,
+        1,
+    );
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+
+    assert_eq!(test.repo.head().unwrap().target().unwrap(), target, "ref move completed");
+    assert!(sync.take_refresh_flag(), "the FUSE layer must rebuild from the new HEAD");
+    assert!(git_drive::git::is_working_tree_clean(&test.repo).unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn journal_is_kept_when_the_commit_is_refused() {
+    // The commit guard refuses while the index does not match HEAD (no
+    // update marker explains it): the write lands in the working tree but no
+    // commit holds it, so its journal record is its only safe copy — a
+    // repair by checkout/reset would wipe the working tree.
+    let test = init_repo();
+    commit_file(&test.repo, "a.txt", b"a", "a");
+    let old_tree = test.repo.head().unwrap().peel_to_tree().unwrap();
+    commit_file(&test.repo, "b.txt", b"b", "b");
+    let mut index = test.repo.index().unwrap();
+    index.read_tree(&old_tree).unwrap();
+    index.write().unwrap();
+    let journal_dir = test.dir.path().join(".git/git-drive-journal");
+    let sync = mgr(test.dir.path().to_str().unwrap(), "main", Some(("Alice", "a@x.com")));
+    sync.enable_journal(&journal_dir).unwrap();
+    sync.queue_write("c.txt", b"written while the guard refuses".to_vec());
+    wait_flush().await;
+
+    assert_eq!(read_file(test.dir.path(), "c.txt"), b"written while the guard refuses");
+    assert!(std::fs::read_dir(&journal_dir).unwrap().count() > 0, "journal kept");
+    let blocked = sync.status_state().snapshot().commit_blocked;
+    assert!(blocked.is_some_and(|r| r.contains("does not match HEAD")), "status shows the refusal");
+}

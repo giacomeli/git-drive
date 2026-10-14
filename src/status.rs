@@ -32,6 +32,10 @@ pub struct SyncStatus {
     pub last_pull: Option<PullInfo>,
     /// Conflicted copies created in this session (paths of the `*.conflict-*` copies).
     pub conflicts: Vec<String>,
+    /// Why the last drain could not commit (the writes stay in the working
+    /// tree and the journal). `None` once a drain commits again.
+    #[serde(default)]
+    pub commit_blocked: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +153,16 @@ impl StatusState {
         let mut s = self.inner.lock();
         s.updated_at = now_unix();
         s.unpushed = n;
+        let snapshot = s.clone();
+        drop(s);
+        self.persist(&snapshot);
+    }
+
+    /// Records (or clears, with `None`) a commit the drain could not make.
+    pub fn set_commit_blocked(&self, reason: Option<String>) {
+        let mut s = self.inner.lock();
+        s.updated_at = now_unix();
+        s.commit_blocked = reason;
         let snapshot = s.clone();
         drop(s);
         self.persist(&snapshot);
@@ -297,6 +311,12 @@ pub fn format_status(s: &SyncStatus, now: u64, alive: Option<bool>) -> String {
         }
         None => out.push_str("  last drain: none yet\n"),
     }
+    if let Some(reason) = &s.commit_blocked {
+        out.push_str(&format!(
+            "  COMMIT BLOCKED: {} — local writes kept in the journal\n",
+            reason
+        ));
+    }
     match &s.last_pull {
         Some(p) => out.push_str(&format!(
             "  last pull: {} — {}\n",
@@ -364,6 +384,22 @@ mod tests {
         // Staleness only warns while the daemon is alive
         let stale_alive = format_status(&s, 2_000, Some(true));
         assert!(stale_alive.contains("warning"), "{}", stale_alive);
+    }
+
+    #[test]
+    fn format_status_shows_a_blocked_commit_and_persists_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let state = StatusState::new();
+        state.enable_file(path.clone());
+        state.set_commit_blocked(Some("index tree does not match HEAD".into()));
+        let loaded = read_from(&path).unwrap();
+        let text = format_status(&loaded, 2_000, None);
+        assert!(text.contains("COMMIT BLOCKED: index tree does not match HEAD"), "{}", text);
+
+        state.set_commit_blocked(None);
+        let text = format_status(&read_from(&path).unwrap(), 2_000, None);
+        assert!(!text.contains("COMMIT BLOCKED"), "{}", text);
     }
 
     #[test]
