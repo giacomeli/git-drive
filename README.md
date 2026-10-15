@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/giacomeli/git-drive/actions/workflows/ci.yml/badge.svg)](https://github.com/giacomeli/git-drive/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](#requirements)
+[![Rust 1.91+](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](#requirements)
 [![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](#requirements)
 
 <p align="center">
@@ -46,15 +46,63 @@ versioned Git data underneath, and it syncs with any Git server, including GitHu
 - Symlinks, mtime derived from history, ignored files as visible local-only entries, native
   Finder Trash, menu bar tray, desktop notifications, and a login service (LaunchAgent on macOS,
   systemd user units on Linux).
+- Optional P2P channel between your devices (iroh): a push on one machine reaches the others in
+  seconds instead of at the next poll. Git stays the source of truth; the channel only carries
+  "I pushed" notices.
+- Control Center: a desktop window with the drive's state, disk space, devices, activity, the
+  live log with per-area log levels, every setting, and start/stop of the daemon.
+
+## Control Center
+
+A window for everything about the drive on this machine, on macOS and Linux. On macOS 26 it uses
+Liquid Glass; the accent color is yours to pick, like in macOS.
+
+<p align="center">
+  <img src="./promo-assets/screenshots/control-center-overview.webp"
+       alt="Control Center overview on macOS: sync state card, storage ring of the repository volume, commits per hour over the last day, connected devices and uptime, pull, waiting and conflict counters"
+       width="820">
+</p>
+
+<table>
+  <tr>
+    <td width="50%"><img src="./promo-assets/screenshots/control-center-logs.webp"
+      alt="Logs page: live session log filtered by level, area and text, with the Recording panel that sets a log level per area"></td>
+    <td width="50%"><img src="./promo-assets/screenshots/control-center-linux.webp"
+      alt="The same overview on Linux (GNOME) with the orange accent color and the window's own buttons"></td>
+  </tr>
+  <tr>
+    <td align="center">Live log, with the log level of each area</td>
+    <td align="center">On Linux (GNOME), with the orange accent</td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="./promo-assets/screenshots/control-center-theme.webp"
+       alt="Theme section of Settings: nine accent colors in the style of the macOS picker, Multicolor selected"
+       width="700">
+</p>
+
+| Page | What it does |
+| --- | --- |
+| Overview | Sync state, last commit, disk space of the repository's volume, devices of the P2P channel, commits per hour, uptime, last pull, changes waiting, conflicts. |
+| Logs | Live tail of the session log, filtered by level, area and text; the log level of each area (`log_categories`), applied with "Save & restart". |
+| Settings | Accent color, then every field of `config.json`, validated and saved atomically. |
+| About | Version, login service, and every file and folder git-drive uses, each with a Reveal button. |
+
+Start, Stop and Restart go through the login service, so a stop is always the clean one (unmount,
+final sync). Build and install it as shown in [Installation](#installation); open it from the tray
+("Open Control Center"), the app launcher, or `git-drive control-center [--page logs]`.
 
 ## Requirements
 
-- Rust 1.85+ (checked in CI)
+- Rust 1.91+ for the default build, which includes the P2P channel; 1.85+ for
+  `cargo build --no-default-features` (both checked in CI)
 - macOS with [macFUSE](https://osxfuse.github.io/) installed (`brew install macfuse`), or Linux
   with fuse3 (runtime validated on Arch Linux; still experimental)
 - Git 2.31+ on PATH (used for fetch/push; set `"git_transport": "libgit2"` to do without it)
 - A local Git repository (with a checked-out branch) to mount
 - Optional: `origin` configured for remote synchronization
+- Optional, to build the Control Center: Node 20+, and on Linux `webkit2gtk-4.1`
 
 ## Installation
 
@@ -65,17 +113,25 @@ cargo run -- -r <repo_path> -m <mount_path>
 cargo run -- status           # daemon state
 cargo run -- tray             # status icon in the menu bar
 cargo run -- key generate     # encryption-at-rest key
+cargo run -- peers            # devices of the P2P channel
 ```
 
-To mount automatically at login (LaunchAgent on macOS, systemd user units on Linux):
+To mount automatically at login (LaunchAgent on macOS, systemd user units on Linux), optionally
+with the Control Center:
 
 ```bash
+cd control-center && npm install                 # Control Center, optional
+npm run tauri build -- --bundles app             # macOS (Linux: npm run tauri build -- --no-bundle)
+cd ..
 cargo run --release -- install -r <repo_path> -m <mount_path> --with-tray
-cargo run -- uninstall        # stops the daemon and removes the service
+cargo run -- daemon stop|start|restart           # drive the installed service
+cargo run -- uninstall                           # stops the daemon and removes the service
 ```
 
-`install` copies the binary to `~/.local/bin/git-drive` and points the service there. On Linux,
-run `loginctl enable-linger $USER` if the drive should keep running after logout.
+`install` copies the binary to `~/.local/bin/git-drive` and points the service there; when the
+Control Center was built, it installs it too (`~/Applications` on macOS, a launcher entry on
+Linux). On Linux, run `loginctl enable-linger $USER` if the drive should keep running after
+logout.
 
 SIGTERM/eject perform a clean stop: the pending queue is committed and pushed before exiting.
 Merge conflicts, failed pushes and blocked pulls trigger a desktop notification. The Finder Trash
@@ -110,7 +166,10 @@ precedence in the dev flow):
   "user_name": "Your Name",
   "user_email": "you@example.com",
   "remote_token": null,
-  "git_transport": "auto"
+  "git_transport": "auto",
+  "p2p_enabled": false,
+  "log_level": "info",
+  "log_categories": { "network": "warn" }
 }
 ```
 
@@ -128,6 +187,13 @@ precedence in the dev flow):
 | `user_email` | `null` | Same as above. |
 | `remote_token` | `null` | HTTPS token (e.g. a GitHub PAT). If absent, uses your normal git/ssh credentials. **Plain text.** |
 | `git_transport` | `"auto"` | `auto` (system `git` when available), `cli` or `libgit2` for fetch/push. |
+| `p2p_enabled` | `false` | P2P channel between your devices (needs `user_name`/`user_email`). Off = git polling only. |
+| `p2p_idle_pull_interval_secs` | `600` | Pull interval while the channel is online; pushes arrive as notices. |
+| `log_level` | `"info"` | Base level of the log file. |
+| `log_categories` | `{}` | Level per area (`sync`, `git`, `fuse`, `crypto`, `p2p`, `network`, `service`); `off` keeps an area out of the file. |
+
+Every field, including the remaining P2P and log rotation settings, is described in
+[docs/usage.md](./docs/usage.md#61-complete-annotated-template).
 
 If the file is missing, defaults are applied with a warning. If it exists but is invalid, the
 daemon refuses to start.
@@ -147,13 +213,16 @@ daemon refuses to start.
   version is preserved as `<file>.conflict-<host>-<timestamp>` and the remote one becomes
   canonical; when one side edited and the other deleted, the edit wins. Local commits the remote
   does not have yet (e.g. written offline) are pushed in the same cycle.
+- **Between devices**: with `p2p_enabled`, every push is announced to the other devices over a
+  direct (or relayed) QUIC connection and wakes their pull at once; polling then only runs every
+  `p2p_idle_pull_interval_secs`, as a safety net.
 - **Branch**: detects the active branch at boot and operates on it until unmount. A detached
   HEAD aborts.
 
 ## Tests
 
 ```bash
-cargo test                   # ~315 tests (unit + integration)
+cargo test                   # 418 tests (unit + integration)
 cargo test --test sync_flow  # watcher -> commit -> push -> pull flow
 ```
 
