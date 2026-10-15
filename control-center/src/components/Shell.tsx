@@ -1,6 +1,5 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
-  HardDrive,
   Info,
   LayoutDashboard,
   LoaderCircle,
@@ -17,6 +16,7 @@ import type { DaemonAction, Overview } from "../lib/api";
 import { duration } from "../lib/format";
 import { booting, health } from "../lib/health";
 import { isMac } from "../lib/hooks";
+import { BrandLogo } from "./Brand";
 import { StatusDot } from "./ui";
 
 export type Page = "overview" | "logs" | "settings" | "about";
@@ -95,17 +95,8 @@ export function Sidebar({
   const device = s?.p2p?.device_name;
   return (
     <aside className={`relative z-10 flex w-60 flex-none flex-col px-4 pb-4 ${isMac ? "pt-14" : "pt-6"}`}>
-      <div className="mb-8 flex items-center gap-3 px-2">
-        <div
-          className="grid h-10 w-10 place-items-center rounded-2xl"
-          style={{ background: "var(--accent)", boxShadow: "0 10px 24px -8px rgb(var(--a3-rgb) / 0.7)" }}
-        >
-          <HardDrive className="h-5 w-5 text-white" strokeWidth={2.2} />
-        </div>
-        <div className="min-w-0">
-          <p className="text-[0.95rem] font-semibold leading-tight tracking-tight">git-drive</p>
-          <p className="truncate text-[0.7rem] text-dim">{device ? `on ${device}` : "Control Center"}</p>
-        </div>
+      <div className="mb-8 px-2">
+        <BrandLogo caption={device ? `on ${device}` : "Control Center"} />
       </div>
 
       <nav className="flex flex-col gap-1">
