@@ -1581,3 +1581,115 @@ async fn journal_is_kept_when_the_commit_is_refused() {
     let blocked = sync.status_state().snapshot().commit_blocked;
     assert!(blocked.is_some_and(|r| r.contains("does not match HEAD")), "status shows the refusal");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn encryption_sweep_leaves_the_device_registry_alone() {
+    // `.git-drive/peers/<id>` is written by the daemon in its final form
+    // (plaintext path, content sealed or not by the registry itself): the
+    // migration must not rename or reseal it, or other devices stop finding
+    // their peers.
+    let test = init_repo();
+    commit_file(&test.repo, ".git-drive/peers/abc", b"registry entry", "register");
+    commit_file(&test.repo, "antigo.txt", b"historico claro", "add antigo");
+    let sync = mgr(test.dir.path().to_str().unwrap(), "main", Some(("Alice", "a@x.com")));
+    sync.set_crypto(Some(test_crypto()));
+    sync.queue_write("gatilho.txt", b"x".to_vec());
+    wait_flush().await;
+
+    assert_eq!(read_file(test.dir.path(), ".git-drive/peers/abc"), b"registry entry");
+    let tree = test.repo.head().unwrap().peel_to_tree().unwrap();
+    assert!(tree.get_path(std::path::Path::new(".git-drive/peers/abc")).is_ok());
+    assert!(!test.dir.path().join("antigo.txt").exists(), "the rest was migrated");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn pull_waker_brings_a_remote_change_long_before_the_interval() {
+    // The P2P channel wakes the pull watcher on a notice: a remote change
+    // arrives in seconds even with an hour-long polling interval.
+    let test = init_repo();
+    let bare = init_bare_remote();
+    let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+    test.repo.remote("origin", &bare_url).unwrap();
+    git_drive::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
+    let sync = SyncManager::new_full_with_pull(
+        test.dir.path().to_str().unwrap(),
+        "main".to_string(),
+        60,
+        Some("Alice".to_string()),
+        Some("a@x.com".to_string()),
+        Some("origin".to_string()),
+        None,
+        3600,
+    );
+    tokio::time::sleep(Duration::from_millis(4000)).await; // the boot pull ran
+    let dir_b = tempfile::tempdir().unwrap();
+    let repo_b = git2::Repository::clone(&bare_url, dir_b.path()).unwrap();
+    commit_file(&repo_b, "from_b.txt", b"hi", "from B");
+    git_drive::git::push_to_remote(&repo_b, "main", "origin", None).unwrap();
+
+    sync.pull_waker().notify_one();
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    assert!(file_exists(test.dir.path(), "from_b.txt"), "woken pull fetched the change");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn drain_push_is_reported_to_the_p2p_hook() {
+    let test = init_repo();
+    let bare = init_bare_remote();
+    let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+    test.repo.remote("origin", &bare_url).unwrap();
+    git_drive::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
+    let sync = mgr_with_remote(test.dir.path().to_str().unwrap(), "main", Some(("Alice", "a@x.com")));
+    let pushed: std::sync::Arc<std::sync::Mutex<Vec<git2::Oid>>> = Default::default();
+    let seen = pushed.clone();
+    sync.set_p2p(git_drive::sync::P2pHooks {
+        online: Default::default(),
+        idle_pull_interval_secs: 600,
+        on_pushed: std::sync::Arc::new(move |oid| seen.lock().unwrap().push(oid)),
+        on_head_changed: std::sync::Arc::new(|| {}),
+    });
+    sync.queue_write("a.txt", b"x".to_vec());
+    wait_flush().await;
+
+    let head = test.repo.head().unwrap().target().unwrap();
+    assert_eq!(*pushed.lock().unwrap(), vec![head], "the pushed commit is announced");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn an_unfinished_pull_cycle_retries_on_the_short_interval_even_when_online() {
+    // An online channel stretches polling to the idle interval, but a cycle
+    // that did not finish (here: the fetch fails) must come back on the
+    // regular one. Otherwise a rejected publish waits the whole idle interval
+    // (sandbox, 2026-10-14: two devices registering at once stayed diverged).
+    let test = init_repo();
+    let bare = init_bare_remote();
+    let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+    test.repo.remote("seed", &bare_url).unwrap();
+    git_drive::git::push_to_remote(&test.repo, "main", "seed", None).unwrap();
+    test.repo.remote("origin", "file:///nonexistent/remote.git").unwrap();
+    let sync = SyncManager::new_full_with_pull(
+        test.dir.path().to_str().unwrap(),
+        "main".to_string(),
+        60,
+        Some("Alice".to_string()),
+        Some("a@x.com".to_string()),
+        Some("origin".to_string()),
+        None,
+        2,
+    );
+    sync.set_p2p(git_drive::sync::P2pHooks {
+        online: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        idle_pull_interval_secs: 3600,
+        on_pushed: std::sync::Arc::new(|_| {}),
+        on_head_changed: std::sync::Arc::new(|| {}),
+    });
+    let dir_b = tempfile::tempdir().unwrap();
+    let repo_b = git2::Repository::clone(&bare_url, dir_b.path()).unwrap();
+    commit_file(&repo_b, "from_b.txt", b"hi", "from B");
+    git_drive::git::push_to_remote(&repo_b, "main", "origin", None).unwrap();
+
+    tokio::time::sleep(Duration::from_millis(3000)).await; // first cycle failed at ~2 s
+    test.repo.remote_set_url("origin", &bare_url).unwrap();
+    tokio::time::sleep(Duration::from_millis(5000)).await;
+    assert!(file_exists(test.dir.path(), "from_b.txt"), "retried on the 2 s interval, not 3600 s");
+}

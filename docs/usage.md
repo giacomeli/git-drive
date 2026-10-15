@@ -201,7 +201,11 @@ by `install`.
   "user_name": "Juliano",
   "user_email": "juliano@example.com",
   "remote_token": null,
-  "git_transport": "auto"
+  "git_transport": "auto",
+  "p2p_enabled": false,
+  "p2p_idle_pull_interval_secs": 600,
+  "log_level": "info",
+  "log_categories": { "network": "warn" }
 }
 ```
 
@@ -218,6 +222,13 @@ by `install`.
 | `user_name` / `user_email` | If either is `null`, git-drive **applies the changes to the working tree but does not commit**. Fill in both to get history. |
 | `remote_token` | PAT for HTTPS. `null` falls back to your git/ssh setup. |
 | `git_transport` | `auto` (default: system `git` when available), `cli` or `libgit2`. Only change it if `git` is missing or misbehaves on that machine. |
+| `p2p_enabled` | Instant sync between your devices (section 8.12). Default `false`: the drive syncs only by polling git, as always. Needs `user_name`/`user_email`. |
+| `p2p_idle_pull_interval_secs` | Pull interval while the P2P channel is online (default `600`): changes arrive as notices, polling is only the safety net. |
+| `p2p_key_file` | Device key of the channel. Default: `peer.key` next to the `config.json` in use, created on first start (0600). |
+| `p2p_device_name` | Name of this device in the registry. Default: the short hostname. |
+| `p2p_relay_url` | Your own relay server. Default: the public relays of n0 (they only see device ids and IP addresses, never content). |
+| `log_level` | Base level of the log file (`off`, `error`, `warn`, `info`, `debug`, `trace`). Default `info`. |
+| `log_categories` | Level per area: `sync`, `git`, `fuse`, `crypto`, `p2p`, `network` (the P2P network stack, `warn` unless set) and `service`. An unset area follows `log_level`; `off` keeps it out of the file. Easiest to edit in the Control Center (section 9.1.4). |
 
 ### 6.2. Quick recipe per scenario
 
@@ -430,6 +441,33 @@ git-drive key generate
 | Modifying `.git/` | The mounted repo's own `.git` is not exposed via FUSE. |
 | Git LFS | Repos with LFS show the text pointer, not the content (libgit2 without smudge/clean filters). |
 
+### 8.12. Instant sync between devices (P2P channel)
+
+By default every device asks git for changes every `pull_interval_secs` (60 s): a change made on one
+device takes up to a minute to appear on the others. With the P2P channel, the device that pushes
+tells the others right away, and they pull in seconds. With nothing happening, each device polls
+only every `p2p_idle_pull_interval_secs` (10 minutes).
+
+```bash
+# On every device: enable it in config.json and restart the daemon
+#    "p2p_enabled": true
+
+# Check the devices (registry read from the repo, online state from the daemon)
+git-drive peers
+#    mac (8f9180e8): this device
+#    allmight (8e83643b): online
+```
+
+| What to know | Detail |
+| --- | --- |
+| How devices find each other | Each device has a key (`peer.key`); its public key is its id. On its first start with the channel on, the device registers itself in `.git-drive/peers/` inside the repo (one commit, hidden in the mount). Only registered devices are accepted. |
+| Any network | Devices connect directly when they can (same LAN, or NAT hole punching) and through a relay otherwise. No VPN or open port needed. |
+| What travels | Only "I pushed commit X". File content still goes through git. Connections are end-to-end encrypted; the relays see device ids and IP addresses, never content. |
+| Measured | Sandbox with a Mac and a Linux machine (14-10-2026): a save appeared on the other machine 3.5 s later, of which 3 s were the write debounce; idle, zero pulls in 3 minutes. |
+| Fallback | The channel never blocks the drive. Off, offline or broken, the drive syncs by polling as before. A build without the `p2p` feature does not even contain the network code. |
+| Remove a device | `git-drive peers remove <name>` with the daemon stopped; the next start publishes the change. Devices are never removed automatically (a laptop asleep for a week stays registered). |
+| Mixed devices | A device without the channel is seen by the others only at the idle interval. Enable it on every device. |
+
 ---
 
 ## 9. Observe the sync cycle
@@ -489,8 +527,9 @@ git-drive tray
 
 A circular icon with the drive state: green (synced), orange (pending ops), red (conflict or
 failed push), gray (daemon stopped or stale status). The menu offers the status summary,
-"Open drive in Finder", "View live log" (Terminal with `tail -f`), "Detailed status", and
-"Quit tray". Install it together with the daemon via `git-drive install ... --with-tray` to start it at login.
+"Open drive in file manager", "Open Control Center", "Show log" (the Control Center at its Logs
+page) and "Quit tray". Without the Control Center installed, the last two open the simple status
+and log window instead. Install it together with the daemon via `git-drive install ... --with-tray` to start it at login.
 
 ### 9.1.3. Notifications
 
@@ -498,6 +537,51 @@ The daemon notifies via Notification Center on macOS (attributed to "Script Edit
 `notify-send` on Linux: merge conflict (with the clear names of the conflicted copies), failing
 push and pull blocked by a dirty working tree (both at most once per hour while they persist), and
 drive mounted/unmounted.
+
+### 9.1.4. Control Center
+
+A window with everything about the drive on this machine: sync state, disk space of the
+repository's volume, connected devices, commit activity of the last 24 hours, the live log,
+every setting of `config.json`, and buttons to start, stop and restart the daemon.
+
+Build it once (needs Node), then let `install` put it in place:
+
+```bash
+cd control-center
+npm install
+npm run tauri build -- --bundles app      # macOS (on Linux: npm run tauri build -- --no-bundle)
+cd ..
+./target/release/git-drive install -r <repo> -m <mount> --with-tray
+```
+
+`install` copies it to `~/.local/bin/git-drive-control-center`, plus
+`~/Applications/git-drive Control Center.app` on macOS (Spotlight, Dock) or a launcher entry on
+Linux. Open it from the tray ("Open Control Center"), the app launcher, or:
+
+```bash
+git-drive control-center              # Overview
+git-drive control-center --page logs  # straight to the log
+```
+
+| Page | What it shows and does |
+| --- | --- |
+| Overview | State headline, last commit, storage ring (repository, other data, free), devices of the P2P channel, commits per hour, uptime, last pull, changes waiting, conflicts. "Starting" while the daemon boots and the drive is not mounted yet. |
+| Logs | Live tail of the session log with filters by level, area and text, pause, and the Recording panel: base level and a level per area (`log_categories`). |
+| Settings | Theme: the accent color, picked like in macOS (Multicolor, Blue, Purple, Pink, Red, Orange, Yellow, Green, Graphite), applied at once and kept in `~/.config/git-drive/control-center.json`. Then every field of `config.json`, validated, saved atomically (permission 0600: it can hold the token). |
+| About | Version, login service, window effect, encryption and P2P state, and every file and folder git-drive uses, each with a Reveal button. |
+
+The daemon reads its config only at boot: "Save & restart" saves and restarts it (a clean stop:
+unmount, final sync, then a new boot). Start, Stop and Restart go through the login service,
+exactly like:
+
+```bash
+git-drive daemon stop      # unmount + final sync; also safe while the daemon is still booting
+git-drive daemon start
+git-drive daemon restart
+```
+
+On macOS 26 and later the window uses Liquid Glass (the desktop shows through, blurred); on older
+macOS the classic vibrancy. On Linux the glass is drawn inside the window.
 
 ## 10. Mount automatically at login (launchd / systemd)
 
@@ -586,7 +670,7 @@ processes holding open file descriptors on the mount (`lsof ~/GitDrive`).
 
 ```bash
 git-drive uninstall           # stops it for good (removes the agents)
-launchctl kill TERM gui/$UID/dev.giacomeli.git-drive   # stops just this instance (KeepAlive does NOT restart exit 0)
+git-drive daemon stop         # stops it until the next login or `git-drive daemon start`
 ```
 
 Confirm with `git-drive status` — it should show "stopped cleanly".

@@ -9,6 +9,10 @@ use crate::paths;
 
 /// `git-drive install`: dispatches to the platform's service manager.
 pub fn install(repo: &str, mount: &str, with_tray: bool) -> anyhow::Result<()> {
+    // Before the service: the tray it starts opens the Control Center.
+    if let Err(e) = install_control_center() {
+        eprintln!("control center: not installed: {}", e);
+    }
     #[cfg(target_os = "macos")]
     {
         crate::launchd::install(repo, mount, with_tray)
@@ -65,6 +69,80 @@ pub(crate) fn install_binary_from(current: &Path, target: &Path) -> anyhow::Resu
     Ok(())
 }
 
+/// Installs the Control Center when it was built next to this executable
+/// (`npm run tauri build` in `control-center/` puts it in `target/release`):
+/// the binary at `~/.local/bin/git-drive-control-center`, plus the app bundle
+/// in `~/Applications` on macOS or a launcher entry and icon on Linux.
+/// Optional: without a build, the tray keeps the egui status viewer.
+pub fn install_control_center() -> anyhow::Result<Option<PathBuf>> {
+    let exe = std::env::current_exe()?;
+    let dir = exe.parent().unwrap_or(Path::new("."));
+    let built = dir.join("git-drive-control-center");
+    if !built.is_file() {
+        println!("control center: not built, skipped (cd control-center && npm install && npm run tauri build)");
+        return Ok(None);
+    }
+    let target = paths::installed_control_center_path();
+    install_binary_from(&built, &target)?;
+    #[cfg(target_os = "macos")]
+    {
+        let bundle = dir.join("bundle/macos/git-drive Control Center.app");
+        if bundle.is_dir() {
+            let app = paths::control_center_app_path();
+            if let Some(parent) = app.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let _ = std::fs::remove_dir_all(&app);
+            // ditto keeps the bundle's metadata and code signature intact.
+            let out = std::process::Command::new("ditto").arg(&bundle).arg(&app).output()?;
+            if !out.status.success() {
+                anyhow::bail!("ditto {}: {}", app.display(), String::from_utf8_lossy(&out.stderr).trim());
+            }
+            println!("control center: {}", app.display());
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let share = paths::home_dir().join(".local/share");
+        let icon_dir = share.join("icons/hicolor/256x256/apps");
+        std::fs::create_dir_all(&icon_dir)?;
+        std::fs::write(icon_dir.join("git-drive-control-center.png"), CONTROL_CENTER_ICON)?;
+        let apps = share.join("applications");
+        std::fs::create_dir_all(&apps)?;
+        std::fs::write(apps.join("git-drive-control-center.desktop"), render_desktop_entry(&target))?;
+        println!("control center: launcher entry in {}", apps.display());
+    }
+    Ok(Some(target))
+}
+
+#[cfg(not(target_os = "macos"))]
+const CONTROL_CENTER_ICON: &[u8] = include_bytes!("../control-center/src-tauri/icons/128x128@2x.png");
+
+/// Launcher entry for the Control Center (pure). `Exec` quotes the path with
+/// the Desktop Entry escapes: `"`, `` ` ``, `$` and `\` inside quotes, `%`
+/// doubled.
+pub fn render_desktop_entry(binary: &Path) -> String {
+    let mut exec = String::from("\"");
+    for ch in binary.to_string_lossy().chars() {
+        match ch {
+            '"' | '`' | '$' => {
+                exec.push('\\');
+                exec.push(ch);
+            }
+            // A literal backslash in a quoted argument takes four (string
+            // escape first, then the quoting rule).
+            '\\' => exec.push_str("\\\\\\\\"),
+            '%' => exec.push_str("%%"),
+            _ => exec.push(ch),
+        }
+    }
+    exec.push('"');
+    format!(
+        "[Desktop Entry]\nType=Application\nName=git-drive Control Center\nComment=Status, logs and settings of git-drive\nExec={}\nIcon=git-drive-control-center\nTerminal=false\nCategories=Utility;System;\nStartupWMClass=git-drive-control-center\n",
+        exec
+    )
+}
+
 /// Moves config/key from a legacy location (pre-rename `drive-sync` dirs,
 /// pre-2026-07-06 Application Support) to `~/.config/git-drive` when the
 /// canonical file does not exist yet.
@@ -108,6 +186,17 @@ pub fn ensure_config() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_desktop_entry_launches_the_installed_control_center() {
+        let entry = render_desktop_entry(Path::new("/home/u/my apps/git-drive-control-center"));
+        assert!(entry.starts_with("[Desktop Entry]\n"), "{}", entry);
+        assert!(entry.contains("\nExec=\"/home/u/my apps/git-drive-control-center\"\n"), "{}", entry);
+        assert!(entry.contains("\nIcon=git-drive-control-center\n"), "{}", entry);
+        assert!(entry.contains("\nType=Application\n"), "{}", entry);
+        let tricky = render_desktop_entry(Path::new("/x/a\"b$c/bin"));
+        assert!(tricky.contains("Exec=\"/x/a\\\"b\\$c/bin\""), "{}", tricky);
+    }
 
     #[test]
     fn install_binary_copies_atomically_and_is_idempotent() {

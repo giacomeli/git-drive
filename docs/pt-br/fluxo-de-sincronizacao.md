@@ -216,7 +216,7 @@ Erros são logados e o lote segue — arquivos restantes são tentados. **Sem at
 
 `src/sync.rs::spawn_pull_watcher`. Roda somente se `pull_interval_secs > 0` **e** `remote_name` está configurado.
 
-1. Loop: a primeira iteração dorme `min(pull_interval_secs, 3)` segundos — uma máquina acordando ou religando se atualiza em segundos — e as seguintes `pull_interval_secs`.
+1. Loop: a primeira iteração dorme `min(pull_interval_secs, 3)` segundos — uma máquina acordando ou religando se atualiza em segundos — e as seguintes `pull_interval_secs`, esticado para `p2p_idle_pull_interval_secs` enquanto o canal P2P está online (`next_pull_delay`). O aviso de um peer acorda o loop na hora (`pull_now`). Um ciclo que não terminou — pulado, erro de fetch ou merge, publicação recusada — sempre volta em `pull_interval_secs`: o intervalo ocioso pressupõe que não sobrou nada a fazer.
 2. Se a fila não está vazia, pula a iteração (não rouba tempo do commit local).
 3. Adquire `repo_lock` — serializa com o drain.
 4. **Guarda de working tree**: `git::is_working_tree_clean` (staged, unstaged e untracked; ignorados fora). Tree suja pula a iteração — o checkout force do fast-forward destruiria mudanças locais não commitadas. No modo sem identidade (commits pulados por design), a primeira escrita local bloqueia o pull até o usuário commitar manualmente ou configurar identidade — comportamento aceito e registrado nas decisões da Fase 0.
@@ -225,6 +225,39 @@ Erros são logados e o lote segue — arquivos restantes são tentados. **Sem at
 7. Qualquer outcome que toque a tree (`FastForwarded`/`Merged`/`Conflicted`) seta `refresh_flag = true`.
 8. Se a branch local tem commits que `refs/remotes/origin/<branch>` não tem e a ponta remota é ancestral (`local_ahead_of_remote`) — push que falhou offline, sessão anterior que morreu antes de publicar, ou o commit de merge recém-criado —, `publish_progressive` publica nesse mesmo ciclo. Antes, eles esperavam a próxima escrita local, então uma máquina que ficou quieta depois de escrever offline nunca sincronizava.
 9. Toda iteração registra o outcome em `status.record_pull` — inclusive os pulos ("fila de sync pendente", "working tree sujo") e erros de fetch/merge. Conflicted copies entram na lista `conflicts` do status pelo nome em claro (no modo cifrado o merge enxerga nomes de disco base32/`dslong_`; `conflict_copies_for_display` decodifica, resolvendo sidecars).
+
+---
+
+## Canal P2P de avisos
+
+`src/peer/` (opcional: `p2p_enabled`; código de rede só com a feature `p2p` do cargo). Os dispositivos avisam uns aos outros "fiz push do commit X"; quem recebe acorda o pull watcher. O git continua a fonte da verdade: o aviso é uma dica, então um aviso perdido, duplicado ou atrasado só atrasa a mudança até o próximo polling, e o canal nunca escreve no repositório.
+
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'primaryColor':'#E3F2FD','primaryTextColor':'#0D47A1','primaryBorderColor':'#1976D2','lineColor':'#546E7A'}}}%%
+sequenceDiagram
+    accTitle: Push anunciado pelo canal P2P
+    accDescr: O dispositivo A faz push, anuncia o commit para B pelo iroh, e B acorda o pull watcher, que busca e faz merge pelo git.
+
+    participant A as git-drive A
+    participant GH as Remote (git)
+    participant B as git-drive B
+
+    A->>GH: push (drain, reconcile ou publicacao de pendentes)
+    A->>B: Pushed(branch, commit)
+    B->>B: commit desconhecido: pull_now.notify_one()
+    B->>GH: fetch + merge (mesmo ciclo e guardas do pull por tempo)
+    Note over A,B: ao (re)conectar, os dois lados mandam Hello(branch, head)
+```
+
+| Peça | Papel |
+| --- | --- |
+| `peer::identity` | Segredo do dispositivo (semente da chave do iroh), 64 hex, 0600, `peer.key` ao lado da config em uso. |
+| `peer::registry` | `.git-drive/peers/<id>` (id = chave pública em hex), um arquivo por dispositivo para registros simultâneos nunca conflitarem; conteúdo `{"name"}` selado no drive cifrado. Commit de auto-registro no boot, sob o `repo_lock`. `.git-drive/` é reservado (`reserved::is_reserved_path`): invisível no mount e ignorado pelas varreduras. |
+| `peer::protocol` | `Hello`/`Pushed`, JSON, no máximo 4 KiB, ALPN `git-drive/notify/1`; `should_wake` = nosso branch e um commit que o repo não tem. |
+| `peer::node` | Endpoint iroh (relays da n0 por padrão, `p2p_relay_url` para relay próprio). Os dois lados discam para cada dispositivo registrado; quando duas conexões chegam, fica a que o ID menor iniciou. Conexão de um ID fora do registro é fechada (código 1, para quem discou continuar no backoff até 60 s em vez de rediscar a cada segundo) e acorda o nosso pull, porque o dispositivo pode ter se registrado depois do nosso último pull: por dispositivo, a primeira recusa acorda na hora e a janela dobra de 30 s até 1 h (um dispositivo removido ainda ligado custa um fetch por hora), e no total no máximo um despertar a cada 30 s. Um dispositivo fora do próprio registro (removido) não disca para ninguém. |
+| `peer::channel` | Ligação no boot: chave, registro, nó, `SyncManager::set_p2p` (`on_pushed` -> `announce`, `on_head_changed` -> releitura do registro) e a seção `p2p` do `status.json`. |
+
+Online = conexão com o relay ou pelo menos uma conexão viva com um peer. Qualquer falha (chave, bind, relay, DNS) só deixa o canal offline: o polling volta a `pull_interval_secs`.
 
 ---
 
@@ -316,6 +349,7 @@ Write+Delete (o lado efêmero é filtrado individualmente).
 3. **Sem cancelamento.** Ops enfileiradas sempre rodam — não há API para descartar um `queue_write` antes do debounce.
 4. **TTL de FUSE vs refresh.** `TTL = 1s` no kernel faz o refresh demorar até 1s extra para aparecer ao usuário.
 5. **Falha persistente de push mantém os commits locais.** Depois das rodadas do reconcile, os commits ficam locais; todo ciclo de pull tenta publicar de novo assim que o remote volta a ser alcançável.
+6. **Canal P2P e dispositivos mistos.** Um dispositivo sem o canal (ou com ele quebrado sem perceber) só é visto pelos outros em `p2p_idle_pull_interval_secs`. Por padrão, os relays da n0 veem IDs e IPs dos dispositivos (nunca conteúdo).
 
 ---
 

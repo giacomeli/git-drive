@@ -68,6 +68,51 @@ impl SyncOp {
     }
 }
 
+/// Hooks the P2P notification channel plugs into the sync cycles
+/// (`SyncManager::set_p2p`). The sync side never knows the transport: it
+/// reports pushes and HEAD changes, and reads whether notices can arrive.
+#[derive(Clone)]
+pub struct P2pHooks {
+    /// Raised by the channel while it can deliver notices.
+    pub online: Arc<AtomicBool>,
+    /// Pull interval while `online`: polling is only the safety net then.
+    pub idle_pull_interval_secs: u64,
+    /// Called with HEAD after every successful push (drain, reconcile, the
+    /// pull watcher's publication of pending commits).
+    pub on_pushed: Arc<dyn Fn(git2::Oid) + Send + Sync>,
+    /// Called after a pull or a recovery moved HEAD: the device registry may
+    /// have changed.
+    pub on_head_changed: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// Seconds until the next pull: the configured interval, stretched to the
+/// idle one while the P2P channel is online (pushes then arrive as notices).
+pub fn next_pull_delay(pull_interval_secs: u64, idle_secs: Option<u64>, online: bool) -> u64 {
+    match idle_secs {
+        Some(idle) if online => idle,
+        _ => pull_interval_secs,
+    }
+}
+
+/// Announces HEAD to the channel after a successful push (no-op without it).
+fn announce_head(p2p: &Mutex<Option<P2pHooks>>, repo_path: &Path) {
+    let Some(hooks) = p2p.lock().clone() else { return };
+    let head = git::open_repo(repo_path.to_str().unwrap_or(""))
+        .ok()
+        .and_then(|r| r.head().ok().and_then(|h| h.target()));
+    if let Some(head) = head {
+        (hooks.on_pushed)(head);
+    }
+}
+
+/// Tells the channel HEAD moved (no-op without it).
+fn head_changed(p2p: &Mutex<Option<P2pHooks>>) {
+    let hooks = p2p.lock().clone();
+    if let Some(hooks) = hooks {
+        (hooks.on_head_changed)();
+    }
+}
+
 #[derive(Clone)]
 pub struct SyncManager {
     inner: Arc<Mutex<Inner>>,
@@ -108,6 +153,10 @@ pub struct SyncManager {
     /// Key available ONLY for the migration back to cleartext (config turned
     /// off but the worktree still encrypted — decrypting requires the key).
     migration_crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
+    /// Wakes the pull watcher before its interval (a peer's notice).
+    pull_now: Arc<Notify>,
+    /// P2P channel hooks; `None` = channel off, behavior as without it.
+    p2p: Arc<Mutex<Option<P2pHooks>>>,
 }
 
 struct Inner {
@@ -215,6 +264,8 @@ impl SyncManager {
             commit_batch_bytes: Arc::new(AtomicU64::new(256 * 1024 * 1024)),
             crypto: Arc::new(Mutex::new(None)),
             migration_crypto: Arc::new(Mutex::new(None)),
+            pull_now: Arc::new(Notify::new()),
+            p2p: Arc::new(Mutex::new(None)),
         };
 
         manager.spawn_watcher();
@@ -235,6 +286,17 @@ impl SyncManager {
     /// internal watchers use the same mechanism via a clone of the `Arc`.
     pub fn raise_refresh_flag(&self) {
         self.refresh_flag.store(true, Ordering::SeqCst);
+    }
+
+    /// Wakes the pull watcher before its interval; wakes arriving while a
+    /// pull runs coalesce into one more cycle.
+    pub fn pull_waker(&self) -> Arc<Notify> {
+        self.pull_now.clone()
+    }
+
+    /// Plugs the P2P channel into the sync cycles.
+    pub fn set_p2p(&self, hooks: P2pHooks) {
+        *self.p2p.lock() = Some(hooks);
     }
 
     /// Number of local commits created by the drain since boot. Monotonic.
@@ -294,6 +356,7 @@ impl SyncManager {
             commit_batch_bytes: self.commit_batch_bytes.clone(),
             crypto: self.crypto.clone(),
             migration_crypto: self.migration_crypto.clone(),
+            p2p: self.p2p.clone(),
         }
     }
 
@@ -390,16 +453,40 @@ impl SyncManager {
         let status = self.status.clone();
         let notifier = self.notifier.clone();
         let crypto = self.crypto.clone();
+        let pull_now = self.pull_now.clone();
+        let p2p = self.p2p.clone();
 
         task::spawn(async move {
             // The first pull runs right after boot (not one full interval
             // later): a machine waking up or relaunching catches up with the
             // remote — and publishes commits a previous session left unpushed
             // — within seconds.
-            let mut delay = interval_secs.min(3);
+            let mut first = true;
+            // A cycle that did not finish (skipped, fetch/merge error, publish
+            // refused) comes back on the regular interval even with the P2P
+            // channel online: the idle interval assumes nothing is left to do,
+            // and a rejected publish would otherwise wait it out (sandbox,
+            // 2026-10-14). Only a cycle that ran to the end clears it.
+            let mut retry_soon = false;
             loop {
-                sleep(Duration::from_secs(delay)).await;
-                delay = interval_secs;
+                let delay = if first {
+                    interval_secs.min(3)
+                } else if retry_soon {
+                    interval_secs
+                } else {
+                    let hooks = p2p.lock();
+                    next_pull_delay(
+                        interval_secs,
+                        hooks.as_ref().map(|h| h.idle_pull_interval_secs),
+                        hooks.as_ref().is_some_and(|h| h.online.load(Ordering::SeqCst)),
+                    )
+                };
+                first = false;
+                retry_soon = true;
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(delay)) => {}
+                    _ = pull_now.notified() => log::info!("pull: woken by a peer's notice"),
+                }
 
                 // Skip the pull while a batch is pending (avoids racing the local commit)
                 let pending = { !inner.lock().buffer.is_empty() };
@@ -428,7 +515,10 @@ impl SyncManager {
                 // reads as "dirty", and an idle machine (no local write, so
                 // no drain) would skip every pull from then on.
                 match git::recover_interrupted_update(&repo) {
-                    Ok(true) => refresh_flag.store(true, Ordering::SeqCst),
+                    Ok(true) => {
+                        refresh_flag.store(true, Ordering::SeqCst);
+                        head_changed(&p2p);
+                    }
                     Ok(false) => {}
                     Err(e) => log::error!("pull: recovering an interrupted update failed: {}", e),
                 }
@@ -490,11 +580,13 @@ impl SyncManager {
                         log::info!("pull: fast-forward applied");
                         status.record_pull("fast-forward");
                         refresh_flag.store(true, Ordering::SeqCst);
+                        head_changed(&p2p);
                     }
                     Ok(git::MergeOutcome::Merged) => {
                         log::info!("pull: 3-way merge, no conflicts");
                         status.record_pull("3-way merge");
                         refresh_flag.store(true, Ordering::SeqCst);
+                        head_changed(&p2p);
                     }
                     Ok(git::MergeOutcome::Conflicted { resolved, suffix }) => {
                         log::warn!(
@@ -510,6 +602,7 @@ impl SyncManager {
                         status.add_conflicts(copies.clone());
                         notifier.notify(NotifyEvent::Conflicts { copies });
                         refresh_flag.store(true, Ordering::SeqCst);
+                        head_changed(&p2p);
                     }
                     Err(e) => {
                         log::error!("pull: merge error: {}", e);
@@ -517,6 +610,8 @@ impl SyncManager {
                         continue;
                     }
                 }
+
+                retry_soon = false;
 
                 // Local commits the remote does not have yet — a push that
                 // failed while offline, a previous session that died before
@@ -535,8 +630,10 @@ impl SyncManager {
                     .ok();
                     if ok {
                         notifier.reset(notify::KEY_PUSH_FAILED);
+                        announce_head(&p2p, &repo_path);
                     } else {
                         notifier.notify(NotifyEvent::PushFailed);
+                        retry_soon = true;
                     }
                 }
             }
@@ -682,6 +779,7 @@ struct DrainCtx {
     commit_batch_bytes: Arc<AtomicU64>,
     crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
     migration_crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
+    p2p: Arc<Mutex<Option<P2pHooks>>>,
 }
 
 /// Takes the whole queue plus its journal boundary (the last seq the taken
@@ -902,6 +1000,7 @@ impl DrainCtx {
                 if ok {
                     pushed = Some(true);
                     self.notifier.reset(notify::KEY_PUSH_FAILED);
+                    announce_head(&self.p2p, &self.repo_path);
                 } else {
                     let recovered = reconcile_and_retry_push(
                         &self.repo_path,
@@ -918,6 +1017,7 @@ impl DrainCtx {
                     if recovered {
                         self.refresh_flag.store(true, Ordering::SeqCst);
                         self.notifier.reset(notify::KEY_PUSH_FAILED);
+                        announce_head(&self.p2p, &self.repo_path);
                     } else {
                         // Push + reconcile failed: local commits left unpublished.
                         self.notifier.notify(NotifyEvent::PushFailed);
@@ -2162,10 +2262,7 @@ impl SweepScope {
             SweepScope::Full => walk_worktree_files(repo_path),
             SweepScope::Paths { paths, .. } => paths
                 .iter()
-                .filter(|rel| {
-                    !rel.starts_with(".git/")
-                        && !rel.starts_with(&format!("{}/", crate::chunk::CHUNKS_DIR))
-                })
+                .filter(|rel| !rel.starts_with(".git/") && !crate::reserved::is_reserved_path(rel))
                 .filter_map(|rel| {
                     let full = repo_path.join(rel);
                     let meta = std::fs::symlink_metadata(&full).ok()?;
@@ -2319,7 +2416,7 @@ fn walk_worktree_files(repo_path: &Path) -> Vec<(std::path::PathBuf, String)> {
             if name == ".git" {
                 continue;
             }
-            if dir == repo_path && name == crate::chunk::CHUNKS_DIR {
+            if dir == repo_path && crate::reserved::is_reserved_path(&name.to_string_lossy()) {
                 continue;
             }
             let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
@@ -2844,6 +2941,13 @@ mod tests {
         // (unencrypted) commit message.
         let m = build_commit_message(&ops, true);
         assert_eq!(m, "git-drive: 2 changes");
+    }
+
+    #[test]
+    fn next_pull_delay_stretches_only_while_the_channel_is_online() {
+        assert_eq!(next_pull_delay(60, None, false), 60, "no channel: as before");
+        assert_eq!(next_pull_delay(60, Some(600), false), 60, "channel offline: as before");
+        assert_eq!(next_pull_delay(60, Some(600), true), 600, "online: notices carry the news");
     }
 
     #[test]

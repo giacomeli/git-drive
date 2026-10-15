@@ -201,7 +201,11 @@ identidade). Instalações antigas (`~/.config/drive-sync/`, Application Support
   "user_name": "Juliano",
   "user_email": "juliano@example.com",
   "remote_token": null,
-  "git_transport": "auto"
+  "git_transport": "auto",
+  "p2p_enabled": false,
+  "p2p_idle_pull_interval_secs": 600,
+  "log_level": "info",
+  "log_categories": { "network": "warn" }
 }
 ```
 
@@ -218,6 +222,13 @@ identidade). Instalações antigas (`~/.config/drive-sync/`, Application Support
 | `user_name` / `user_email` | Se qualquer um for `null`, git-drive **aplica as mudanças no working tree mas não commita**. Deixe ambos preenchidos para ter histórico. |
 | `remote_token` | PAT para HTTPS. `null` cai para o seu setup de git/ssh. |
 | `git_transport` | `auto` (padrão: `git` do sistema quando disponível), `cli` ou `libgit2`. Só mude se o `git` faltar ou se comportar mal naquela máquina. |
+| `p2p_enabled` | Sincronização instantânea entre os seus dispositivos (seção 8.12). Padrão `false`: o drive sincroniza só consultando o git, como sempre. Exige `user_name`/`user_email`. |
+| `p2p_idle_pull_interval_secs` | Intervalo do pull enquanto o canal P2P está online (padrão `600`): as mudanças chegam como aviso, e o polling é só a rede de segurança. |
+| `p2p_key_file` | Chave do dispositivo no canal. Padrão: `peer.key` ao lado do `config.json` em uso, criada na primeira subida (0600). |
+| `p2p_device_name` | Nome deste dispositivo no registro. Padrão: o hostname curto. |
+| `p2p_relay_url` | Servidor de relay próprio. Padrão: os relays públicos da n0 (veem só IDs e IPs dos dispositivos, nunca conteúdo). |
+| `log_level` | Nível base do arquivo de log (`off`, `error`, `warn`, `info`, `debug`, `trace`). Padrão `info`. |
+| `log_categories` | Nível por área: `sync`, `git`, `fuse`, `crypto`, `p2p`, `network` (a pilha de rede do P2P, `warn` se não definido) e `service`. Área sem nível segue o `log_level`; `off` tira a área do arquivo. Mais fácil de editar na Central de Controle (seção 9.1.4). |
 
 ### 6.2. Receita rápida por cenário
 
@@ -428,6 +439,33 @@ git-drive key generate
 | Modificar `.git/` | O próprio `.git` do repo montado não é exposto via FUSE. |
 | Git LFS | Repos com LFS mostram o ponteiro de texto, não o conteúdo (libgit2 sem filtros smudge/clean). |
 
+### 8.12. Sincronização instantânea entre dispositivos (canal P2P)
+
+Por padrão, cada dispositivo consulta o git a cada `pull_interval_secs` (60 s): uma mudança feita num
+dispositivo leva até um minuto para aparecer nos outros. Com o canal P2P, quem faz o push avisa os
+outros na hora, e eles buscam em segundos. Sem atividade, cada dispositivo consulta só a cada
+`p2p_idle_pull_interval_secs` (10 minutos).
+
+```bash
+# Em cada dispositivo: ligue no config.json e reinicie o daemon
+#    "p2p_enabled": true
+
+# Confira os dispositivos (registro lido do repo, estado online vindo do daemon)
+git-drive peers
+#    mac (8f9180e8): this device
+#    allmight (8e83643b): online
+```
+
+| O que saber | Detalhe |
+| --- | --- |
+| Como os dispositivos se encontram | Cada dispositivo tem uma chave (`peer.key`); a chave pública é o ID dele. Na primeira subida com o canal ligado, o dispositivo se registra em `.git-drive/peers/` dentro do repo (um commit, invisível no mount). Só dispositivos registrados são aceitos. |
+| Qualquer rede | Os dispositivos conectam direto quando conseguem (mesma LAN ou hole punching no NAT) e por um relay quando não. Sem VPN e sem abrir porta. |
+| O que trafega | Só "fiz push do commit X". O conteúdo dos arquivos continua indo pelo git. As conexões são cifradas de ponta a ponta; os relays veem IDs e IPs dos dispositivos, nunca conteúdo. |
+| Medido | Sandbox com um Mac e uma máquina Linux (14-10-2026): um arquivo salvo apareceu na outra máquina 3,5 s depois, dos quais 3 s eram o debounce de escrita; parados, zero pulls em 3 minutos. |
+| Fallback | O canal nunca trava o drive. Desligado, offline ou quebrado, o drive sincroniza por polling como antes. Um binário sem a feature `p2p` nem contém o código de rede. |
+| Remover um dispositivo | `git-drive peers remove <nome>` com o daemon parado; a próxima subida publica a mudança. Dispositivos nunca são removidos automaticamente (um laptop dormindo uma semana continua registrado). |
+| Dispositivos mistos | Um dispositivo sem o canal só é visto pelos outros no intervalo ocioso. Ligue em todos. |
+
 ---
 
 ## 9. Observar o ciclo de sincronização
@@ -487,8 +525,9 @@ git-drive tray
 
 Ícone circular com o estado do drive: verde (sincronizado), laranja (ops pendentes), vermelho
 (conflito ou push falho), cinza (daemon parado ou status stale). O menu traz o resumo do status,
-"Abrir drive no Finder", "Ver log em tempo real" (Terminal com `tail -f`), "Status detalhado" e
-"Sair da tray". Instale junto do daemon com `git-drive install ... --with-tray` para subir no login.
+"Open drive in file manager", "Open Control Center", "Show log" (a Central de Controle na página
+de logs) e "Quit tray". Sem a Central de Controle instalada, os dois últimos abrem a janela simples
+de status e log. Instale junto do daemon com `git-drive install ... --with-tray` para subir no login.
 
 ### 9.1.3. Notificações
 
@@ -496,6 +535,52 @@ O daemon notifica via Central de Notificações no macOS (atribuídas ao "Script
 `notify-send` no Linux: conflito de merge (com os nomes em claro das conflicted copies), push falho
 e pull bloqueado por working tree sujo (ambos no máximo uma vez por hora enquanto persistirem), e
 drive montado/desmontado.
+
+### 9.1.4. Central de Controle
+
+Uma janela com tudo sobre o drive nesta máquina: estado da sincronização, espaço do volume do
+repositório, dispositivos conectados, commits das últimas 24 horas, o log ao vivo, todos os campos
+do `config.json` e botões para iniciar, parar e reiniciar o daemon. A interface é em inglês, como a
+CLI e o tray.
+
+Compile uma vez (precisa de Node) e deixe o `install` instalar:
+
+```bash
+cd control-center
+npm install
+npm run tauri build -- --bundles app      # macOS (no Linux: npm run tauri build -- --no-bundle)
+cd ..
+./target/release/git-drive install -r <repo> -m <mount> --with-tray
+```
+
+O `install` copia para `~/.local/bin/git-drive-control-center` e, no macOS, para
+`~/Applications/git-drive Control Center.app` (Spotlight, Dock); no Linux cria a entrada no lançador
+de aplicativos. Abra pelo tray ("Open Control Center"), pelo lançador ou:
+
+```bash
+git-drive control-center              # Overview
+git-drive control-center --page logs  # direto no log
+```
+
+| Página | O que mostra e faz |
+| --- | --- |
+| Overview | Estado do drive, último commit, anel de armazenamento (repositório, outros dados, livre), dispositivos do canal P2P, commits por hora, tempo no ar, último pull, mudanças esperando e conflitos. Mostra "Starting" enquanto o daemon sobe e o drive ainda não montou. |
+| Logs | Final ao vivo do log da sessão com filtros por nível, área e texto, pausa e o painel Recording: nível base e um nível por área (`log_categories`). |
+| Settings | Theme: a cor de destaque, escolhida como no macOS (Multicolor, Blue, Purple, Pink, Red, Orange, Yellow, Green, Graphite), aplicada na hora e guardada em `~/.config/git-drive/control-center.json`. Depois, todos os campos do `config.json`, validados e salvos de forma atômica (permissão 0600: pode conter o token). |
+| About | Versão, serviço de login, efeito da janela, estado da criptografia e do P2P, e cada arquivo e pasta que o git-drive usa, com botão Reveal. |
+
+O daemon só lê a config no boot: "Save & restart" salva e reinicia (parada limpa: unmount,
+sincronização final e boot novo). Start, Stop e Restart passam pelo serviço de login, exatamente
+como:
+
+```bash
+git-drive daemon stop      # unmount + sincronização final; seguro mesmo com o daemon ainda subindo
+git-drive daemon start
+git-drive daemon restart
+```
+
+No macOS 26 ou posterior a janela usa Liquid Glass (o fundo da área de trabalho aparece desfocado);
+em versões anteriores, o vibrancy clássico. No Linux o vidro é desenhado dentro da janela.
 
 ## 10. Montar automaticamente no login (launchd / systemd)
 
@@ -583,7 +668,7 @@ file descriptors abertos no mount (`lsof ~/GitDrive`).
 
 ```bash
 git-drive uninstall           # para de vez (remove os agentes)
-launchctl kill TERM gui/$UID/dev.giacomeli.git-drive   # para só a instância (KeepAlive NÃO religa exit 0)
+git-drive daemon stop         # para até o próximo login ou até `git-drive daemon start`
 ```
 
 Confirme com `git-drive status` — deve mostrar "encerrado de forma limpa".

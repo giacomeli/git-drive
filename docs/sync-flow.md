@@ -216,7 +216,7 @@ Errors are logged and the batch proceeds — the remaining files are still attem
 
 `src/sync.rs::spawn_pull_watcher`. Runs only if `pull_interval_secs > 0` **and** `remote_name` is configured.
 
-1. Loop: the first iteration sleeps `min(pull_interval_secs, 3)` seconds — a machine waking up or relaunching catches up within seconds — and every later one `pull_interval_secs`.
+1. Loop: the first iteration sleeps `min(pull_interval_secs, 3)` seconds — a machine waking up or relaunching catches up within seconds — and every later one `pull_interval_secs`, stretched to `p2p_idle_pull_interval_secs` while the P2P channel is online (`next_pull_delay`). A peer's notice wakes the loop at once (`pull_now`). A cycle that did not finish — skipped, fetch or merge error, publish refused — always comes back on `pull_interval_secs`: the idle interval assumes nothing is left to do.
 2. If the queue is not empty, skips the iteration (does not steal time from the local commit).
 3. Acquires `repo_lock` — serializes with the drain.
 4. **Working tree guard**: `git::is_working_tree_clean` (staged, unstaged and untracked; ignored files excluded). A dirty tree skips the iteration — the fast-forward's checkout force would destroy uncommitted local changes. In identity-less mode (commits skipped by design), the first local write blocks the pull until the user commits manually or configures an identity — accepted behavior, recorded in the Phase 0 (data integrity) decisions.
@@ -225,6 +225,39 @@ Errors are logged and the batch proceeds — the remaining files are still attem
 7. Any outcome that touches the tree (`FastForwarded`/`Merged`/`Conflicted`) sets `refresh_flag = true`.
 8. If the local branch has commits that `refs/remotes/origin/<branch>` lacks and the remote tip is an ancestor (`local_ahead_of_remote`) — a push that failed while offline, a previous session that died before publishing, or the merge commit just created — `publish_progressive` publishes them in this same cycle. Before, they waited for the next local write, so a machine that went quiet after an offline write never synced.
 9. Every iteration records the outcome in `status.record_pull` — including the skips ("sync queue pending", "dirty working tree") and fetch/merge errors. Conflicted copies enter the status's `conflicts` list by their clear name (in encrypted mode the merge sees base32/`dslong_` disk names; `conflict_copies_for_display` decodes them, resolving sidecars).
+
+---
+
+## P2P notification channel
+
+`src/peer/` (opt-in: `p2p_enabled`; network code only with the `p2p` cargo feature). Devices tell each other "I pushed commit X"; the receiver wakes its pull watcher. Git stays the source of truth: a notice is a hint, so a lost, duplicated or late one only delays a change until the next poll, and the channel never writes to the repository.
+
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'primaryColor':'#E3F2FD','primaryTextColor':'#0D47A1','primaryBorderColor':'#1976D2','lineColor':'#546E7A'}}}%%
+sequenceDiagram
+    accTitle: A push announced over the P2P channel
+    accDescr: Device A pushes, announces the commit to B over iroh, and B wakes its pull watcher, which fetches and merges through git.
+
+    participant A as git-drive A
+    participant GH as Remote (git)
+    participant B as git-drive B
+
+    A->>GH: push (drain, reconcile or publication of pending commits)
+    A->>B: Pushed(branch, commit)
+    B->>B: commit unknown locally: pull_now.notify_one()
+    B->>GH: fetch + merge (same cycle and guards as a timed pull)
+    Note over A,B: on (re)connection both sides send Hello(branch, head)
+```
+
+| Piece | Role |
+| --- | --- |
+| `peer::identity` | Device secret (iroh key seed), 64 hex, 0600, `peer.key` next to the config in use. |
+| `peer::registry` | `.git-drive/peers/<id>` (id = public key in hex), one file per device so concurrent registrations never conflict; content `{"name"}` sealed on an encrypted drive. Self-registration commit at boot, under `repo_lock`. `.git-drive/` is reserved (`reserved::is_reserved_path`): hidden in the mount, skipped by the sweeps. |
+| `peer::protocol` | `Hello`/`Pushed`, JSON, 4 KiB max, ALPN `git-drive/notify/1`; `should_wake` = our branch and a commit the repo lacks. |
+| `peer::node` | iroh endpoint (n0 relays by default, `p2p_relay_url` for an own relay). Both sides dial every registered device; when two connections land, the one the smaller id initiated stays. A connection from an unregistered id is closed (code 1, so its dialer keeps backing off up to 60 s instead of redialing every second) and wakes our pull, because the device may have registered after our last pull: per device the first refusal wakes at once, then the window doubles from 30 s to 1 h (a removed device still running costs one fetch an hour), and at most one such wake happens per 30 s overall. A device missing from its own registry (removed) dials nobody. |
+| `peer::channel` | Boot glue: key, registration, node, `SyncManager::set_p2p` (`on_pushed` -> `announce`, `on_head_changed` -> registry reload) and the `p2p` section of `status.json`. |
+
+Online = a relay connection or at least one live peer connection. Any failure (key, bind, relay, DNS) only leaves the channel offline: polling goes back to `pull_interval_secs`.
 
 ---
 
@@ -316,6 +349,7 @@ the Write+Delete translation (the ephemeral side is filtered individually).
 3. **No cancellation.** Enqueued ops always run — there is no API to discard a `queue_write` before the debounce.
 4. **FUSE TTL vs refresh.** The kernel's `TTL = 1s` can make a refresh take up to 1 extra second to become visible to the user.
 5. **Persistent push failure keeps commits local.** After the reconcile rounds, the commits stay local; every pull cycle retries the publish as soon as the remote is reachable again.
+6. **P2P channel and mixed devices.** A device without the channel (or with it broken unnoticed) is seen by the others only at `p2p_idle_pull_interval_secs`. By default the n0 relays see device ids and IP addresses (never content).
 
 ---
 

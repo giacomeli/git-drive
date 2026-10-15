@@ -1886,3 +1886,25 @@ fn boot_index_waits_for_the_repo_lock() {
     drop(guard);
     assert_eq!(handle.join().unwrap().unwrap(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn device_registry_dir_is_invisible_in_mount_and_after_refresh() {
+    // `.git-drive/` holds the P2P device registry: synced by git, never shown.
+    let test = init_repo();
+    commit_file(&test.repo, ".git-drive/peers/abc", b"{\"name\":\"mac\"}", "register");
+    commit_file(&test.repo, "doc.txt", b"x", "add doc");
+    let sync = SyncManager::new(test.dir.path().to_str().unwrap(), 5);
+    let sync_handle = sync.clone();
+    let mut fs = GitDriveFS::new(test.dir.path().to_str().unwrap(), "main".to_string(), sync)
+        .expect("GitDriveFS::new");
+
+    assert_eq!(fs.find_inode(".git-drive"), None, "reserved dir hidden at boot");
+    let entries = fs.apply_readdir(1).unwrap();
+    assert!(!entries.iter().any(|(_, _, n)| n == ".git-drive"), "{:?}", entries);
+    assert_eq!(fs.file_count(), 1, "only doc.txt is indexed");
+
+    sync_handle.raise_refresh_flag();
+    fs.refresh_if_needed();
+    assert_eq!(fs.find_inode(".git-drive"), None, "reserved dir hidden after refresh");
+    assert_eq!(fs.file_count(), 1);
+}

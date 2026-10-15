@@ -23,6 +23,11 @@ pub struct SyncStatus {
     /// Set on clean shutdown (SIGTERM/eject with final drain).
     #[serde(default)]
     pub stopped_at: Option<u64>,
+    /// When the volume appeared. `None` while the session boots (journal
+    /// replay, recovery drain, index): the daemon runs but the drive is not
+    /// there yet.
+    #[serde(default)]
+    pub mounted_at: Option<u64>,
     pub pending_ops: usize,
     /// Local commits still awaiting publication to the remote (progressive
     /// push catch-up in flight or interrupted). 0 = remote at the local tip.
@@ -36,6 +41,28 @@ pub struct SyncStatus {
     /// tree and the journal). `None` once a drain commits again.
     #[serde(default)]
     pub commit_blocked: Option<String>,
+    /// P2P notification channel; `None` = off (or a build without it).
+    #[serde(default)]
+    pub p2p: Option<P2pInfo>,
+}
+
+/// State of the P2P channel as published by the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct P2pInfo {
+    pub online: bool,
+    pub device_id: String,
+    pub device_name: String,
+    pub peers: Vec<PeerInfo>,
+}
+
+/// A registered device other than this one.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PeerInfo {
+    /// Empty when the registry entry could not be read.
+    pub name: String,
+    pub id: String,
+    pub online: bool,
+    pub last_seen: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,8 +117,9 @@ impl StatusState {
         s.branch = branch.to_string();
         s.started_at = now;
         s.updated_at = now;
-        // A new session invalidates the previous one's shutdown (same status file).
+        // A new session invalidates the previous one's shutdown and mount (same status file).
         s.stopped_at = None;
+        s.mounted_at = None;
         let snapshot = s.clone();
         drop(s);
         self.persist(&snapshot);
@@ -109,6 +137,17 @@ impl StatusState {
         let mut s = self.inner.lock();
         s.mount = mount.to_string();
         s.log_file = log_file.to_string();
+        let snapshot = s.clone();
+        drop(s);
+        self.persist(&snapshot);
+    }
+
+    /// The volume is mounted: the boot finished.
+    pub fn record_mounted(&self) {
+        let now = now_unix();
+        let mut s = self.inner.lock();
+        s.updated_at = now;
+        s.mounted_at = Some(now);
         let snapshot = s.clone();
         drop(s);
         self.persist(&snapshot);
@@ -153,6 +192,16 @@ impl StatusState {
         let mut s = self.inner.lock();
         s.updated_at = now_unix();
         s.unpushed = n;
+        let snapshot = s.clone();
+        drop(s);
+        self.persist(&snapshot);
+    }
+
+    /// Publishes the P2P channel state (`None` = channel off).
+    pub fn set_p2p(&self, info: Option<P2pInfo>) {
+        let mut s = self.inner.lock();
+        s.updated_at = now_unix();
+        s.p2p = info;
         let snapshot = s.clone();
         drop(s);
         self.persist(&snapshot);
@@ -248,6 +297,13 @@ pub fn pid_alive(pid: u32) -> Option<bool> {
     Some(unsafe { libc::kill(pid as libc::pid_t, 0) } == 0)
 }
 
+/// Whether the daemon behind `s` is running: a live pid and no clean stop
+/// recorded. Commands that touch the repository outside the daemon (no
+/// shared lock) refuse while this holds.
+pub fn daemon_running(s: &SyncStatus) -> bool {
+    s.stopped_at.is_none() && pid_alive(s.pid) == Some(true)
+}
+
 fn format_ago(now: u64, then: u64) -> String {
     if then == 0 || then > now {
         return "unknown time".to_string();
@@ -310,6 +366,31 @@ pub fn format_status(s: &SyncStatus, now: u64, alive: Option<bool>) -> String {
             ));
         }
         None => out.push_str("  last drain: none yet\n"),
+    }
+    match &s.p2p {
+        None => out.push_str("  p2p: off\n"),
+        Some(p) => {
+            out.push_str(&format!(
+                "  p2p: {} — this device: {} ({})\n",
+                if p.online { "online" } else { "offline" },
+                p.device_name,
+                &p.device_id[..p.device_id.len().min(8)]
+            ));
+            for peer in &p.peers {
+                let id = &peer.id[..peer.id.len().min(8)];
+                let label = if peer.name.is_empty() {
+                    id.to_string()
+                } else {
+                    format!("{} ({})", peer.name, id)
+                };
+                let state = match (peer.online, peer.last_seen) {
+                    (true, _) => "online".to_string(),
+                    (false, Some(at)) => format!("offline, seen {}", format_ago(now, at)),
+                    (false, None) => "offline, never seen".to_string(),
+                };
+                out.push_str(&format!("    - {}: {}\n", label, state));
+            }
+        }
     }
     if let Some(reason) = &s.commit_blocked {
         out.push_str(&format!(
@@ -387,6 +468,50 @@ mod tests {
     }
 
     #[test]
+    fn format_status_shows_the_p2p_channel_and_its_peers() {
+        let mut s = sample();
+        let off = format_status(&s, 2_000, None);
+        assert!(off.contains("p2p: off"), "{}", off);
+
+        s.p2p = Some(P2pInfo {
+            online: true,
+            device_id: "ab".repeat(32),
+            device_name: "mac".into(),
+            peers: vec![
+                PeerInfo { name: "allmight".into(), id: "cd".repeat(32), online: true, last_seen: Some(1_990) },
+                PeerInfo { name: String::new(), id: "ef".repeat(32), online: false, last_seen: None },
+            ],
+        });
+        let text = format_status(&s, 2_000, None);
+        assert!(text.contains("p2p: online — this device: mac (abababab)"), "{}", text);
+        assert!(text.contains("allmight (cdcdcdcd): online"), "{}", text);
+        assert!(text.contains("efefefef: offline, never seen"), "{}", text);
+    }
+
+    #[test]
+    fn daemon_running_needs_a_live_pid_and_no_clean_stop() {
+        let mut s = sample();
+        s.pid = std::process::id();
+        s.stopped_at = None;
+        assert!(daemon_running(&s), "this test process is alive");
+        s.stopped_at = Some(1_000);
+        assert!(!daemon_running(&s), "a recorded clean stop wins");
+        s.stopped_at = None;
+        s.pid = 0;
+        assert!(!daemon_running(&s), "no pid recorded");
+    }
+
+    #[test]
+    fn status_without_the_p2p_field_still_loads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let mut json = serde_json::to_value(sample()).unwrap();
+        json.as_object_mut().unwrap().remove("p2p");
+        std::fs::write(&path, json.to_string()).unwrap();
+        assert!(read_from(&path).unwrap().p2p.is_none());
+    }
+
+    #[test]
     fn format_status_shows_a_blocked_commit_and_persists_it() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("status.json");
@@ -400,6 +525,26 @@ mod tests {
         state.set_commit_blocked(None);
         let text = format_status(&read_from(&path).unwrap(), 2_000, None);
         assert!(!text.contains("COMMIT BLOCKED"), "{}", text);
+    }
+
+    #[test]
+    fn the_mount_is_recorded_and_a_new_boot_clears_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let state = StatusState::new();
+        state.enable_file(path.clone());
+        state.record_boot("/repo", "main");
+        assert_eq!(read_from(&path).unwrap().mounted_at, None, "booting: not mounted yet");
+        state.record_mounted();
+        assert!(read_from(&path).unwrap().mounted_at.is_some());
+        state.record_boot("/repo", "main");
+        assert_eq!(read_from(&path).unwrap().mounted_at, None, "the next session starts unmounted");
+        // Older status files have no such field.
+        let old: SyncStatus = serde_json::from_str(
+            r#"{"pid":1,"repo":"/r","branch":"main","started_at":1,"updated_at":1,"pending_ops":0,"last_drain":null,"last_pull":null,"conflicts":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.mounted_at, None);
     }
 
     #[test]

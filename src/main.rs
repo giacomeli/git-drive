@@ -101,6 +101,57 @@ fn cli() -> Command {
                 ),
         )
         .subcommand(
+            Command::new("peers")
+                .about("List the devices of the P2P channel, or remove one")
+                .arg(
+                    Arg::new("file")
+                        .long("file")
+                        .value_name("PATH")
+                        .global(true)
+                        .help("Path to status.json (default: ./logs/status.json, then the platform default)"),
+                )
+                .arg(
+                    Arg::new("config")
+                        .long("config")
+                        .value_name("PATH")
+                        .global(true)
+                        .help("Path to config.json (default: ./config.json, then ~/.config/git-drive/config.json)"),
+                )
+                .arg(
+                    Arg::new("repo")
+                        .long("repo")
+                        .value_name("REPO_PATH")
+                        .global(true)
+                        .help("Repository (default: the one in status.json)"),
+                )
+                .subcommand(
+                    Command::new("remove")
+                        .about("Remove a device from the registry (the daemon must be stopped)")
+                        .arg(Arg::new("device").required(true).value_name("NAME|ID")),
+                ),
+        )
+        .subcommand(
+            Command::new("daemon")
+                .about("Start, stop or restart the daemon through its login service (clean stop: unmount + final sync)")
+                .arg(
+                    Arg::new("action")
+                        .required(true)
+                        .value_parser(["start", "stop", "restart"])
+                        .value_name("ACTION"),
+                ),
+        )
+        .subcommand(
+            Command::new("control-center")
+                .about("Open the Control Center: status, logs, settings and daemon control")
+                .arg(
+                    Arg::new("page")
+                        .long("page")
+                        .value_name("PAGE")
+                        .value_parser(["overview", "logs", "settings", "about"])
+                        .help("Page to open at"),
+                ),
+        )
+        .subcommand(
             Command::new("viewer")
                 .about("Open a window with the daemon status and a live log tail")
                 .arg(
@@ -201,6 +252,26 @@ fn main() -> anyhow::Result<()> {
         // that is why the dispatch happens before any tokio runtime.
         return git_drive::tray::run(file);
     }
+    if let Some(sub) = matches.subcommand_matches("peers") {
+        return run_peers(sub);
+    }
+    if let Some(sub) = matches.subcommand_matches("daemon") {
+        let action = match sub.get_one::<String>("action").map(String::as_str) {
+            Some("start") => git_drive::control::Action::Start,
+            Some("stop") => git_drive::control::Action::Stop,
+            _ => git_drive::control::Action::Restart,
+        };
+        return git_drive::control::run(action);
+    }
+    if let Some(sub) = matches.subcommand_matches("control-center") {
+        let page = sub.get_one::<String>("page").map(String::as_str);
+        if !git_drive::control::open_control_center(page)? {
+            anyhow::bail!(
+                "the Control Center is not installed: build it (cd control-center && npm install && npm run tauri build), then run `git-drive install` again"
+            );
+        }
+        return Ok(());
+    }
     if let Some(sub) = matches.subcommand_matches("viewer") {
         let file = git_drive::paths::resolve_status_for_read(
             sub.get_one::<String>("file").map(String::as_str),
@@ -245,6 +316,7 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
         verbose,
         &log_dir,
         &config.log_level,
+        &config.log_categories,
         config.log_max_mb,
         config.log_keep_files,
     )?;
@@ -274,6 +346,11 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     let _guard = runtime.enter();
+    // Stop signals are taken over before the boot work (journal replay,
+    // recovery drain, index): a stop or restart that arrives while the drive
+    // boots is held and handled as a clean stop at the mount point, instead
+    // of the default action killing the process mid-boot.
+    let (mut term, mut int) = stop_signals()?;
 
     let sync = SyncManager::new_full_with_pull(
         &repo_path,
@@ -341,6 +418,26 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     sync.enable_journal(&journal_dir)?;
     sync.recover_at_boot();
 
+    // P2P notification channel (opt-in): devices tell each other about their
+    // pushes and polling stretches while it is online. Any failure leaves the
+    // drive on git polling, exactly as with the channel off.
+    #[cfg(feature = "p2p")]
+    let channel = runtime.block_on(git_drive::peer::channel::start(
+        git_drive::peer::channel::ChannelSettings {
+            config: &config,
+            config_path: Path::new(&config_path),
+            repo_path: Path::new(&repo_path),
+            branch: &branch,
+            crypto: crypto.clone(),
+            relays: None,
+        },
+        &sync,
+    ));
+    #[cfg(not(feature = "p2p"))]
+    if config.p2p_enabled {
+        log::warn!("p2p: enabled in config, but this build has no `p2p` feature — git polling only");
+    }
+
     let fs = GitDriveFS::new_with_options_crypto(
         &repo_path,
         branch,
@@ -382,10 +479,26 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     // unmount before mounting.
     prepare_mountpoint(&mount_path)?;
 
+    // A stop requested during the boot: everything is committed already
+    // (recover_at_boot), so leave without mounting.
+    if runtime.block_on(stop_pending(&mut term, &mut int)) {
+        log::info!("shutdown: stop requested during boot, the volume is not mounted");
+        drop(fs);
+        sync_handle.drain_now();
+        #[cfg(feature = "p2p")]
+        if let Some(channel) = &channel {
+            runtime.block_on(channel.shutdown());
+        }
+        sync_handle.status_state().record_stopped();
+        log::info!("shutdown: clean stop completed");
+        return Ok(());
+    }
+
     // Background session: main owns the lifecycle and drives the ordered
     // shutdown (decisions 6 and 7 of Phase 2).
     let session = fuser::spawn_mount2(fs, &mount_path, &options)?;
     log::info!("boot: volume mounted at {}", mount_path);
+    sync_handle.status_state().record_mounted();
     sync_handle.enable_notifications();
     sync_handle
         .notifier()
@@ -396,9 +509,6 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     // Wait for SIGTERM/SIGINT (launchd/Ctrl-C) or for the session to end
     // externally (eject in Finder / umount).
     let ejected = runtime.block_on(async {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = signal(SignalKind::terminate())?;
-        let mut int = signal(SignalKind::interrupt())?;
         loop {
             tokio::select! {
                 _ = term.recv() => {
@@ -427,6 +537,10 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     }
     session.join();
     sync_handle.drain_now();
+    #[cfg(feature = "p2p")]
+    if let Some(channel) = &channel {
+        runtime.block_on(channel.shutdown());
+    }
     sync_handle.status_state().record_stopped();
     sync_handle
         .notifier()
@@ -434,6 +548,24 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     log::info!("shutdown: clean stop completed");
 
     Ok(())
+}
+
+/// SIGTERM and SIGINT listeners. Registering them replaces the default
+/// action (terminate) for the whole process; signals that arrive before
+/// anyone awaits them are held.
+fn stop_signals() -> std::io::Result<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)> {
+    use tokio::signal::unix::{signal, SignalKind};
+    Ok((signal(SignalKind::terminate())?, signal(SignalKind::interrupt())?))
+}
+
+/// Whether a stop signal arrived (consumes it). Waits a moment so a signal
+/// still in the runtime's pipe is seen.
+async fn stop_pending(term: &mut tokio::signal::unix::Signal, int: &mut tokio::signal::unix::Signal) -> bool {
+    tokio::select! {
+        _ = term.recv() => true,
+        _ = int.recv() => true,
+        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => false,
+    }
 }
 
 /// Ensures the mountpoint exists and is free. If the mount table already
@@ -537,6 +669,73 @@ fn clear_stale_mount(mount: &str) -> anyhow::Result<()> {
 }
 
 /// `git-drive status`: reads the status.json written by the daemon and formats it.
+/// `git-drive peers [remove <device>]`: the registry read from the repo, with
+/// the online state the daemon last published.
+fn run_peers(sub: &ArgMatches) -> anyhow::Result<()> {
+    use git_drive::peer::registry;
+    use git_drive::status;
+    let status_file =
+        git_drive::paths::resolve_status_for_read(sub.get_one::<String>("file").map(String::as_str));
+    let state = status::read_from(&status_file).ok();
+    let repo_path = match (sub.get_one::<String>("repo"), &state) {
+        (Some(repo), _) => repo.clone(),
+        (None, Some(s)) if !s.repo.is_empty() => s.repo.clone(),
+        _ => anyhow::bail!("no repository: pass --repo or mount the drive once (status.json names it)"),
+    };
+    let config_path = git_drive::paths::resolve_config_for_read(
+        sub.get_one::<String>("config").map(String::as_str),
+    );
+    let config = Config::load_from(&config_path.to_string_lossy());
+    // Names are sealed on an encrypted drive: without the key only ids show.
+    let crypto = config
+        .encryption_enabled
+        .then(|| git_drive::paths::resolve_key_for_read(config.encryption_key_file.as_deref()))
+        .and_then(|key| git_drive::crypt::load_key_file(&key).ok())
+        .map(|master| git_drive::crypt::Crypto::from_master_key(&master));
+
+    if let Some(remove) = sub.subcommand_matches("remove") {
+        if state.as_ref().is_some_and(status::daemon_running) {
+            anyhow::bail!(
+                "the daemon is running — stop it first (macOS: launchctl bootout gui/$(id -u)/dev.giacomeli.git-drive; Linux: systemctl --user stop git-drive), then run this again"
+            );
+        }
+        let identity = (
+            config.user_name.as_deref().unwrap_or_default(),
+            config.user_email.as_deref().unwrap_or_default(),
+        );
+        if identity.0.is_empty() || identity.1.is_empty() {
+            anyhow::bail!("removing a device commits: set user_name and user_email in the config");
+        }
+        let device = remove.get_one::<String>("device").unwrap();
+        let id = registry::remove(Path::new(&repo_path), device, crypto.as_ref(), identity)?;
+        println!("removed device {} — the daemon publishes the change on its next start", &id[..8]);
+        return Ok(());
+    }
+
+    let repo = git::open_repo(&repo_path)?;
+    let entries = registry::list(&repo, crypto.as_ref())?;
+    if entries.is_empty() {
+        println!("No devices registered (the channel is off on every device so far).");
+        return Ok(());
+    }
+    let p2p = state.as_ref().and_then(|s| s.p2p.clone());
+    for entry in entries {
+        let label = registry::display_name(&entry, p2p.as_ref());
+        let this = p2p.as_ref().is_some_and(|p| p.device_id == entry.id);
+        let online = p2p
+            .as_ref()
+            .and_then(|p| p.peers.iter().find(|peer| peer.id == entry.id))
+            .map(|peer| if peer.online { "online" } else { "offline" });
+        let state = match (this, online) {
+            (true, _) => "this device",
+            (false, Some(s)) => s,
+            (false, None) => "unknown",
+        };
+        println!("{} ({}): {}", label, &entry.id[..8], state);
+    }
+    Ok(())
+}
+
 fn run_status(file: &Path) -> anyhow::Result<()> {
     use git_drive::status;
     match status::read_from(file) {
@@ -571,5 +770,22 @@ mod mount_tests {
             "/home/j/GitDrive2"
         ));
         assert!(!mount_line_present("", "/x", "/x"));
+    }
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use super::{stop_pending, stop_signals};
+
+    #[test]
+    fn a_stop_signal_sent_during_boot_is_held_and_seen_once() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+        let (mut term, mut int) = stop_signals().unwrap();
+        assert!(!rt.block_on(stop_pending(&mut term, &mut int)), "nothing sent yet");
+        // With the handler registered, SIGTERM is recorded instead of killing the process.
+        unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        assert!(rt.block_on(stop_pending(&mut term, &mut int)), "the stop is held for the boot to see");
+        assert!(!rt.block_on(stop_pending(&mut term, &mut int)), "and consumed once seen");
     }
 }

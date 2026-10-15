@@ -141,7 +141,7 @@ fn gui_domain() -> String {
 /// drain can take seconds, up to ExitTimeOut); a bootstrap issued in that
 /// window fails with "Bootstrap failed: 5: Input/output error" and leaves
 /// the drive with no agent at all (seen re-installing over a live daemon).
-fn bootout_and_wait(label: &str) {
+pub(crate) fn bootout_and_wait(label: &str) {
     let target = format!("{}/{}", gui_domain(), label);
     let _ = launchctl(&["bootout", &target]);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);

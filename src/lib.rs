@@ -1,21 +1,51 @@
 pub mod chunk;
 pub mod config;
+pub mod control;
 pub mod crypt;
 pub mod fs;
 pub mod git;
 pub mod journal;
+pub mod logview;
 pub mod launchd;
 pub mod notify;
 pub mod paths;
+pub mod peer;
 pub mod range_read;
+pub mod reserved;
 pub mod service;
 pub mod status;
+pub mod storage;
 pub mod sync;
 pub mod systemd;
 pub mod tray;
 pub mod viewer;
 
 use std::path::{Path, PathBuf};
+
+/// Logger specification for the configured base level and per-category
+/// levels (`log_categories`, see `logview::CATEGORIES`). Every module of every
+/// category is listed explicitly, so a category level never leaks into
+/// another category through a shared prefix (`git_drive` vs
+/// `git_drive::sync`). The `network` category (the iroh stack and its tracing
+/// span records) defaults to warnings: it logs internal events at INFO
+/// several times per second. Invalid levels fall back to the base level.
+pub fn log_spec(level: &str, categories: &std::collections::BTreeMap<String, String>) -> String {
+    const LEVELS: [&str; 6] = ["off", "error", "warn", "info", "debug", "trace"];
+    let mut spec = level.to_string();
+    for (name, modules) in logview::CATEGORIES {
+        let explicit = categories
+            .get(name)
+            .map(|l| l.trim().to_ascii_lowercase())
+            .filter(|l| LEVELS.contains(&l.as_str()));
+        let category_level = explicit.unwrap_or_else(|| {
+            if name == "network" { "warn".to_string() } else { level.to_string() }
+        });
+        for module in modules.iter() {
+            spec.push_str(&format!(", {}={}", module, category_level));
+        }
+    }
+    spec
+}
 
 /// Initializes the process-wide logger (flexi_logger) writing to rotating
 /// files in `log_dir`. Returns the logger handle (which must stay alive for
@@ -33,6 +63,7 @@ pub fn init_logging(
     verbose: bool,
     log_dir: &Path,
     level: &str,
+    categories: &std::collections::BTreeMap<String, String>,
     max_mb: u64,
     keep_files: usize,
 ) -> anyhow::Result<(flexi_logger::LoggerHandle, PathBuf)> {
@@ -40,7 +71,7 @@ pub fn init_logging(
 
     std::fs::create_dir_all(log_dir)?;
 
-    let mut logger = Logger::try_with_env_or_str(level)?
+    let mut logger = Logger::try_with_env_or_str(log_spec(level, categories))?
         .log_to_file(FileSpec::default().directory(log_dir).basename("git-drive"))
         .format_for_files(flexi_logger::detailed_format)
         // Direct write keeps the tail (viewer / `tail -f`) live without waiting
@@ -100,10 +131,43 @@ mod tests {
     // does so. `keep` leaves the dir alive past this test (the global
     // logger keeps pointing at it), avoiding write-after-delete noise.
     #[test]
+    fn log_categories_set_levels_per_area_of_the_daemon() {
+        let mut cats = std::collections::BTreeMap::new();
+        cats.insert("p2p".to_string(), "debug".to_string());
+        cats.insert("fuse".to_string(), "off".to_string());
+        cats.insert("network".to_string(), "info".to_string());
+        cats.insert("git".to_string(), "loud".to_string());
+        let spec = log_spec("info", &cats);
+        assert!(spec.contains("git_drive::peer=debug"), "{}", spec);
+        assert!(spec.contains("fuser=off") && spec.contains("git_drive::fs=off"), "{}", spec);
+        assert!(spec.contains("iroh=info") && spec.contains("tracing=info"), "{}", spec);
+        assert!(spec.contains("git_drive::git=info"), "an invalid level falls back: {}", spec);
+        assert!(spec.contains("git_drive::sync=info"), "untouched categories keep the base level: {}", spec);
+        assert!(flexi_logger::LogSpecification::parse(&spec).is_ok(), "{}", spec);
+    }
+
+    #[test]
+    fn the_network_stack_logs_only_warnings_by_default() {
+        // iroh logs internal events at INFO several times per second (1,776
+        // lines in 8 minutes on the Mac, 14-10-2026): they stay out of the
+        // drive's log unless RUST_LOG asks for them.
+        for level in ["info", "debug"] {
+            let spec = log_spec(level, &Default::default());
+            assert!(spec.starts_with(level), "{}", spec);
+            // Span lifecycle records of tracing-based crates (iroh) carry the
+            // target "tracing::span", not the crate's module.
+            for noisy in ["iroh=warn", "iroh_relay=warn", "noq=warn", "portmapper=warn", "tracing=warn"] {
+                assert!(spec.contains(noisy), "{} missing in {}", noisy, spec);
+            }
+            assert!(flexi_logger::LogSpecification::parse(&spec).is_ok(), "{}", spec);
+        }
+    }
+
+    #[test]
     #[serial_test::serial]
     fn init_logging_creates_and_locates_current_file() {
         let dir = tempfile::tempdir().unwrap().keep();
-        let (handle, path) = init_logging(false, &dir, "info", 50, 10).unwrap();
+        let (handle, path) = init_logging(false, &dir, "info", &Default::default(), 50, 10).unwrap();
         log::info!("test line for the current file");
         handle.flush();
         assert!(

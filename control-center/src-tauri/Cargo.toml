@@ -1,0 +1,29 @@
+[package]
+name = "git-drive-control-center"
+version = "0.2.2"
+edition = "2021"
+description = "git-drive Control Center: status, logs, settings and daemon control"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "git-drive-control-center"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+# The daemon's library without the P2P stack: the Control Center only reads
+# what the daemon publishes (status, log, config) and drives its service.
+git-drive = { path = "../..", default-features = false }
+tauri = { version = "2.12", features = ["macos-private-api"] }
+# A second launch (tray menu, CLI) focuses the open window instead of opening another.
+tauri-plugin-single-instance = "2.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+git2 = "0.18"
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+window-vibrancy = "0.8"

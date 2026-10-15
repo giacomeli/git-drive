@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -64,6 +64,16 @@ pub(crate) fn xdg_state_dir_from(home: &Path, xdg_state_home: Option<PathBuf>) -
 /// project directory broke the Mac LaunchAgent (exit 78, 2026-10).
 pub fn installed_binary_path() -> PathBuf {
     home_dir().join(".local/bin/git-drive")
+}
+
+/// Installed Control Center binary (next to the daemon's).
+pub fn installed_control_center_path() -> PathBuf {
+    home_dir().join(".local/bin/git-drive-control-center")
+}
+
+/// Installed Control Center app bundle (macOS): Dock icon, Spotlight, app name.
+pub fn control_center_app_path() -> PathBuf {
+    home_dir().join("Applications/git-drive Control Center.app")
 }
 
 pub(crate) fn standard_log_dir_from(home: &Path) -> PathBuf {

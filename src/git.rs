@@ -1341,6 +1341,32 @@ fn commit_system_time(commit: &git2::Commit) -> std::time::SystemTime {
     }
 }
 
+/// Commits reachable from HEAD per time bucket (the Control Center's activity
+/// chart): `buckets` windows of `width_secs` ending at `now`, oldest first.
+/// A commit dated after `now` (a skewed clock on another device) counts in
+/// the newest bucket. The walk stops at the first commit older than the
+/// window (time-sorted), so it reads only the recent history.
+pub fn commit_activity(repo: &Repository, now: i64, buckets: usize, width_secs: i64) -> Result<Vec<u32>, Error> {
+    let mut out = vec![0u32; buckets];
+    if buckets == 0 || width_secs <= 0 {
+        return Ok(out);
+    }
+    let start = now - buckets as i64 * width_secs;
+    let mut walk = repo.revwalk()?;
+    walk.set_sorting(git2::Sort::TIME)?;
+    walk.push_head()?;
+    for oid in walk {
+        let commit = repo.find_commit(oid?)?;
+        let at = commit.time().seconds();
+        if at < start {
+            break;
+        }
+        let idx = (((at - start) / width_secs) as usize).min(buckets - 1);
+        out[idx] += 1;
+    }
+    Ok(out)
+}
+
 /// Timestamp of the last commit that touched each path in HEAD, computed in
 /// a SINGLE revwalk (not one walk per file). Walks backwards from HEAD,
 /// diffing each commit against its first parent; the first (most recent)
@@ -2858,5 +2884,23 @@ mod tests {
         let local_head = repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(bare_head.id(), local_head.id());
         drop(dir);
+    }
+
+    #[test]
+    fn commit_activity_counts_commits_per_time_bucket() {
+        let (_dir, repo) = init_repo_with_commit();
+        let now: i64 = 4_000_000_000;
+        commit_file_at(&repo, "a.txt", b"1", now - 30 * 3600); // outside the window
+        commit_file_at(&repo, "a.txt", b"2", now - 3 * 3600 - 10);
+        commit_file_at(&repo, "a.txt", b"3", now - 3600 - 5);
+        commit_file_at(&repo, "a.txt", b"4", now - 3600 + 5);
+        commit_file_at(&repo, "a.txt", b"5", now - 60);
+        commit_file_at(&repo, "a.txt", b"6", now + 120); // skewed clock: newest bucket
+        let buckets = commit_activity(&repo, now, 24, 3600).unwrap();
+        assert_eq!(buckets.len(), 24);
+        assert_eq!(buckets[23], 3, "{:?}", buckets);
+        assert_eq!(buckets[22], 1, "{:?}", buckets);
+        assert_eq!(buckets[20], 1, "{:?}", buckets);
+        assert_eq!(buckets.iter().sum::<u32>(), 5, "{:?}", buckets);
     }
 }

@@ -190,6 +190,19 @@ fn spawn_viewer(status_path: &Path) {
     crate::notify::reap_in_background(child);
 }
 
+/// Opens the Control Center at `page`; without it installed, the egui status
+/// viewer (status + live log tail) takes its place.
+fn open_control_center(page: Option<&str>, status_path: &Path) {
+    match crate::control::open_control_center(page) {
+        Ok(true) => {}
+        Ok(false) => spawn_viewer(status_path),
+        Err(e) => {
+            log::warn!("tray: control center: {}", e);
+            spawn_viewer(status_path);
+        }
+    }
+}
+
 /// Starts the tray. BLOCKS the main thread with tao's event loop (an AppKit
 /// requirement) — which is why the dispatch in main happens before the tokio
 /// runtime.
@@ -210,7 +223,8 @@ pub fn run(status_path: PathBuf) -> anyhow::Result<()> {
     let line2 = MenuItem::new("", false, None);
     let line3 = MenuItem::new("", false, None);
     let open_drive = MenuItem::new("Open drive in file manager", true, None);
-    let viewer = MenuItem::new("Status & log window", true, None);
+    let center = MenuItem::new("Open Control Center", true, None);
+    let viewer = MenuItem::new("Show log", true, None);
     let quit = MenuItem::new("Quit tray", true, None);
 
     let menu = Menu::new();
@@ -222,6 +236,7 @@ pub fn run(status_path: PathBuf) -> anyhow::Result<()> {
         &line3,
         &PredefinedMenuItem::separator(),
         &open_drive,
+        &center,
         &viewer,
         &PredefinedMenuItem::separator(),
         &quit,
@@ -275,8 +290,10 @@ pub fn run(status_path: PathBuf) -> anyhow::Result<()> {
                         open_in_file_manager(&s.mount);
                     }
                 }
+            } else if ev.id == center.id() {
+                open_control_center(None, &status_path);
             } else if ev.id == viewer.id() {
-                spawn_viewer(&status_path);
+                open_control_center(Some("logs"), &status_path);
             } else if ev.id == quit.id() {
                 *control_flow = ControlFlow::Exit;
             }

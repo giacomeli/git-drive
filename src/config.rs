@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
-use serde::Deserialize;
+use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
 
 fn default_write_debounce_secs() -> u64 {
     5
@@ -24,6 +25,10 @@ fn default_chunk_threshold_mb() -> u64 {
 
 fn default_chunk_size_mb() -> u64 {
     80
+}
+
+fn default_p2p_idle_pull_interval_secs() -> u64 {
+    600
 }
 
 fn default_encryption_enabled() -> bool {
@@ -50,7 +55,7 @@ fn default_git_transport() -> String {
     "auto".to_string()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default = "default_write_debounce_secs")]
     pub write_debounce_secs: u64,
@@ -86,13 +91,13 @@ pub struct Config {
     pub encryption_enabled: bool,
     /// File holding the master key (64 hex, permission 0600). Absent = the
     /// platform's default path. Generate it with `git-drive key generate`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_key_file: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_email: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_token: Option<String>,
     /// Maximum size of a single session log file, in MiB, before rotating to a
     /// new file. Keeps the log from growing without bound (see the 225 MB
@@ -106,12 +111,35 @@ pub struct Config {
     /// at runtime by the `RUST_LOG` environment variable.
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Per-category log levels (`sync`, `git`, `fuse`, `crypto`, `p2p`,
+    /// `network`, `service` — see `logview::CATEGORIES`), each `off` to
+    /// `trace`. Unset categories follow `log_level`, except `network` (the
+    /// iroh stack), which defaults to `warn`. `RUST_LOG` overrides it all.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub log_categories: BTreeMap<String, String>,
     /// Network transport for fetch/push: `auto` (system `git` when available,
     /// libgit2 otherwise), `cli` or `libgit2`. The CLI authenticates exactly
     /// like a manual `git fetch` (OpenSSH config, agent, Keychain, credential
     /// helpers); libgit2 only knows the agent and `~/.ssh/id_*`.
     #[serde(default = "default_git_transport")]
     pub git_transport: String,
+    /// P2P notification channel between the devices of the drive (opt-in per
+    /// machine). Off = the drive syncs only through git polling, as before.
+    #[serde(default)]
+    pub p2p_enabled: bool,
+    /// Pull interval while the P2P channel is online: pushes arrive as
+    /// notifications, so polling is only the safety net.
+    #[serde(default = "default_p2p_idle_pull_interval_secs")]
+    pub p2p_idle_pull_interval_secs: u64,
+    /// Device secret key. Absent = `peer.key` next to the config file in use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p2p_key_file: Option<String>,
+    /// Name of this device in the registry. Absent = short hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p2p_device_name: Option<String>,
+    /// Own relay server. Absent = the public n0 relays and DNS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p2p_relay_url: Option<String>,
 }
 
 impl Default for Config {
@@ -132,7 +160,13 @@ impl Default for Config {
             log_max_mb: default_log_max_mb(),
             log_keep_files: default_log_keep_files(),
             log_level: default_log_level(),
+            log_categories: BTreeMap::new(),
             git_transport: default_git_transport(),
+            p2p_enabled: false,
+            p2p_idle_pull_interval_secs: default_p2p_idle_pull_interval_secs(),
+            p2p_key_file: None,
+            p2p_device_name: None,
+            p2p_relay_url: None,
         }
     }
 }
@@ -152,6 +186,56 @@ impl Config {
             .map_err(|e| format!("failed to read config {}: {}", path, e))?;
         serde_json::from_str(&content)
             .map_err(|e| format!("invalid config {}: {}", path, e))
+    }
+
+    /// Writes the config to `path` atomically (temp file + rename) with mode
+    /// 0600 — it can hold `remote_token`. Keys of the existing file that this
+    /// version does not know are kept; unset optional fields are removed.
+    pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut doc = match fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()) {
+            Some(serde_json::Value::Object(existing)) => existing,
+            _ => serde_json::Map::new(),
+        };
+        let serde_json::Value::Object(fields) = serde_json::to_value(self)? else {
+            anyhow::bail!("config does not serialize to an object");
+        };
+        let known: Vec<String> = serde_json::to_value(Config {
+            encryption_key_file: Some(String::new()),
+            user_name: Some(String::new()),
+            user_email: Some(String::new()),
+            remote_token: Some(String::new()),
+            p2p_key_file: Some(String::new()),
+            p2p_device_name: Some(String::new()),
+            p2p_relay_url: Some(String::new()),
+            log_categories: BTreeMap::from([(String::new(), String::new())]),
+            ..Config::default()
+        })?
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+        for key in known {
+            doc.remove(&key);
+        }
+        doc.extend(fields);
+        let text = serde_json::to_string_pretty(&serde_json::Value::Object(doc))? + "\n";
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp, path)?;
+        Ok(())
     }
 
     pub fn load_from(path: &str) -> Self {
@@ -198,6 +282,43 @@ mod tests {
         assert!(cfg.user_name.is_none());
         assert!(cfg.user_email.is_none());
         assert!(cfg.remote_token.is_none());
+    }
+
+    #[test]
+    fn save_to_round_trips_atomically_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut cfg = Config { user_name: Some("A".into()), remote_token: Some("secret".into()), ..Config::default() };
+        cfg.log_categories.insert("p2p".into(), "debug".into());
+        cfg.save_to(&path).unwrap();
+        let back = Config::try_load_from(path.to_str().unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&cfg).unwrap());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the config can hold a token");
+        assert!(!dir.path().join("config.json.tmp").exists(), "no temp file left");
+    }
+
+    #[test]
+    fn p2p_is_off_by_default_and_parses_when_set() {
+        let (_dir, path) = write_config("{}");
+        let cfg = Config::try_load_from(&path).unwrap();
+        assert!(!cfg.p2p_enabled, "the channel is opt-in per machine");
+        assert_eq!(cfg.p2p_idle_pull_interval_secs, 600);
+        assert!(cfg.p2p_key_file.is_none() && cfg.p2p_device_name.is_none());
+        assert!(cfg.p2p_relay_url.is_none());
+
+        let (_dir, path) = write_config(
+            r#"{"p2p_enabled": true, "p2p_idle_pull_interval_secs": 900,
+                "p2p_key_file": "/k/peer.key", "p2p_device_name": "mac",
+                "p2p_relay_url": "https://relay.example.com"}"#,
+        );
+        let cfg = Config::try_load_from(&path).unwrap();
+        assert!(cfg.p2p_enabled);
+        assert_eq!(cfg.p2p_idle_pull_interval_secs, 900);
+        assert_eq!(cfg.p2p_key_file.as_deref(), Some("/k/peer.key"));
+        assert_eq!(cfg.p2p_device_name.as_deref(), Some("mac"));
+        assert_eq!(cfg.p2p_relay_url.as_deref(), Some("https://relay.example.com"));
     }
 
     #[test]

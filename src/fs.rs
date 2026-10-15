@@ -414,7 +414,7 @@ impl GitDriveFS {
 
         for dir_path in dirs_sorted {
             // `.chunks` is an internal chunking artifact (Phase 2.6) — invisible.
-            if crate::chunk::is_chunk_path(&dir_path) {
+            if crate::reserved::is_reserved_path(&dir_path) {
                 continue;
             }
             let inode = next_inode.fetch_add(1, Ordering::SeqCst);
@@ -446,7 +446,7 @@ impl GitDriveFS {
             // indexes nor shows up in readdir — without this, rmdir of an
             // "empty" folder failed with ENOTEMPTY after a refresh (finding
             // from the 2026-07-03 validation).
-            if leaf_name(&file_path) == ".gitkeep" || crate::chunk::is_chunk_path(&file_path) {
+            if leaf_name(&file_path) == ".gitkeep" || crate::reserved::is_reserved_path(&file_path) {
                 continue;
             }
             let inode = next_inode.fetch_add(1, Ordering::SeqCst);
@@ -1552,7 +1552,7 @@ impl GitDriveFS {
         dirs_sorted.sort_by_key(|p| p.matches('/').count());
 
         for dir_path in dirs_sorted {
-            if crate::chunk::is_chunk_path(&dir_path) {
+            if crate::reserved::is_reserved_path(&dir_path) {
                 continue;
             }
             // `unwrap_or_else` (lazy): the eager form with `unwrap_or` always
@@ -1582,7 +1582,7 @@ impl GitDriveFS {
         for git::ListedFile { path: file_path, size, kind } in files {
             // Same rule as the initial ingestion: `.gitkeep` and `.chunks`
             // stay out of the indexes.
-            if leaf_name(&file_path) == ".gitkeep" || crate::chunk::is_chunk_path(&file_path) {
+            if leaf_name(&file_path) == ".gitkeep" || crate::reserved::is_reserved_path(&file_path) {
                 continue;
             }
             let inode = previous
