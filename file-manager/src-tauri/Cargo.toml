@@ -1,0 +1,28 @@
+[package]
+name = "git-drive-files"
+version = "0.3.0"
+edition = "2021"
+description = "git-drive Files: a file manager with the Control Center's look (proof of concept)"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "git-drive-files"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+# Paths and status of the daemon (the drive's mount point, the shared accent
+# preference, free space); no P2P stack.
+git-drive = { path = "../..", default-features = false }
+tauri = { version = "2.12", features = ["macos-private-api", "protocol-asset"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+window-vibrancy = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

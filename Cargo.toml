@@ -8,12 +8,12 @@ repository = "https://github.com/giacomeli/git-drive"
 keywords = ["git", "fuse", "filesystem", "sync", "encryption"]
 categories = ["filesystem", "command-line-utilities"]
 
-# The Control Center (Tauri GUI) is a workspace member outside the default
-# members: `cargo build`/`test`/`clippy` at the root build only the daemon and
-# never need Node or a webview. Build it with `npm run tauri build` in
-# `control-center/`.
+# The Control Center and the file manager POC (Tauri GUIs) are workspace
+# members outside the default members: `cargo build`/`test`/`clippy` at the
+# root build only the daemon and never need Node or a webview. Build each with
+# `npm run tauri build` in `control-center/` or `file-manager/`.
 [workspace]
-members = [".", "control-center/src-tauri"]
+members = [".", "control-center/src-tauri", "file-manager/src-tauri"]
 default-members = ["."]
 
 [dependencies]
