@@ -2520,7 +2520,7 @@ dependencies = [
 
 [[package]]
 name = "git-drive"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chacha20 0.9.1",
@@ -2551,7 +2551,7 @@ dependencies = [
 
 [[package]]
 name = "git-drive-control-center"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "git-drive",
  "git2",

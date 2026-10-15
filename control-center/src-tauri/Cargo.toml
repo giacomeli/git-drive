@@ -1,6 +1,6 @@
 [package]
 name = "git-drive-control-center"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 description = "git-drive Control Center: status, logs, settings and daemon control"
 license = "MIT"
