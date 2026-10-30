@@ -202,7 +202,11 @@ pub struct Config {
   refresh from 8.1 s to 1.1 s.
 - The drain's sweeps (chunking, encryption migration, chunk GC) are incremental: one full pass per
   state, then only dirty files plus paths changed since the last conforming HEAD. Save-to-commit on
-  the real drive went from 4 min 22 s to 8.4 s on the Mac and 4.3 s on Linux.
+  the real drive went from 4 min 22 s to 8.4 s on the Mac and 4.3 s on Linux. The chunk GC still
+  reads every small file of the tree (it needs every manifest's references), so it runs only when
+  chunks may be orphans: a scoped path was a manifest, or a sweep replaced chunks. A new large file
+  only adds chunks — before, it triggered the GC, ~90 s of a 2-minute commit of a 136 MB video on
+  the Mac's 210k-file drive.
 - Every queued op costs one extra write (its journal record) — the price of not losing
   acknowledged writes on a crash.
 - The config is loaded a single time — there is no hot reload (changing `encryption_enabled`

@@ -915,15 +915,25 @@ impl DrainCtx {
                     &scope,
                 );
             }
+            // Whether a sweep replaced chunks, leaving the old ones as orphans.
+            let mut orphaned = false;
             if let Some(c) = crypto.as_deref() {
-                let migrated = migrate_worktree_to_encrypted(&self.repo_path, c, &scope);
-                if migrated > 0 {
+                let sealed = migrate_worktree_to_encrypted(&self.repo_path, c, &scope);
+                // Only cleartext HEAD already held left a trace in the
+                // history. A new chunk manifest is written in clear and
+                // sealed here on every large file: no warning for those.
+                if sealed.from_history > 0 {
                     log::warn!(
-                        "crypto: {} item(s) migrated to encrypted. WARNING: the PREVIOUS Git history remains in cleartext on the remote — for a public repo, prefer starting from a fresh repo",
-                        migrated
+                        "crypto: {} item(s) committed in cleartext before are sealed now. WARNING: the PREVIOUS Git history remains in cleartext on the remote — for a public repo, prefer starting from a fresh repo",
+                        sealed.from_history
                     );
                 }
-                converted += migrated;
+                let fresh = sealed.items - sealed.from_history;
+                if fresh > 0 {
+                    log::debug!("crypto: sealed {} new item(s) that reached the working tree in clear", fresh);
+                }
+                orphaned = sealed.orphaned_chunks;
+                converted += sealed.items;
             } else if let Some(mk) = migration_crypto.as_deref() {
                 let migrated = migrate_worktree_to_clear(&self.repo_path, mk, &scope);
                 if migrated > 0 {
@@ -931,6 +941,8 @@ impl DrainCtx {
                         "crypto: {} item(s) decrypted back to cleartext",
                         migrated
                     );
+                    // Decrypting replaces sealed chunks with clear ones.
+                    orphaned = true;
                     if chunk_threshold > 0 {
                         // Decrypted files got NEW (clear) paths, outside the
                         // scope list — re-check the whole tree for size.
@@ -945,7 +957,12 @@ impl DrainCtx {
                 }
                 converted += migrated;
             }
-            if gc_needed || (chunk_threshold > 0 && converted > 0) {
+            // The GC reads every small file of the working tree, O(worktree):
+            // it runs only when chunks may be orphans — a scoped path was a
+            // manifest (rewritten, deleted, renamed) or a sweep replaced
+            // chunks. A new large file only adds chunks (2026-10-16: the GC
+            // was ~90 s of the 2-minute commit of a 136 MB video on the Mac).
+            if gc_needed || orphaned {
                 gc_orphan_chunks(
                     &self.repo_path,
                     crypto.as_deref().or(migration_crypto.as_deref()),
@@ -1857,12 +1874,38 @@ fn file_starts_with_encrypted_magic(path: &Path) -> bool {
 /// `cleartext -> encrypted` migration: conforms every file/symlink in the
 /// working tree to the encrypted state (name AND content). Idempotent — a
 /// file already conforming is skipped. Returns how many items were converted.
+/// What the encryption sweep changed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Sealed {
+    /// Items sealed, or renamed to their encrypted name.
+    items: usize,
+    /// Of those, the ones HEAD held in cleartext: their old bytes or name
+    /// stay in the history.
+    from_history: usize,
+    /// Cleartext chunks were re-sealed under new names: the old ones are
+    /// orphans now, for the GC.
+    orphaned_chunks: bool,
+}
+
+impl Sealed {
+    fn add(&mut self, in_head: bool) {
+        self.items += 1;
+        if in_head {
+            self.from_history += 1;
+        }
+    }
+}
+
 fn migrate_worktree_to_encrypted(
     repo_path: &Path,
     c: &crate::crypt::Crypto,
     scope: &SweepScope,
-) -> usize {
-    let mut converted = repair_double_encrypted_conflicts(repo_path, c, scope);
+) -> Sealed {
+    let mut out = Sealed { items: repair_double_encrypted_conflicts(repo_path, c, scope), ..Sealed::default() };
+    // HEAD's tree tells an item committed in clear before from a new one.
+    let repo = git::open_repo(repo_path.to_str().unwrap_or("")).ok();
+    let head = repo.as_ref().and_then(|r| r.head().ok()?.peel_to_tree().ok());
+    let in_head = |rel: &str| head.as_ref().is_some_and(|t| t.get_path(Path::new(rel)).is_ok());
     for (full, rel) in scope.files(repo_path) {
         let leaf = rel.rsplit('/').next().unwrap_or(&rel);
         // Long-name sidecars are our own metadata, never user files.
@@ -1904,7 +1947,7 @@ fn migrate_worktree_to_encrypted(
             let _ = std::fs::remove_file(&full);
             let _ = std::fs::remove_file(&new_full);
             if std::os::unix::fs::symlink(&new_target, &new_full).is_ok() {
-                converted += 1;
+                out.add(in_head(&rel));
             }
             continue;
         }
@@ -1924,7 +1967,7 @@ fn migrate_worktree_to_encrypted(
         if sealed {
             // Content is fine; only the name needs to migrate.
             if new_full != full && std::fs::rename(&full, &new_full).is_ok() {
-                converted += 1;
+                out.add(in_head(&rel));
             }
             continue;
         }
@@ -1990,7 +2033,8 @@ fn migrate_worktree_to_encrypted(
                         if new_full != full {
                             let _ = std::fs::remove_file(&full);
                         }
-                        converted += 1;
+                        out.add(in_head(&rel));
+                        out.orphaned_chunks = true;
                     }
                 }
                 continue;
@@ -2004,13 +2048,13 @@ fn migrate_worktree_to_encrypted(
             if new_full != full {
                 let _ = std::fs::remove_file(&full);
             }
-            converted += 1;
+            out.add(in_head(&rel));
         }
     }
     if let SweepScope::Full = scope {
         prune_empty_dirs(repo_path);
     }
-    converted
+    out
 }
 
 /// Repairs conflicted copies whose name was encrypted TWICE by the old
@@ -3034,7 +3078,7 @@ mod tests {
         let short = c.enc_path("ok.txt");
         std::fs::write(repo.join(&short), c.seal(b"fine")).unwrap();
 
-        let converted = migrate_worktree_to_encrypted(repo, &c, &SweepScope::Full);
+        let converted = migrate_worktree_to_encrypted(repo, &c, &SweepScope::Full).items;
         assert_eq!(converted, 1, "only the over-threshold entry migrates");
 
         // Old entry is gone; its dslong replacement + sidecar exist.
@@ -3053,7 +3097,7 @@ mod tests {
         assert_eq!(c.open(&std::fs::read(&new_full).unwrap()).unwrap(), b"payload");
 
         // Idempotent: second pass converts nothing.
-        assert_eq!(migrate_worktree_to_encrypted(repo, &c, &SweepScope::Full), 0);
+        assert_eq!(migrate_worktree_to_encrypted(repo, &c, &SweepScope::Full).items, 0);
     }
 
     fn repo_with_commit(files: &[(&str, &[u8])]) -> (tempfile::TempDir, git2::Repository) {
@@ -3126,10 +3170,47 @@ mod tests {
             paths: vec!["new.txt".to_string()],
             since: git2::Oid::zero(),
         };
-        assert_eq!(migrate_worktree_to_encrypted(root, &c, &scope), 1);
+        assert_eq!(migrate_worktree_to_encrypted(root, &c, &scope).items, 1);
         assert!(root.join("old.txt").exists(), "outside the scope: not visited");
         let enc = root.join(c.enc_path("new.txt"));
         assert_eq!(c.open(&std::fs::read(enc).unwrap()).unwrap(), b"fresh cleartext");
+    }
+
+    #[test]
+    fn migration_tells_new_items_from_ones_the_history_holds_in_clear() {
+        // Only cleartext that HEAD already holds left a trace in the history;
+        // an item written in clear and sealed in the same drain (a new chunk
+        // manifest) did not, and must not raise the history warning.
+        let c = crate::crypt::Crypto::from_master_key(&[9u8; 32]);
+        let (dir, _repo) = repo_with_commit(&[("old.txt", b"committed in clear")]);
+        let root = dir.path();
+        std::fs::write(root.join("new.txt"), b"written this drain").unwrap();
+        let scope = SweepScope::Paths {
+            paths: vec!["new.txt".to_string(), "old.txt".to_string()],
+            since: git2::Oid::zero(),
+        };
+        let sealed = migrate_worktree_to_encrypted(root, &c, &scope);
+        assert_eq!(sealed, Sealed { items: 2, from_history: 1, orphaned_chunks: false });
+    }
+
+    #[test]
+    fn migration_reports_the_cleartext_chunks_it_orphans() {
+        let c = crate::crypt::Crypto::from_master_key(&[9u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Chunked under encryption: the chunks are sealed, only the manifest is clear.
+        let seal = |p: &[u8]| c.seal(p);
+        let fresh = crate::chunk::chunk_reader_into_repo_with(&mut &[8u8; 100][..], 32, root, Some(&seal)).unwrap();
+        std::fs::write(root.join("fresh.bin"), fresh.serialize()).unwrap();
+        // Chunked in clear (by a client without the key): re-sealing replaces the chunks.
+        let clear = crate::chunk::chunk_reader_into_repo_with(&mut &[7u8; 100][..], 32, root, None).unwrap();
+        std::fs::write(root.join("big.bin"), clear.serialize()).unwrap();
+
+        let only = |p: &str| SweepScope::Paths { paths: vec![p.to_string()], since: git2::Oid::zero() };
+        let sealed = migrate_worktree_to_encrypted(root, &c, &only("fresh.bin"));
+        assert_eq!((sealed.items, sealed.orphaned_chunks), (1, false), "sealed chunks stay in use");
+        let sealed = migrate_worktree_to_encrypted(root, &c, &only("big.bin"));
+        assert_eq!((sealed.items, sealed.orphaned_chunks), (1, true), "the clear chunks are orphans now");
     }
 
     #[test]
@@ -3157,7 +3238,7 @@ mod tests {
         let copy = format!("{}.conflict-host-1791868058", short);
         std::fs::write(repo.join(&copy), c.seal(b"local version")).unwrap();
 
-        assert_eq!(migrate_worktree_to_encrypted(repo, &c, &SweepScope::Full), 0);
+        assert_eq!(migrate_worktree_to_encrypted(repo, &c, &SweepScope::Full).items, 0);
         assert!(repo.join(&copy).exists(), "conflicted copy untouched");
         assert_eq!(
             c.dec_path(&copy),
@@ -3192,7 +3273,7 @@ mod tests {
         assert!(!repo.join(crate::crypt::sidecar_name(&bad_leaf)).exists());
         assert_eq!(c.dec_path(&good), format!("shared.txt{}", suffix));
         assert_eq!(c.open(&std::fs::read(repo.join(&good)).unwrap()).unwrap(), b"local version");
-        assert_eq!(migrate_worktree_to_encrypted(repo, &c, &SweepScope::Full), 0, "idempotent");
+        assert_eq!(migrate_worktree_to_encrypted(repo, &c, &SweepScope::Full).items, 0, "idempotent");
     }
 
     #[test]

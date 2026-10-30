@@ -198,6 +198,10 @@ pub struct Config {
 - As varreduras do drain (chunking, migração de criptografia, GC de chunks) são incrementais: uma
   passada completa por estado e depois só arquivos sujos mais paths alterados desde o último HEAD
   conforme. Do salvamento ao commit no drive real: de 4 min 22 s para 8,4 s no Mac e 4,3 s no Linux.
+  O GC de chunks ainda lê todo arquivo pequeno da árvore (precisa das referências de todos os
+  manifestos), então só roda quando pode haver órfãos: um path do escopo era manifesto, ou uma
+  varredura substituiu chunks. Um arquivo grande novo só acrescenta chunks — antes, ele disparava o
+  GC, ~90 s de um commit de 2 minutos de um vídeo de 136 MB no drive de 210 mil arquivos do Mac.
 - `refresh_if_needed` é chamado em cada `lookup`/`getattr`/`readdir`. Barato em steady state;
   após um pull reconstrói o índice com a thread FUSE bloqueada. Tamanhos de blob vêm do header dos
   objetos, nomes decifrados de um cache reaproveitado entre refreshes, e os mtimes são recalculados

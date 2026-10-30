@@ -1021,6 +1021,44 @@ async fn chunked_update_and_delete_gc_orphan_chunks() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_new_large_file_does_not_sweep_the_tree_for_orphans() {
+    // The orphan-chunk GC reads and decrypts every small file of the working
+    // tree: ~90 s of the 2-minute commit of a 136 MB video on the Mac's
+    // 210k-file drive (2026-10-16). A new large file only adds chunks, so it
+    // must not run the GC; a rewrite of a chunked file (old chunks orphaned)
+    // must. A leftover orphan stands in for "did the GC run".
+    let test = init_repo();
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    sync.set_chunking(64, 32);
+
+    // First drain: full sweep, then the marker makes the next ones incremental.
+    sync.queue_write("dado.bin", vec![1u8; 100]);
+    wait_flush().await;
+
+    let stray = test.dir.path().join(shard_rel_path(&"ab".repeat(32)));
+    std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    std::fs::write(&stray, b"left by an earlier run").unwrap();
+
+    sync.queue_write("novo.bin", vec![3u8; 100]);
+    wait_flush().await;
+    let novo = read_manifest_at(test.dir.path(), "novo.bin");
+    assert!(test.dir.path().join(shard_rel_path(&novo.hashes[0])).exists());
+    assert!(stray.exists(), "a new large file must not run the whole-tree GC");
+    assert!(sync.status_state().snapshot().syncing.is_none(), "the drain ended: not syncing");
+
+    sync.queue_write("dado.bin", vec![2u8; 100]);
+    wait_flush().await;
+    assert!(!stray.exists(), "rewriting a chunked file orphans chunks: the GC runs");
+    for h in &novo.hashes {
+        assert!(test.dir.path().join(shard_rel_path(h)).exists(), "live chunks stay");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn shared_chunk_survives_delete_of_one_referencing_file() {
     let test = init_repo();
     let sync = mgr(
