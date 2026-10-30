@@ -524,8 +524,13 @@ Enquanto um drain roda, uma linha `syncing:` acima de `pending ops` mostra quant
 git-drive tray
 ```
 
-Ícone circular com o estado do drive: verde (sincronizado), laranja (ops pendentes), vermelho
-(conflito ou push falho), cinza (daemon parado ou status stale). O menu traz o resumo do status,
+A marca do app (a pasta com um ramo, como na Central de Controle) em branco num menu bar escuro e
+em preto num claro — no macOS ela segue a aparência do próprio menu bar, que depende também do papel
+de parede; no Linux fica branca, para a barra superior escura do GNOME. O nó inferior direito do
+ramo é uma bolinha de status: verde (sincronizado), azul (sincronizando — mudanças pendentes ou um
+drain em andamento), laranja (remoto inacessível — as mudanças ficam neste dispositivo até ele
+responder), vermelho (conflito, push ou merge com falha, commit bloqueado), cinza (daemon parado ou
+status stale; a marca esmaece). O menu traz o resumo do status,
 "Open drive in file manager", "Open Control Center", "Show log" (a Central de Controle na página
 de logs) e "Quit tray". Sem a Central de Controle instalada, os dois últimos abrem a janela simples
 de status e log. Instale junto do daemon com `git-drive install ... --with-tray` para subir no login.

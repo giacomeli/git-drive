@@ -56,6 +56,22 @@ tao = "0.35.3"
 # datapath uses private APIs and the metrics have no consumer here.
 iroh = { version = "1.3", default-features = false, features = ["tls-ring", "portmapper"], optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# The tray reads its menu bar's appearance to draw its icon light or dark; the
+# versions tray-icon already uses.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSAppearance",
+  "NSButton",
+  "NSControl",
+  "NSResponder",
+  "NSStatusBarButton",
+  "NSStatusItem",
+  "NSView",
+] }
+
 [features]
 default = ["p2p"]
 # Requires Rust 1.91 (iroh 1.3); the core builds without it on the project MSRV.

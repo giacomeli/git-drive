@@ -526,8 +526,12 @@ While a drain runs, a `syncing:` line above `pending ops` shows how many changes
 git-drive tray
 ```
 
-A circular icon with the drive state: green (synced), orange (pending ops), red (conflict or
-failed push), gray (daemon stopped or stale status). The menu offers the status summary,
+The app's mark (the folder with a branch, as in the Control Center) in white on a dark menu bar
+and black on a light one — on macOS it follows the menu bar's own appearance, which also depends on
+the wallpaper; on Linux it stays white, for GNOME's dark top bar. The branch's lower-right node is a
+status dot: green (synced), blue (syncing — pending changes or a drain at work), orange (remote
+unreachable — changes stay on this device until it answers), red (conflict, failed push or merge,
+blocked commit), gray (daemon stopped or stale status; the mark dims). The menu offers the status summary,
 "Open drive in file manager", "Open Control Center", "Show log" (the Control Center at its Logs
 page) and "Quit tray". Without the Control Center installed, the last two open the simple status
 and log window instead. Install it together with the daemon via `git-drive install ... --with-tray` to start it at login.
