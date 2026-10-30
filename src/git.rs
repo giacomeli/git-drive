@@ -1210,22 +1210,46 @@ fn merge_into_head(
             .ok_or_else(|| Error::from_str("repo has no workdir (bare?) - cannot merge"))?
             .to_path_buf();
 
-        let conflicts: Vec<(Option<git2::IndexEntry>, Option<git2::IndexEntry>)> = {
+        type Conflict = (Option<git2::IndexEntry>, Option<git2::IndexEntry>, Option<git2::IndexEntry>);
+        let conflicts: Vec<Conflict> = {
             let iter = index.conflicts()?;
             iter.filter_map(|c| c.ok())
-                .map(|c| (c.our, c.their))
+                .map(|c| (c.ancestor, c.our, c.their))
                 .collect()
         };
 
-        for (our, their) in conflicts {
-            let path_bytes = our
-                .as_ref()
-                .or(their.as_ref())
-                .map(|e| e.path.clone())
-                .ok_or_else(|| Error::from_str("conflict without an identifiable path"))?;
+        for (ancestor, our, their) in conflicts {
+            let Some(path_bytes) = our.as_ref().or(their.as_ref()).map(|e| e.path.clone()) else {
+                // Only the ancestor: both sides renamed the file, to different
+                // names. Each new name arrives as a one-sided entry of its own
+                // and is kept; the old name goes. Failing here stopped every
+                // pull on both machines (2026-10-18 research, A5).
+                if let Some(old) = ancestor.and_then(|e| String::from_utf8(e.path).ok()) {
+                    index.remove_path(Path::new(&old))?;
+                    let _ = std::fs::remove_file(workdir.join(&old));
+                }
+                continue;
+            };
             let path_str = String::from_utf8(path_bytes)
                 .map_err(|_| Error::from_str("path contains invalid bytes"))?;
             let full = workdir.join(&path_str);
+
+            // A file against a folder of the same name: the folder keeps the
+            // name and the file becomes the conflicted copy, whichever side
+            // it came from. Writing the file over the folder failed on every
+            // pull (A4).
+            if index.find_prefix(format!("{}/", path_str)).is_ok() {
+                let file = our.as_ref().or(their.as_ref()).expect("one side is present");
+                let blob = repo.find_blob(file.id)?;
+                let conflict_name = format!("{}.{}", path_str, conflict_suffix);
+                copies.push(workdir.join(&conflict_name));
+                write_workdir_file(&workdir.join(&conflict_name), blob.content())?;
+                remove_side_files(&full, file.id);
+                index.remove_path(Path::new(&path_str))?;
+                index.add_path(Path::new(&conflict_name))?;
+                conflicted_paths.push(path_str);
+                continue;
+            }
 
             match (&our, &their) {
                 // Both sides changed the file: the local version is preserved
@@ -1264,6 +1288,24 @@ fn merge_into_head(
         // that deleted an entry also deleted its sidecar, cleanly. Restore the
         // sidecar of every surviving hashed entry so its name stays decodable.
         restore_missing_long_name_sidecars(repo, &mut index, &workdir, &fetch_commit.id())?;
+        index.write()?;
+    }
+
+    // A cleartext chunk manifest is text, one chunk per line: libgit2 merges
+    // two edits of the same large file into a manifest of a file neither side
+    // wrote (2026-10-18 research, A2). Both versions stay whole, as for any
+    // other file both sides changed. A sealed manifest never merges this way.
+    let mixed = mixed_manifests(repo, &index, fetch_commit.id())?;
+    if let (false, Some(workdir)) = (mixed.is_empty(), repo.workdir()) {
+        for (path_str, ours, theirs) in mixed {
+            let conflict_name = format!("{}.{}", path_str, conflict_suffix);
+            copies.push(workdir.join(&conflict_name));
+            write_workdir_file(&workdir.join(&conflict_name), repo.find_blob(ours)?.content())?;
+            write_workdir_file(&workdir.join(&path_str), repo.find_blob(theirs)?.content())?;
+            index.add_path(Path::new(&conflict_name))?;
+            index.add_path(Path::new(&path_str))?;
+            conflicted_paths.push(path_str);
+        }
         index.write()?;
     }
 
@@ -1309,6 +1351,60 @@ fn merge_into_head(
             resolved: conflicted_paths,
             suffix: conflict_suffix.to_string(),
         })
+    }
+}
+
+/// Files both sides changed whose merged blob is neither version, where
+/// either version is a chunk manifest: `(path, ours, theirs)`.
+fn mixed_manifests(
+    repo: &Repository,
+    index: &git2::Index,
+    their_oid: git2::Oid,
+) -> Result<Vec<(String, git2::Oid, git2::Oid)>, Error> {
+    let ours = repo.head()?.peel_to_commit()?;
+    let theirs = repo.find_commit(their_oid)?;
+    let base = repo.find_commit(repo.merge_base(ours.id(), their_oid)?)?;
+    let (ours, theirs, base) = (ours.tree()?, theirs.tree()?, base.tree()?);
+    let changed = |side: &git2::Tree| -> Result<std::collections::HashSet<PathBuf>, Error> {
+        let diff = repo.diff_tree_to_tree(Some(&base), Some(side), None)?;
+        Ok(diff.deltas().filter_map(|d| d.new_file().path().map(Path::to_path_buf)).collect())
+    };
+    let (by_us, by_them) = (changed(&ours)?, changed(&theirs)?);
+    let is_manifest = |id: git2::Oid| {
+        repo.find_blob(id)
+            .is_ok_and(|b| crate::chunk::Manifest::is_manifest_bytes(b.content()))
+    };
+    let mut out = Vec::new();
+    for path in by_us.intersection(&by_them) {
+        let (Some(merged), Ok(o), Ok(t)) =
+            (index.get_path(path, 0), ours.get_path(path), theirs.get_path(path))
+        else {
+            continue;
+        };
+        if merged.id != o.id() && merged.id != t.id() && (is_manifest(o.id()) || is_manifest(t.id())) {
+            if let Some(p) = path.to_str() {
+                out.push((p.to_string(), o.id(), t.id()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Removes the copies libgit2 writes of the file side of a file/folder
+/// conflict, next to the folder as `<name>~<side label>` (`x~HEAD`,
+/// `x~main`): the conflicted copy replaces them. Only a file holding exactly
+/// that blob goes.
+fn remove_side_files(full: &Path, id: git2::Oid) {
+    let (Some(dir), Some(name)) = (full.parent(), full.file_name()) else { return };
+    let prefix = format!("{}~", name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with(&prefix)
+            && git2::Oid::hash_file(git2::ObjectType::Blob, &path).ok() == Some(id)
+        {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -2241,6 +2337,15 @@ mod tests {
         local: &dyn Fn(&Repository),
         remote: &dyn Fn(&Repository),
     ) -> (Vec<tempfile::TempDir>, Repository, MergeOutcome) {
+        let (keep, repo_a, outcome) = diverge_and_try_merge(base, local, remote);
+        (keep, repo_a, outcome.unwrap())
+    }
+
+    fn diverge_and_try_merge(
+        base: &[(&str, &[u8])],
+        local: &dyn Fn(&Repository),
+        remote: &dyn Fn(&Repository),
+    ) -> (Vec<tempfile::TempDir>, Repository, Result<MergeOutcome, Error>) {
         let (local_a, repo_a, bare) = setup_local_with_bare_remote();
         let branch = current_branch_name(&repo_a).unwrap();
         for (p, c) in base {
@@ -2253,8 +2358,108 @@ mod tests {
         local(&repo_a);
         fetch_remote(&repo_a, &branch, "origin", None).unwrap();
         let outcome =
-            pull_and_merge(&repo_a, &branch, "origin", "Alice", "a@x.com", "conflict-xyz").unwrap();
+            pull_and_merge(&repo_a, &branch, "origin", "Alice", "a@x.com", "conflict-xyz");
         (vec![local_a, bare, dir_b], repo_a, outcome)
+    }
+
+    fn rename_and_commit(repo: &Repository, from: &str, to: &str) {
+        let wd = repo.workdir().unwrap();
+        std::fs::rename(wd.join(from), wd.join(to)).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new(from)).unwrap();
+        index.add_path(Path::new(to)).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "mv", &tree, &[&parent]).unwrap();
+    }
+
+    /// A merge that left the repo usable: committed, clean, no merge state.
+    fn assert_merged_cleanly(repo: &Repository) {
+        assert!(repo.state() == git2::RepositoryState::Clean);
+        let mut opts = git2::StatusOptions::new();
+        opts.include_untracked(true).recurse_untracked_dirs(true);
+        let statuses = repo.statuses(Some(&mut opts)).unwrap();
+        let dirty: Vec<String> =
+            statuses.iter().map(|e| format!("{:?} {:?}", e.status(), e.path())).collect();
+        assert!(dirty.is_empty(), "everything committed, left: {:?}", dirty);
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().parent_count(), 2);
+    }
+
+    #[test]
+    fn pull_and_merge_keeps_a_remote_folder_and_a_local_file_of_the_same_name() {
+        // The folder keeps the name; the file becomes the conflicted copy. A
+        // merge that tried to write the file over the folder failed on every
+        // pull, and both machines stopped syncing (2026-10-18 research, A4).
+        let (_keep, repo_a, outcome) = diverge_and_try_merge(
+            &[("keep.txt", b"k")],
+            &|a| commit_file(a, "x", b"local file"),
+            &|b| commit_file(b, "x/f.txt", b"remote folder"),
+        );
+        let outcome = outcome.expect("the merge must go through");
+        assert!(matches!(outcome, MergeOutcome::Conflicted { .. }), "got {:?}", outcome);
+        let wd = repo_a.workdir().unwrap();
+        assert_eq!(std::fs::read(wd.join("x/f.txt")).unwrap(), b"remote folder");
+        assert_eq!(std::fs::read(wd.join("x.conflict-xyz")).unwrap(), b"local file");
+        assert_merged_cleanly(&repo_a);
+    }
+
+    #[test]
+    fn pull_and_merge_keeps_a_local_folder_and_a_remote_file_of_the_same_name() {
+        let (_keep, repo_a, outcome) = diverge_and_try_merge(
+            &[("keep.txt", b"k")],
+            &|a| commit_file(a, "x/f.txt", b"local folder"),
+            &|b| commit_file(b, "x", b"remote file"),
+        );
+        let outcome = outcome.expect("the merge must go through");
+        assert!(matches!(outcome, MergeOutcome::Conflicted { .. }), "got {:?}", outcome);
+        let wd = repo_a.workdir().unwrap();
+        assert_eq!(std::fs::read(wd.join("x/f.txt")).unwrap(), b"local folder");
+        assert_eq!(std::fs::read(wd.join("x.conflict-xyz")).unwrap(), b"remote file");
+        assert_merged_cleanly(&repo_a);
+    }
+
+    #[test]
+    fn pull_and_merge_never_mixes_the_chunks_of_two_versions_of_a_large_file() {
+        // A cleartext manifest is text, one chunk per line: libgit2 merged
+        // two edits to distant chunks into a manifest of a file neither
+        // machine wrote (2026-10-18 research, A2).
+        let manifest = |hashes: [u64; 4]| crate::chunk::Manifest {
+            total_size: 40,
+            chunk_size: 10,
+            hashes: hashes.iter().map(|h| format!("{:064x}", h)).collect(),
+        }
+        .serialize();
+        let local = manifest([11, 2, 3, 4]);
+        let remote = manifest([1, 2, 3, 44]);
+        let (_keep, repo_a, outcome) = diverge_and_merge(
+            &[("big.bin", &manifest([1, 2, 3, 4]))],
+            &|a| commit_file(a, "big.bin", &local),
+            &|b| commit_file(b, "big.bin", &remote),
+        );
+        assert!(matches!(outcome, MergeOutcome::Conflicted { .. }), "got {:?}", outcome);
+        let wd = repo_a.workdir().unwrap();
+        assert_eq!(std::fs::read(wd.join("big.bin")).unwrap(), remote, "the remote version, whole");
+        assert_eq!(std::fs::read(wd.join("big.bin.conflict-xyz")).unwrap(), local);
+        assert_merged_cleanly(&repo_a);
+    }
+
+    #[test]
+    fn pull_and_merge_keeps_both_names_when_both_sides_rename_the_same_file() {
+        // libgit2 reports a rename to two names as three one-sided conflicts:
+        // the ancestor alone, ours alone and theirs alone (A5).
+        let (_keep, repo_a, outcome) = diverge_and_try_merge(
+            &[("a.txt", b"same content")],
+            &|a| rename_and_commit(a, "a.txt", "b.txt"),
+            &|b| rename_and_commit(b, "a.txt", "c.txt"),
+        );
+        outcome.expect("the merge must go through");
+        let wd = repo_a.workdir().unwrap();
+        assert!(!wd.join("a.txt").exists());
+        assert_eq!(std::fs::read(wd.join("b.txt")).unwrap(), b"same content");
+        assert_eq!(std::fs::read(wd.join("c.txt")).unwrap(), b"same content");
+        assert_merged_cleanly(&repo_a);
     }
 
     #[test]

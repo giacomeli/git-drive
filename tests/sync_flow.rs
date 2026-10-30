@@ -474,6 +474,107 @@ async fn remote_update_visible_after_refresh_despite_local_buffer() {
     );
 }
 
+/// Another machine (B) commits `content` to `hi.txt` and publishes it.
+fn remote_commit(bare_url: &str, content: &[u8]) -> tempfile::TempDir {
+    let dir_b = tempfile::tempdir().unwrap();
+    let repo_b = git2::Repository::clone(bare_url, dir_b.path()).unwrap();
+    std::fs::write(dir_b.path().join("hi.txt"), content).unwrap();
+    let mut index = repo_b.index().unwrap();
+    index.add_path(std::path::Path::new("hi.txt")).unwrap();
+    index.write().unwrap();
+    let tree = repo_b.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Bob", "b@x.com").unwrap();
+    let parent = repo_b.head().unwrap().peel_to_commit().unwrap();
+    repo_b.commit(Some("HEAD"), &sig, &sig, "from B", &tree, &[&parent]).unwrap();
+    git_drive::git::push_to_remote(&repo_b, "main", "origin", None).unwrap();
+    dir_b
+}
+
+fn head_blob(repo_path: &std::path::Path, path: &str) -> Option<Vec<u8>> {
+    let repo = Repository::open(repo_path).unwrap();
+    let tree = repo.head().unwrap().peel_to_tree().unwrap();
+    let id = tree.get_path(std::path::Path::new(path)).ok()?.id();
+    let content = repo.find_blob(id).unwrap().content().to_vec();
+    Some(content)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn an_edit_held_open_across_a_pull_does_not_overwrite_the_remote_version() {
+    // The buffer was born from v1; while the file stayed open, a pull brought
+    // v3 from another machine; the close committed v1+edit over v3, and v3
+    // left HEAD with no conflicted copy (2026-10-18 research, A3).
+    let test = init_repo();
+    let bare = init_bare_remote();
+    let bare_url = format!("file://{}", bare.path().to_str().unwrap());
+    test.repo.remote("origin", &bare_url).unwrap();
+    commit_file(&test.repo, "hi.txt", b"local-v1", "add hi");
+    git_drive::git::push_to_remote(&test.repo, "main", "origin", None).unwrap();
+    let sync = SyncManager::new_full_with_pull(
+        test.dir.path().to_str().unwrap(),
+        "main".to_string(),
+        1,
+        Some("Alice".to_string()),
+        Some("a@x.com".to_string()),
+        Some("origin".to_string()),
+        None,
+        1,
+    );
+    let mut fs =
+        git_drive::fs::GitDriveFS::new(test.dir.path().to_str().unwrap(), "main".to_string(), sync)
+            .unwrap();
+    let ino = fs.find_inode("hi.txt").unwrap();
+
+    fs.apply_write(ino, 0, b"local-v2").unwrap(); // held open: no flush yet
+    let _b = remote_commit(&bare_url, b"remote-v3");
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    assert_eq!(head_blob(test.dir.path(), "hi.txt").as_deref(), Some(&b"remote-v3"[..]), "pulled");
+
+    fs.apply_flush(ino).expect("the close queues the edit");
+    wait_flush().await;
+
+    assert_eq!(
+        head_blob(test.dir.path(), "hi.txt").as_deref(),
+        Some(&b"remote-v3"[..]),
+        "the version another machine published first stays"
+    );
+    let repo = Repository::open(test.dir.path()).unwrap();
+    let tree = repo.head().unwrap().peel_to_tree().unwrap();
+    let copy = tree
+        .iter()
+        .filter_map(|e| e.name().map(String::from))
+        .find(|n| n.starts_with("hi.txt.conflict-"))
+        .expect("the local edit kept as a conflicted copy");
+    assert_eq!(head_blob(test.dir.path(), &copy).as_deref(), Some(&b"local-v2"[..]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn successive_saves_of_a_file_held_open_are_not_conflicts() {
+    // The buffer outlives its first save: the second save starts from the
+    // version this machine committed itself, which is no conflict.
+    let test = init_repo();
+    commit_file(&test.repo, "hi.txt", b"v1", "add hi");
+    let sync = mgr(test.dir.path().to_str().unwrap(), "main", Some(("Alice", "a@x.com")));
+    let mut fs =
+        git_drive::fs::GitDriveFS::new(test.dir.path().to_str().unwrap(), "main".to_string(), sync)
+            .unwrap();
+    let ino = fs.find_inode("hi.txt").unwrap();
+
+    fs.apply_write(ino, 0, b"v2").unwrap();
+    fs.apply_flush(ino).unwrap();
+    wait_flush().await;
+    fs.apply_write(ino, 0, b"v3").unwrap();
+    fs.apply_flush(ino).unwrap();
+    wait_flush().await;
+
+    assert_eq!(head_blob(test.dir.path(), "hi.txt").as_deref(), Some(&b"v3"[..]));
+    let repo = Repository::open(test.dir.path()).unwrap();
+    let tree = repo.head().unwrap().peel_to_tree().unwrap();
+    assert!(
+        tree.iter().all(|e| !e.name().unwrap_or("").contains(".conflict-")),
+        "no conflicted copy"
+    );
+}
+
 // ---- RF5 regression (Phase 0): batch with causal ordering ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

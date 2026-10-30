@@ -36,13 +36,21 @@ pub struct Prepared {
 }
 
 fn header(op: &SyncOp) -> String {
-    let v: Vec<&str> = match op {
-        SyncOp::Write { path, .. } => vec!["write", path],
-        SyncOp::Delete { path } => vec!["delete", path],
-        SyncOp::Mkdir { path } => vec!["mkdir", path],
-        SyncOp::Rmdir { path } => vec!["rmdir", path],
-        SyncOp::Rename { from, to } => vec!["rename", from, to],
-        SyncOp::Symlink { path, target } => vec!["symlink", path, target],
+    let v: Vec<String> = match op {
+        // A base adds `commit, blob` ("" for a path that did not exist).
+        SyncOp::Write { path, base, .. } => {
+            let mut v = vec!["write".to_string(), path.clone()];
+            if let Some(b) = base {
+                v.push(b.commit.to_string());
+                v.push(b.blob.map(|o| o.to_string()).unwrap_or_default());
+            }
+            v
+        }
+        SyncOp::Delete { path } => vec!["delete".into(), path.clone()],
+        SyncOp::Mkdir { path } => vec!["mkdir".into(), path.clone()],
+        SyncOp::Rmdir { path } => vec!["rmdir".into(), path.clone()],
+        SyncOp::Rename { from, to } => vec!["rename".into(), from.clone(), to.clone()],
+        SyncOp::Symlink { path, target } => vec!["symlink".into(), path.clone(), target.clone()],
     };
     serde_json::to_string(&v).expect("string array serializes")
 }
@@ -55,6 +63,13 @@ fn parse(header: &str, data: Option<PathBuf>) -> Option<SyncOp> {
         "write" => SyncOp::Write {
             path: arg(1)?,
             content: WriteContent::Spooled(data?),
+            // Records written before bases existed have none.
+            base: arg(2).and_then(|c| git2::Oid::from_str(&c).ok()).map(|commit| {
+                crate::sync::WriteBase {
+                    commit,
+                    blob: arg(3).and_then(|b| git2::Oid::from_str(&b).ok()),
+                }
+            }),
         },
         "delete" => SyncOp::Delete { path: arg(1)? },
         "mkdir" => SyncOp::Mkdir { path: arg(1)? },
@@ -204,6 +219,7 @@ mod tests {
             SyncOp::Write {
                 path: "dir/a b\n.txt".into(),
                 content: WriteContent::Mem(Arc::new(b"hello".to_vec())),
+                base: None,
             },
             SyncOp::Delete { path: "x".into() },
             SyncOp::Mkdir { path: "d".into() },
@@ -235,7 +251,7 @@ mod tests {
         assert_eq!(replay.len(), 6, "temp record dropped");
         assert_eq!(replay.iter().map(|r| r.0).collect::<Vec<_>>(), (10..16).collect::<Vec<_>>());
         match &replay[0].1 {
-            SyncOp::Write { path, content } => {
+            SyncOp::Write { path, content, .. } => {
                 assert_eq!(path, "dir/a b\n.txt", "any path survives the header encoding");
                 assert_eq!(content.to_vec(), b"hello");
             }
@@ -258,6 +274,7 @@ mod tests {
             let op = SyncOp::Write {
                 path: format!("f{}", seq),
                 content: WriteContent::Mem(Arc::new(vec![seq as u8])),
+                base: None,
             };
             let p = j.prepare(&op).unwrap();
             j.commit(p, seq).unwrap();
@@ -266,6 +283,36 @@ mod tests {
         let (_j, replay) = Journal::open(dir.path()).unwrap();
         assert_eq!(replay.iter().map(|r| r.0).collect::<Vec<_>>(), vec![3, 4]);
         assert!(!dir.path().join(seq_name(1, "data")).exists());
+    }
+
+    #[test]
+    fn a_write_keeps_its_base_across_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let (j, _) = Journal::open(dir.path()).unwrap();
+        let base = |blob: Option<&str>| crate::sync::WriteBase {
+            commit: git2::Oid::from_str("1111111111111111111111111111111111111111").unwrap(),
+            blob: blob.map(|b| git2::Oid::from_str(b).unwrap()),
+        };
+        let edited = base(Some("2222222222222222222222222222222222222222"));
+        let created = base(None);
+        for (seq, b) in [(1, Some(edited)), (2, Some(created)), (3, None)] {
+            let op = SyncOp::Write {
+                path: format!("f{}", seq),
+                content: WriteContent::Mem(Arc::new(vec![1])),
+                base: b,
+            };
+            let p = j.prepare(&op).unwrap();
+            j.commit(p, seq).unwrap();
+        }
+        let (_j, replay) = Journal::open(dir.path()).unwrap();
+        let bases: Vec<_> = replay
+            .iter()
+            .map(|(_, op)| match op {
+                SyncOp::Write { base, .. } => *base,
+                other => panic!("{:?}", other),
+            })
+            .collect();
+        assert_eq!(bases, vec![Some(edited), Some(created), None]);
     }
 
     #[test]
@@ -278,6 +325,7 @@ mod tests {
         let op = SyncOp::Write {
             path: "big.bin".into(),
             content: WriteContent::Spooled(spool.clone()),
+            base: None,
         };
         let p = j.prepare(&op).unwrap();
         j.commit(p, 1).unwrap();
@@ -297,6 +345,7 @@ mod tests {
         let op = SyncOp::Write {
             path: "a".into(),
             content: WriteContent::Mem(Arc::new(b"x".to_vec())),
+            base: None,
         };
         let p = j.prepare(&op).unwrap();
         j.commit(p, 7).unwrap();

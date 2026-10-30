@@ -269,9 +269,19 @@ Online = a relay connection or at least one live peer connection. Any failure (k
 | --- | --- |
 | Remote only advanced | Fast-forward (`checkout force` of the paths that differ from HEAD only, behind the clean-tree guard). |
 | Both sides changed different files | 3-way merge, merge commit with 2 parents. |
-| Both sides changed (or created) the same file | Remote version canonical at the path; local version preserved as `<path>.conflict-<host>-<ts>`. |
+| Both sides changed (or created) the same file | Remote version canonical at the path; local version preserved as `<path>.conflict-<host>-<ts>`. Exception in cleartext mode: libgit2 merges text line by line when the two edits do not touch neighboring lines (encrypted content always conflicts). |
+| Both sides changed a large file (chunk manifest) | Never merged line by line (`mixed_manifests`): a mixed manifest would point at chunks of two versions. Remote version canonical, local as the conflicted copy. |
+| A file on one side, a folder of the same name on the other | The folder keeps the name; the file becomes `<path>.conflict-<host>-<ts>`, whichever side it came from. libgit2's `<path>~<label>` side files are removed. |
+| Both sides renamed the same file to different names | Both names are kept, the old one goes (libgit2 reports three one-sided conflicts). |
 | One side edited, the other deleted | The edit wins and stays at its own path — only one version survives, so there is nothing to conflict. (A conflicted copy here left the original name gone and, in encrypted mode, an orphan copy without its long-name sidecar.) |
 | Hashed long-name entry lost its sidecar (the deleting side removed `dslong_<h>.name`) | `restore_missing_long_name_sidecars` restores it from the local HEAD or the remote tree, so the name stays decodable. |
+
+The same rule covers a file held open across a pull: every write the FUSE layer queues carries
+the version its buffer was born from (`WriteBase`: HEAD and the path's blob). Before applying a
+batch, the drain checks it against HEAD (`stale_write`); when a commit this session did not create
+(`own_commits`) changed the path since, the write goes to `<path>.conflict-<host>-<ts>` instead of
+overwriting the version another machine published (`DrainCtx::divert_stale_writes`), and the copy
+enters the status's `conflicts` list. The base also travels through the journal.
 
 In encrypted mode the conflicted copy is named `<encrypted name>.conflict-...` on disk; the
 migration sweep treats that shape as conforming (it used to encrypt the base32 name a second time,

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -43,9 +44,21 @@ impl WriteContent {
     }
 }
 
+/// The version a write's content grew from: HEAD when its buffer was born,
+/// and the blob the path had there (`None`: the path did not exist). The
+/// drain compares it with HEAD: content born from an older version than one
+/// another machine published since would overwrite that version unseen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteBase {
+    pub commit: git2::Oid,
+    pub blob: Option<git2::Oid>,
+}
+
 #[derive(Debug, Clone)]
 pub enum SyncOp {
-    Write { path: String, content: WriteContent },
+    /// `base`: `None` for writes that are not edits of a version the
+    /// drive showed (tests, swaps between two files).
+    Write { path: String, content: WriteContent, base: Option<WriteBase> },
     Delete { path: String },
     Mkdir { path: String },
     Rmdir { path: String },
@@ -91,6 +104,13 @@ pub fn next_pull_delay(pull_interval_secs: u64, idle_secs: Option<u64>, online: 
     match idle_secs {
         Some(idle) if online => idle,
         _ => pull_interval_secs,
+    }
+}
+
+/// Adds HEAD (a merge this session just created) to `own`.
+fn record_head(own: &Mutex<HashSet<git2::Oid>>, repo: &git2::Repository) {
+    if let Some(head) = repo.head().ok().and_then(|h| h.target()) {
+        own.lock().insert(head);
     }
 }
 
@@ -168,6 +188,9 @@ pub struct SyncManager {
     pull_now: Arc<Notify>,
     /// P2P channel hooks; `None` = channel off, behavior as without it.
     p2p: Arc<Mutex<Option<P2pHooks>>>,
+    /// Commits this session created (drains, merges): a change to a path
+    /// made by one of them is no reason to divert a write (`stale_write`).
+    own_commits: Arc<Mutex<HashSet<git2::Oid>>>,
 }
 
 struct Inner {
@@ -277,6 +300,7 @@ impl SyncManager {
             migration_crypto: Arc::new(Mutex::new(None)),
             pull_now: Arc::new(Notify::new()),
             p2p: Arc::new(Mutex::new(None)),
+            own_commits: Arc::new(Mutex::new(HashSet::new())),
         };
 
         manager.spawn_watcher();
@@ -368,6 +392,7 @@ impl SyncManager {
             crypto: self.crypto.clone(),
             migration_crypto: self.migration_crypto.clone(),
             p2p: self.p2p.clone(),
+            own_commits: self.own_commits.clone(),
         }
     }
 
@@ -481,6 +506,7 @@ impl SyncManager {
         let crypto = self.crypto.clone();
         let pull_now = self.pull_now.clone();
         let p2p = self.p2p.clone();
+        let own_commits = self.own_commits.clone();
 
         task::spawn(async move {
             // The first pull runs right after boot (not one full interval
@@ -613,6 +639,7 @@ impl SyncManager {
                         remeasure_repo(&status, &repo_path);
                     }
                     Ok(git::MergeOutcome::Merged) => {
+                        record_head(&own_commits, &repo);
                         log::info!("pull: 3-way merge, no conflicts");
                         status.record_pull("3-way merge");
                         refresh_flag.store(true, Ordering::SeqCst);
@@ -620,6 +647,7 @@ impl SyncManager {
                         remeasure_repo(&status, &repo_path);
                     }
                     Ok(git::MergeOutcome::Conflicted { resolved, suffix }) => {
+                        record_head(&own_commits, &repo);
                         log::warn!(
                             "pull: resolved {} conflict(s) — local versions at *.{}: {:?}",
                             resolved.len(),
@@ -679,9 +707,15 @@ impl SyncManager {
     /// Enqueues a write with already-packaged content (e.g. an `Arc` shared
     /// with the FUSE write buffer — no copy on the hot path).
     pub fn queue_write_content(&self, path: &str, content: WriteContent) {
+        self.queue_write_from(path, content, None);
+    }
+
+    /// Enqueues an edit of the version `base` describes (see `WriteBase`).
+    pub fn queue_write_from(&self, path: &str, content: WriteContent, base: Option<WriteBase>) {
         self.enqueue(SyncOp::Write {
             path: path.to_string(),
             content,
+            base,
         });
     }
 
@@ -812,6 +846,7 @@ struct DrainCtx {
     crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
     migration_crypto: Arc<Mutex<Option<Arc<crate::crypt::Crypto>>>>,
     p2p: Arc<Mutex<Option<P2pHooks>>>,
+    own_commits: Arc<Mutex<HashSet<git2::Oid>>>,
 }
 
 /// Takes the whole queue plus its journal boundary (the last seq the taken
@@ -874,6 +909,7 @@ impl DrainCtx {
         let mut commits_created = 0usize;
         let mut commit_error: Option<String> = None;
         for (i, batch) in batches.into_iter().enumerate() {
+            let (batch, diverted) = self.divert_stale_writes(batch, crypto.as_deref());
             // Apply in arrival order — the queue is already causal. With
             // encryption, the cleartext->encrypted translation of paths and
             // content happens HERE (the FUSE layer and the queue work 100% in
@@ -1002,6 +1038,7 @@ impl DrainCtx {
                 write_sweep_marker(&self.repo_path, &fingerprint);
             }
             if let Some(oid) = commit_oid {
+                self.own_commits.lock().insert(oid);
                 commits_created += 1;
                 last_commit = Some(oid);
                 if n_batches > 1 {
@@ -1014,7 +1051,8 @@ impl DrainCtx {
                 // in the drive until a real pull (zip migration incident,
                 // 2026-07-03). Flag AFTER the commit: a rebuild before it
                 // would read the old HEAD and consume the flag for nothing.
-                if converted > 0 {
+                // A diverted write is such a new path too.
+                if converted > 0 || diverted > 0 {
                     self.refresh_flag.store(true, Ordering::SeqCst);
                 }
             }
@@ -1085,6 +1123,7 @@ impl DrainCtx {
                         &self.status,
                         &self.notifier,
                         crypto.as_deref(),
+                        &self.own_commits,
                     );
                     pushed = Some(recovered);
                     if recovered {
@@ -1112,6 +1151,90 @@ impl DrainCtx {
         // arena would otherwise keep.
         crate::release_freed_memory();
     }
+}
+
+impl DrainCtx {
+    /// Sends to a conflicted copy next to its path every write whose content
+    /// grew from an older version than one another machine published since:
+    /// the published version stays, the local one is kept beside it — the
+    /// rule of the 3-way merge. Overwriting lost the other machine's edit,
+    /// unseen, whenever a file stayed open across a pull (2026-10-18
+    /// research, A3). Returns the batch and how many writes it diverted.
+    fn divert_stale_writes(
+        &self,
+        batch: Vec<SyncOp>,
+        crypto: Option<&crate::crypt::Crypto>,
+    ) -> (Vec<SyncOp>, usize) {
+        if !batch.iter().any(|op| matches!(op, SyncOp::Write { base: Some(_), .. })) {
+            return (batch, 0);
+        }
+        let Ok(repo) = git::open_repo(self.repo_path.to_str().unwrap_or("")) else {
+            return (batch, 0);
+        };
+        let own = self.own_commits.lock().clone();
+        let suffix = conflict_suffix();
+        let mut copies = Vec::new();
+        let batch = batch
+            .into_iter()
+            .map(|op| match op {
+                SyncOp::Write { path, content, base: Some(base) }
+                    if stale_write(&repo, &own, &disk_rel_path(crypto, &path), &base) =>
+                {
+                    let copy = format!("{}.{}", path, suffix);
+                    copies.push(copy.clone());
+                    SyncOp::Write { path: copy, content, base: None }
+                }
+                other => other,
+            })
+            .collect();
+        let n = copies.len();
+        if n > 0 {
+            log::warn!(
+                "drain: {} file(s) changed on another machine while open here — local versions kept at *.{}",
+                n,
+                suffix
+            );
+            self.status.add_conflicts(copies.clone());
+            self.notifier.notify(NotifyEvent::Conflicts { copies });
+        }
+        (batch, n)
+    }
+}
+
+/// Whether a commit this session did not create changed `disk_path` after
+/// `base`: a write grown from `base` would overwrite that change unseen. A
+/// change by this session's own drains or merges is no reason (successive
+/// saves of a file held open).
+fn stale_write(
+    repo: &git2::Repository,
+    own: &HashSet<git2::Oid>,
+    disk_path: &str,
+    base: &WriteBase,
+) -> bool {
+    let entry_at = |c: &git2::Commit| {
+        c.tree()
+            .ok()
+            .and_then(|t| t.get_path(Path::new(disk_path)).ok())
+            .map(|e| e.id())
+    };
+    let Ok(head) = repo.head().and_then(|h| h.peel_to_commit()) else { return false };
+    if entry_at(&head) == base.blob {
+        return false;
+    }
+    let walk = (|| {
+        let mut walk = repo.revwalk()?;
+        walk.push(head.id())?;
+        walk.hide(base.commit)?;
+        Ok::<_, git2::Error>(walk)
+    })();
+    // A base this repository does not know: keep both versions.
+    let Ok(walk) = walk else { return true };
+    walk.flatten().filter(|oid| !own.contains(oid)).any(|oid| {
+        repo.find_commit(oid).is_ok_and(|c| {
+            let before = c.parent(0).ok().and_then(|p| entry_at(&p));
+            entry_at(&c) != before
+        })
+    })
 }
 
 /// Content bytes an op contributes to a batch (only writes carry content;
@@ -1391,7 +1514,7 @@ fn apply_op_to_disk(
     chunk_threshold: u64,
 ) {
     match op {
-        SyncOp::Write { path, content } => {
+        SyncOp::Write { path, content, .. } => {
             let full = repo_path.join(disk_rel_path(crypto, path));
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent).ok();
@@ -1618,6 +1741,7 @@ fn reconcile_and_retry_push(
     status: &StatusState,
     notifier: &Notifier,
     crypto: Option<&crate::crypt::Crypto>,
+    own_commits: &Mutex<HashSet<git2::Oid>>,
 ) -> bool {
     const RECONCILE_ROUNDS: usize = 3;
     let (Some(name), Some(email)) = (user_name.as_deref(), user_email.as_deref()) else {
@@ -1650,6 +1774,7 @@ fn reconcile_and_retry_push(
             }
             Ok(git::MergeOutcome::NoOp) => {}
             Ok(git::MergeOutcome::Conflicted { ref resolved, ref suffix }) => {
+                record_head(own_commits, &repo);
                 log::warn!(
                     "reconcile: {} conflict(s) — local versions at *.{}: {:?}",
                     resolved.len(),
@@ -1661,6 +1786,9 @@ fn reconcile_and_retry_push(
                 notifier.notify(NotifyEvent::Conflicts { copies });
             }
             Ok(o) => {
+                if matches!(o, git::MergeOutcome::Merged) {
+                    record_head(own_commits, &repo);
+                }
                 log::info!("reconcile: applied ({:?})", o);
             }
             Err(e) => {
@@ -2693,9 +2821,11 @@ fn op_paths(op: &SyncOp) -> [Option<&str>; 2] {
 /// content during write storms (repeated flushes of the same file within the
 /// debounce window).
 pub(crate) fn push_coalescing(queue: &mut Vec<SyncOp>, op: SyncOp) {
-    if let SyncOp::Write { path, content } = op {
+    if let SyncOp::Write { path, content, base } = op {
         for existing in queue.iter_mut().rev() {
-            if let SyncOp::Write { path: p, content: c } = existing {
+            // The queued op keeps its base: the oldest version the merged
+            // content grew from.
+            if let SyncOp::Write { path: p, content: c, .. } = existing {
                 if *p == path {
                     // A replaced spooled snapshot will never reach the drain —
                     // removing the file here avoids buildup in the spool dir.
@@ -2714,7 +2844,7 @@ pub(crate) fn push_coalescing(queue: &mut Vec<SyncOp>, op: SyncOp) {
                 break;
             }
         }
-        queue.push(SyncOp::Write { path, content });
+        queue.push(SyncOp::Write { path, content, base });
     } else {
         queue.push(op);
     }
@@ -2737,6 +2867,7 @@ mod tests {
         SyncOp::Write {
             path: path.to_string(),
             content: wc(&vec![b'x'; size]),
+            base: None,
         }
     }
 
@@ -2812,6 +2943,7 @@ mod tests {
             &SyncOp::Write {
                 path: clear.clone(),
                 content: wc(b"secret data"),
+                base: None,
             },
             Some(&c),
             0,
@@ -2849,7 +2981,7 @@ mod tests {
         let snap = m.buffer_snapshot();
         assert_eq!(snap.len(), 1);
         match &snap[0] {
-            SyncOp::Write { path, content } => {
+            SyncOp::Write { path, content, .. } => {
                 assert_eq!(path, "a.txt");
                 assert_eq!(content.to_vec(), b"hello");
             }
@@ -2965,11 +3097,11 @@ mod tests {
     #[test]
     fn push_coalescing_write_over_write_same_path_replaces_in_place() {
         let mut q = Vec::new();
-        push_coalescing(&mut q, SyncOp::Write { path: "a.txt".into(), content: wc(b"v1") });
-        push_coalescing(&mut q, SyncOp::Write { path: "b.txt".into(), content: wc(b"other") });
-        push_coalescing(&mut q, SyncOp::Write { path: "a.txt".into(), content: wc(b"v2") });
+        push_coalescing(&mut q, SyncOp::Write { path: "a.txt".into(), content: wc(b"v1"), base: None });
+        push_coalescing(&mut q, SyncOp::Write { path: "b.txt".into(), content: wc(b"other"), base: None });
+        push_coalescing(&mut q, SyncOp::Write { path: "a.txt".into(), content: wc(b"v2"), base: None });
         assert_eq!(q.len(), 2);
-        assert!(matches!(&q[0], SyncOp::Write { path, content }
+        assert!(matches!(&q[0], SyncOp::Write { path, content, .. }
             if path == "a.txt" && content.to_vec() == b"v2"));
     }
 
@@ -3015,9 +3147,9 @@ mod tests {
         // the same path: `rm f && ln -s target f && echo x > f` are three
         // causal states.
         let mut q = Vec::new();
-        push_coalescing(&mut q, SyncOp::Write { path: "f.txt".into(), content: wc(b"pre") });
+        push_coalescing(&mut q, SyncOp::Write { path: "f.txt".into(), content: wc(b"pre"), base: None });
         push_coalescing(&mut q, SyncOp::Symlink { path: "f.txt".into(), target: "target".into() });
-        push_coalescing(&mut q, SyncOp::Write { path: "f.txt".into(), content: wc(b"post") });
+        push_coalescing(&mut q, SyncOp::Write { path: "f.txt".into(), content: wc(b"post"), base: None });
         assert_eq!(q.len(), 3, "Symlink must be a barrier: {:?}", q);
         assert!(matches!(&q[2], SyncOp::Write { content, .. } if content.to_vec() == b"post"));
     }
@@ -3027,9 +3159,9 @@ mod tests {
         // Write(b) must not cross Rename{a->b}: the pre- and post-rename
         // content are different states of the path.
         let mut q = Vec::new();
-        push_coalescing(&mut q, SyncOp::Write { path: "b.txt".into(), content: wc(b"pre") });
+        push_coalescing(&mut q, SyncOp::Write { path: "b.txt".into(), content: wc(b"pre"), base: None });
         push_coalescing(&mut q, SyncOp::Rename { from: "a.txt".into(), to: "b.txt".into() });
-        push_coalescing(&mut q, SyncOp::Write { path: "b.txt".into(), content: wc(b"post") });
+        push_coalescing(&mut q, SyncOp::Write { path: "b.txt".into(), content: wc(b"post"), base: None });
         assert_eq!(q.len(), 3);
         assert!(matches!(&q[2], SyncOp::Write { content, .. } if content.to_vec() == b"post"));
     }
@@ -3038,9 +3170,9 @@ mod tests {
     fn push_coalescing_dir_rename_is_barrier_for_nested_write() {
         // A directory rename is a barrier for writes INSIDE it (prefix).
         let mut q = Vec::new();
-        push_coalescing(&mut q, SyncOp::Write { path: "d/f.txt".into(), content: wc(b"v1") });
+        push_coalescing(&mut q, SyncOp::Write { path: "d/f.txt".into(), content: wc(b"v1"), base: None });
         push_coalescing(&mut q, SyncOp::Rename { from: "c".into(), to: "d".into() });
-        push_coalescing(&mut q, SyncOp::Write { path: "d/f.txt".into(), content: wc(b"v2") });
+        push_coalescing(&mut q, SyncOp::Write { path: "d/f.txt".into(), content: wc(b"v2"), base: None });
         assert_eq!(q.len(), 3, "post-rename write must not coalesce with the pre-rename one");
     }
 
@@ -3057,9 +3189,9 @@ mod tests {
     #[test]
     fn build_commit_message_three_paths() {
         let ops_owned = [
-            SyncOp::Write { path: "a.txt".into(), content: wc(b"") },
-            SyncOp::Write { path: "b.txt".into(), content: wc(b"") },
-            SyncOp::Write { path: "c.txt".into(), content: wc(b"") },
+            SyncOp::Write { path: "a.txt".into(), content: wc(b""), base: None },
+            SyncOp::Write { path: "b.txt".into(), content: wc(b""), base: None },
+            SyncOp::Write { path: "c.txt".into(), content: wc(b""), base: None },
         ];
         let ops: Vec<&SyncOp> = ops_owned.iter().collect();
         let m = build_commit_message(&ops, false);
@@ -3070,7 +3202,7 @@ mod tests {
     #[test]
     fn build_commit_message_redacts_paths_in_encrypted_mode() {
         let ops_owned = [
-            SyncOp::Write { path: "secret-name.txt".into(), content: wc(b"") },
+            SyncOp::Write { path: "secret-name.txt".into(), content: wc(b""), base: None },
             SyncOp::Delete { path: "other/secret.doc".into() },
         ];
         let ops: Vec<&SyncOp> = ops_owned.iter().collect();
@@ -3093,6 +3225,7 @@ mod tests {
             .map(|i| SyncOp::Write {
                 path: format!("f{}.txt", i),
                 content: wc(b""),
+                base: None,
             })
             .collect();
         let ops: Vec<&SyncOp> = ops_owned.iter().collect();

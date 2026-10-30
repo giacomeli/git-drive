@@ -249,6 +249,10 @@ pub struct GitDriveFS {
     /// Current content per inode: copy-on-write RAM (shared with the queue
     /// via `Arc`) below the spool threshold, file on disk above it.
     write_buffers: Arc<parking_lot::Mutex<HashMap<u64, WriteBuffer>>>,
+    /// The version each write buffer was born from, sent with its writes:
+    /// the drain refuses to let content born from an older version overwrite
+    /// one another machine published meanwhile (`WriteBase`).
+    buffer_bases: parking_lot::Mutex<HashMap<u64, crate::sync::WriteBase>>,
     /// Threshold in bytes for spooling buffers (0 = spool disabled).
     spool_threshold_bytes: u64,
     /// Directory for spool files (inside `.git/` — same volume as the
@@ -490,6 +494,7 @@ impl GitDriveFS {
             next_inode,
             sync,
             write_buffers: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            buffer_bases: parking_lot::Mutex::new(HashMap::new()),
             spool_threshold_bytes,
             spool_dir,
             spool_counter: AtomicU64::new(0),
@@ -919,6 +924,12 @@ impl GitDriveFS {
         if self.write_buffers.lock().contains_key(&ino) {
             return;
         }
+        // Read before the content: a pull landing in between makes the base
+        // older than the content (a needless conflicted copy at worst),
+        // never newer (an overwrite nobody sees).
+        if let Some(base) = self.head_base(ino, path) {
+            self.buffer_bases.lock().insert(ino, base);
+        }
         let buffer = if let Some(m) = self.manifest_for(ino) {
             // Chunked: the buffer is born from the REASSEMBLY, never from the
             // raw manifest — same POSIX semantics as the Phase 0 invariant.
@@ -931,6 +942,23 @@ impl GitDriveFS {
             self.make_buffer_from_vec(base)
         };
         self.write_buffers.lock().entry(ino).or_insert(buffer);
+    }
+
+    /// HEAD and the blob `path` has there. `None` for local-only files,
+    /// which never reach a commit.
+    fn head_base(&self, ino: u64, path: &str) -> Option<crate::sync::WriteBase> {
+        if self.files_by_inode.get(&ino).is_some_and(|f| f.local_only) {
+            return None;
+        }
+        let repo = git::open_repo(&self.repo_path).ok()?;
+        let commit = git::get_commit(&repo, "HEAD").ok()?;
+        let blob = commit
+            .tree()
+            .ok()?
+            .get_path(std::path::Path::new(&self.disk_path(path)))
+            .ok()
+            .map(|e| e.id());
+        Some(crate::sync::WriteBase { commit: commit.id(), blob })
     }
 
     /// Write at an offset into the inode's buffer. Returns bytes accepted.
@@ -975,7 +1003,8 @@ impl GitDriveFS {
         if let Some(f) = self.files_by_inode.get_mut(&ino) {
             f.size = new_size;
         }
-        self.sync.queue_write_content(&path, content);
+        let base = self.buffer_bases.lock().get(&ino).copied();
+        self.sync.queue_write_from(&path, content, base);
         // Buffer content was just queued — the inode is "clean" again; a
         // subsequent flush without new writes must not duplicate the op.
         self.dirty.remove(&ino);
@@ -1229,7 +1258,8 @@ impl GitDriveFS {
             let buf = buffers.get(&ino)?;
             self.snapshot_buffer_content(buf)
         };
-        self.sync.queue_write_content(&path, content);
+        let base = self.buffer_bases.lock().get(&ino).copied();
+        self.sync.queue_write_from(&path, content, base);
         self.dirty.remove(&ino);
         self.touch(ino);
         Some(path)
@@ -1242,6 +1272,7 @@ impl GitDriveFS {
     fn gc_clean_buffers(&mut self) {
         let dirty = &self.dirty;
         self.write_buffers.lock().retain(|ino, _| dirty.contains(ino));
+        self.buffer_bases.lock().retain(|ino, _| dirty.contains(ino));
         self.read_cache.clear();
         // HEAD changed: manifests may have changed content/state.
         self.manifests.lock().clear();

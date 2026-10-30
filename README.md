@@ -222,7 +222,7 @@ daemon refuses to start.
 ## Tests
 
 ```bash
-cargo test                   # 418 tests (unit + integration)
+cargo test                   # 447 tests (unit + integration)
 cargo test --test sync_flow  # watcher -> commit -> push -> pull flow
 ```
 

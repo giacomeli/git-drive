@@ -207,7 +207,7 @@ async fn apply_create_queues_initial_empty_write() {
     let ops = fs.sync_snapshot_for_test();
     // there must be a Write { path: "novo.txt", content: [] }
     assert!(ops.iter().any(|op| matches!(op,
-        git_drive::sync::SyncOp::Write { path, content }
+        git_drive::sync::SyncOp::Write { path, content, .. }
             if path == "novo.txt" && content.is_empty()
     )));
 }
@@ -427,7 +427,7 @@ async fn apply_rename_of_file_queues_write_plus_delete() {
     let ops = fs.sync_snapshot_for_test();
     assert!(
         ops.iter().any(|op| matches!(op,
-            git_drive::sync::SyncOp::Write { path, content }
+            git_drive::sync::SyncOp::Write { path, content, .. }
                 if path == "b.txt" && content.to_vec() == b"hello"
         )),
         "expected Write(b.txt) with the original content, got {:?}",
@@ -539,7 +539,7 @@ async fn apply_truncate_smaller_preserves_prefix() {
     let ops = fs.sync_snapshot_for_test();
     assert!(
         ops.iter().any(|op| matches!(op,
-            git_drive::sync::SyncOp::Write { path, content }
+            git_drive::sync::SyncOp::Write { path, content, .. }
                 if path == "a.txt" && content.to_vec() == b"hell"
         )),
         "expected truncated Write(a.txt), got {:?}",
@@ -589,7 +589,7 @@ async fn flush_after_write_enqueues_once() {
     let ops = fs.sync_snapshot_for_test();
     assert!(
         ops.iter().any(|op| matches!(op,
-            git_drive::sync::SyncOp::Write { path, content }
+            git_drive::sync::SyncOp::Write { path, content, .. }
                 if path == "a.txt" && content.to_vec() == b"hello world"
         )),
         "expected Write(a.txt) with the full content, got {:?}",
@@ -791,7 +791,7 @@ async fn dir_rename_from_ephemeral_materializes_content() {
     use git_drive::sync::SyncOp;
     let pos_mkdir = ops.iter().position(|op| matches!(op, SyncOp::Mkdir { path } if path == "visible"));
     let pos_write = ops.iter().position(|op| matches!(op,
-        SyncOp::Write { path, content } if path == "visible/f.txt" && content.to_vec() == b"segredo"));
+        SyncOp::Write { path, content, .. } if path == "visible/f.txt" && content.to_vec() == b"segredo"));
     assert!(pos_mkdir.is_some(), "expected mkdir, got {:?}", ops);
     assert!(pos_write.is_some(), "expected write with content, got {:?}", ops);
     assert!(pos_mkdir < pos_write, "mkdir must precede the write");
@@ -829,7 +829,7 @@ async fn file_rename_from_ephemeral_materializes_write() {
     let ops = fs.sync_snapshot_for_test();
     use git_drive::sync::SyncOp;
     assert_eq!(ops.len(), 1, "expected only the Write, got {:?}", ops);
-    assert!(matches!(&ops[0], SyncOp::Write { path, content }
+    assert!(matches!(&ops[0], SyncOp::Write { path, content, .. }
         if path == "real.txt" && content.to_vec() == b"data"));
 }
 
@@ -852,9 +852,9 @@ async fn apply_exchange_swaps_contents_by_name() {
     assert_eq!(fs.read_content_for_test(ino_b).as_deref(), Some(b"conteudo-a".as_slice()));
     let ops = fs.sync_snapshot_for_test();
     use git_drive::sync::SyncOp;
-    assert!(ops.iter().any(|op| matches!(op, SyncOp::Write { path, content }
+    assert!(ops.iter().any(|op| matches!(op, SyncOp::Write { path, content, .. }
         if path == "a.txt" && content.to_vec() == b"conteudo-b")));
-    assert!(ops.iter().any(|op| matches!(op, SyncOp::Write { path, content }
+    assert!(ops.iter().any(|op| matches!(op, SyncOp::Write { path, content, .. }
         if path == "b.txt" && content.to_vec() == b"conteudo-a")));
 }
 
@@ -1503,7 +1503,7 @@ async fn write_to_chunked_file_roundtrip_via_buffer() {
     let content_len = snap
         .iter()
         .find_map(|op| match op {
-            git_drive::sync::SyncOp::Write { path, content } if path == "big.bin" => {
+            git_drive::sync::SyncOp::Write { path, content, .. } if path == "big.bin" => {
                 Some(content.to_vec().len())
             }
             _ => None,
@@ -1526,7 +1526,7 @@ async fn rename_chunked_file_queues_manifest_not_expanded_content() {
     let write_bytes = snap
         .iter()
         .find_map(|op| match op {
-            git_drive::sync::SyncOp::Write { path, content } if path == "renomeado.bin" => {
+            git_drive::sync::SyncOp::Write { path, content, .. } if path == "renomeado.bin" => {
                 Some(content.to_vec())
             }
             _ => None,

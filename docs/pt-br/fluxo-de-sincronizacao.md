@@ -269,9 +269,20 @@ Online = conexão com o relay ou pelo menos uma conexão viva com um peer. Qualq
 | --- | --- |
 | Só o remote avançou | Fast-forward (`checkout force` só dos caminhos que diferem do HEAD, atrás da guarda de tree limpa). |
 | Os dois lados mudaram arquivos diferentes | Merge 3-way, commit de merge com 2 pais. |
-| Os dois lados mudaram (ou criaram) o mesmo arquivo | Versão remota canônica no path; versão local preservada como `<path>.conflict-<host>-<ts>`. |
+| Os dois lados mudaram (ou criaram) o mesmo arquivo | Versão remota canônica no path; versão local preservada como `<path>.conflict-<host>-<ts>`. Exceção no modo em claro: o libgit2 mescla texto linha a linha quando as duas edições não tocam linhas vizinhas (conteúdo cifrado sempre conflita). |
+| Os dois lados mudaram um arquivo grande (manifest de chunks) | Nunca mesclado linha a linha (`mixed_manifests`): um manifest misturado apontaria chunks de duas versões. Versão remota canônica, a local como conflicted copy. |
+| Um arquivo de um lado, uma pasta de mesmo nome do outro | A pasta fica com o nome; o arquivo vira `<path>.conflict-<host>-<ts>`, venha de qual lado vier. Os arquivos `<path>~<rótulo>` que o libgit2 deixa são removidos. |
+| Os dois lados renomearam o mesmo arquivo para nomes diferentes | Os dois nomes ficam e o antigo sai (o libgit2 relata três conflitos de um lado só). |
 | Um lado editou, o outro apagou | A edição vence e fica no próprio path — só uma versão sobrevive, então não há o que conflitar. (Uma conflicted copy aqui deixava o nome original sumido e, no modo cifrado, uma cópia órfã sem o sidecar de nome longo.) |
 | Entrada de nome longo perdeu o sidecar (o lado que apagou removeu `dslong_<h>.name`) | `restore_missing_long_name_sidecars` restaura a partir do HEAD local ou da tree remota, para o nome continuar decodificável. |
+
+A mesma regra vale para um arquivo que fica aberto durante um pull: toda escrita que a camada
+FUSE enfileira leva a versão de onde o buffer nasceu (`WriteBase`: o HEAD e o blob do caminho).
+Antes de aplicar um lote, o drain a compara com o HEAD (`stale_write`); se um commit que esta
+sessão não criou (`own_commits`) mudou o caminho desde então, a escrita vai para
+`<path>.conflict-<host>-<ts>` em vez de sobrescrever a versão que outra máquina publicou
+(`DrainCtx::divert_stale_writes`), e a cópia entra na lista `conflicts` do status. A base também
+passa pelo journal.
 
 No modo cifrado a conflicted copy se chama `<nome cifrado>.conflict-...` em disco; a varredura de
 migração trata esse formato como conforme (ela cifrava o nome base32 uma segunda vez, e a cópia
