@@ -8,13 +8,14 @@ repository = "https://github.com/giacomeli/git-drive"
 keywords = ["git", "fuse", "filesystem", "sync", "encryption"]
 categories = ["filesystem", "command-line-utilities"]
 
-# The Control Center and the file manager POC (Tauri GUIs) are workspace
-# members outside the default members: `cargo build`/`test`/`clippy` at the
-# root build only the daemon (and `state/`, its observable state, which the
-# apps share) and never need Node or a webview. Build each GUI with
-# `npm run tauri build` in `control-center/` or `file-manager/`.
+# The Control Center (a Tauri GUI) is a workspace member outside the default
+# members: `cargo build`/`test`/`clippy` at the root build only the daemon (and
+# `state/`, its observable state, which the apps share) and never need Node or
+# a webview. Build it with `npm run tauri build` in `control-center/`.
+# UnniFiles, the file manager, lives in its own repository and links `state/`
+# by path from beside this one.
 [workspace]
-members = [".", "state", "control-center/src-tauri", "file-manager/src-tauri"]
+members = [".", "state", "control-center/src-tauri"]
 default-members = [".", "state"]
 
 [dependencies]

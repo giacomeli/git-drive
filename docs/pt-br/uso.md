@@ -227,7 +227,7 @@ identidade). Instalações antigas (`~/.config/drive-sync/`, Application Support
 | `p2p_key_file` | Chave do dispositivo no canal. Padrão: `peer.key` ao lado do `config.json` em uso, criada na primeira subida (0600). |
 | `p2p_device_name` | Nome deste dispositivo no registro. Padrão: o hostname curto. |
 | `p2p_relay_url` | Servidor de relay próprio. Padrão: os relays públicos da n0 (veem só IDs e IPs dos dispositivos, nunca conteúdo). |
-| `repo_quota_gb` | Quanto o repositório pode ocupar, em GB, comparado ao tamanho dele na Central de Controle e no git-drive Files. Padrão: o do host (GitHub: 10 GB, o máximo que ele recomenda, com uma marca nos 5 GB abaixo dos quais ele recomenda fortemente ficar; GitLab.com: 10 GB; sem limite nos demais). O GitHub não impõe um total: só recusa push acima de 2 GB ou arquivo acima de 100 MB. |
+| `repo_quota_gb` | Quanto o repositório pode ocupar, em GB, comparado ao tamanho dele na Central de Controle e no UnniFiles. Padrão: o do host (GitHub: 10 GB, o máximo que ele recomenda, com uma marca nos 5 GB abaixo dos quais ele recomenda fortemente ficar; GitLab.com: 10 GB; sem limite nos demais). O GitHub não impõe um total: só recusa push acima de 2 GB ou arquivo acima de 100 MB. |
 | `log_level` | Nível base do arquivo de log (`off`, `error`, `warn`, `info`, `debug`, `trace`). Padrão `info`. |
 | `log_categories` | Nível por área: `sync`, `git`, `fuse`, `crypto`, `p2p`, `network` (a pilha de rede do P2P, `warn` se não definido) e `service`. Área sem nível segue o `log_level`; `off` tira a área do arquivo. Mais fácil de editar na Central de Controle (seção 9.1.4). |
 

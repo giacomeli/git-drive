@@ -227,7 +227,7 @@ by `install`.
 | `p2p_key_file` | Device key of the channel. Default: `peer.key` next to the `config.json` in use, created on first start (0600). |
 | `p2p_device_name` | Name of this device in the registry. Default: the short hostname. |
 | `p2p_relay_url` | Your own relay server. Default: the public relays of n0 (they only see device ids and IP addresses, never content). |
-| `repo_quota_gb` | How much the repository may hold, in GB, shown against its size in the Control Center and in git-drive Files. Default: the host's (GitHub: 10 GB, the maximum it recommends, with a mark at the 5 GB it strongly recommends staying under; GitLab.com: 10 GB; no limit elsewhere). GitHub enforces no total: it refuses only a push over 2 GB or a file over 100 MB. |
+| `repo_quota_gb` | How much the repository may hold, in GB, shown against its size in the Control Center and in UnniFiles. Default: the host's (GitHub: 10 GB, the maximum it recommends, with a mark at the 5 GB it strongly recommends staying under; GitLab.com: 10 GB; no limit elsewhere). GitHub enforces no total: it refuses only a push over 2 GB or a file over 100 MB. |
 | `log_level` | Base level of the log file (`off`, `error`, `warn`, `info`, `debug`, `trace`). Default `info`. |
 | `log_categories` | Level per area: `sync`, `git`, `fuse`, `crypto`, `p2p`, `network` (the P2P network stack, `warn` unless set) and `service`. An unset area follows `log_level`; `off` keeps it out of the file. Easiest to edit in the Control Center (section 9.1.4). |
 

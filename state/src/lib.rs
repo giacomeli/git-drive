@@ -1,7 +1,7 @@
 //! The git-drive daemon's observable state, shared by the daemon and its
 //! apps: `status.json` and its types, where git-drive keeps its files, and
 //! disk figures. No FUSE and no Git here, so an app that only reads the
-//! state (git-drive Files) links neither macFUSE nor libgit2 and opens on a
+//! state (UnniFiles, the file manager) links neither macFUSE nor libgit2 and opens on a
 //! Mac without them. The `git-drive` library re-exports these modules under
 //! their old paths (`git_drive::status`, `git_drive::paths`, `git_drive::storage`).
 

@@ -418,7 +418,7 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     sync.enable_journal(&journal_dir)?;
     sync.recover_at_boot();
     // The repository's size against what its host accepts (Control Center,
-    // git-drive Files); measured again after every commit and pull.
+    // UnniFiles); measured again after every commit and pull.
     sync.publish_repo_size(Some("origin"), config.repo_quota_gb);
 
     // P2P notification channel (opt-in): devices tell each other about their
