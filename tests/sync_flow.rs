@@ -1270,6 +1270,40 @@ async fn encrypted_rename_and_delete_translate_paths() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn an_incremental_encrypted_drain_leaves_nothing_uncommitted() {
+    // After the first drain, the commit stages only what the drain's status
+    // scan found: anything it missed would stay dirty and stop every pull.
+    let test = init_repo();
+    let sync = mgr(
+        test.dir.path().to_str().unwrap(),
+        "main",
+        Some(("Alice", "a@x.com")),
+    );
+    let crypto = test_crypto();
+    sync.set_crypto(Some(crypto.clone()));
+    sync.queue_write("base.txt", b"b".to_vec());
+    sync.queue_write("velho.txt", b"v".to_vec());
+    wait_flush().await;
+
+    let long = "Nova Pasta/um nome de arquivo bem comprido.txt";
+    sync.queue_mkdir("Nova Pasta");
+    sync.queue_write(long, b"conteudo".to_vec());
+    sync.queue_rename("velho.txt", "Nova Pasta/movido.txt");
+    sync.queue_delete("base.txt");
+    sync.queue_symlink("atalho", "Nova Pasta/movido.txt");
+    wait_flush().await;
+
+    let repo = Repository::open(test.dir.path()).unwrap();
+    assert!(git_drive::git::is_working_tree_clean(&repo).unwrap(), "all of it committed");
+    let tree = repo.head().unwrap().peel_to_tree().unwrap();
+    for clear in [long, "Nova Pasta/movido.txt", "atalho"] {
+        let rel = crypto.enc_path(clear);
+        assert!(tree.get_path(std::path::Path::new(&rel)).is_ok(), "{} in HEAD", clear);
+    }
+    assert!(tree.get_path(std::path::Path::new(&crypto.enc_path("base.txt"))).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn encrypted_chunking_seals_chunks_and_manifest() {
     let test = init_repo();
     let sync = mgr(

@@ -971,6 +971,9 @@ impl DrainCtx {
                     crypto.as_deref().or(migration_crypto.as_deref()),
                 );
             }
+            // An ordinary save leaves the sweeps nothing to do: the commit
+            // stages exactly what the scope's status scan found.
+            let staged = scope.staged_paths(converted > 0 || gc_needed || orphaned);
             let commit_oid = match commit_batch(
                 &self.repo_path,
                 &self.branch,
@@ -978,6 +981,7 @@ impl DrainCtx {
                 &self.user_email,
                 &ops,
                 crypto.is_some(),
+                staged,
             ) {
                 Ok(oid) => oid,
                 Err(reason) => {
@@ -1552,7 +1556,8 @@ fn apply_op_to_disk(
 }
 
 /// Returns the oid of the created commit, or `None` (no identity, clean tree
-/// or error — the reason goes to the log).
+/// or error — the reason goes to the log). `staged`: the only paths that
+/// changed, when known (see `SweepScope::staged_paths`); `None` stages all.
 fn commit_batch(
     repo_path: &Path,
     branch: &str,
@@ -1560,6 +1565,7 @@ fn commit_batch(
     user_email: &Option<String>,
     ops: &[&SyncOp],
     redact_paths: bool,
+    staged: Option<&[String]>,
 ) -> Result<Option<git2::Oid>, String> {
     let (Some(name), Some(email)) = (user_name.as_deref(), user_email.as_deref()) else {
         log::warn!(
@@ -1575,7 +1581,11 @@ fn commit_batch(
         }
     };
     let message = build_commit_message(ops, redact_paths);
-    match git::commit_working_tree(&repo, branch, name, email, &message) {
+    let committed = match staged {
+        Some(paths) => git::commit_working_tree_paths(&repo, branch, name, email, &message, paths),
+        None => git::commit_working_tree(&repo, branch, name, email, &message),
+    };
+    match committed {
         Ok(Some(oid)) => {
             log::info!("commit: created {}", oid);
             Ok(Some(oid))
@@ -2354,10 +2364,26 @@ enum SweepScope {
         /// HEAD recorded by the marker — its tree holds the previous version
         /// of the paths changed since (for the GC trigger).
         since: git2::Oid,
+        /// Of `paths`, the ones the status scan found changed in the working
+        /// tree (staged, unstaged or untracked) — what the commit must stage.
+        /// `None` when one of them is not UTF-8.
+        dirty: Option<Vec<String>>,
     },
 }
 
 impl SweepScope {
+    /// The paths the drain's commit must stage, when the status scan that
+    /// built this scope still describes the tree: every change it found, as
+    /// long as no sweep changed the tree after it. `None`: stage everything
+    /// (`add_all`, a full diff of the working tree — 10.7 s of each save on
+    /// the 219k-entry drive, 2026-10-18).
+    fn staged_paths(&self, sweeps_changed_tree: bool) -> Option<&[String]> {
+        match self {
+            SweepScope::Paths { dirty, .. } if !sweeps_changed_tree => dirty.as_deref(),
+            _ => None,
+        }
+    }
+
     /// The `(full, rel)` pairs to visit — same shape as `walk_worktree_files`.
     fn files(&self, repo_path: &Path) -> Vec<(PathBuf, String)> {
         match self {
@@ -2379,7 +2405,7 @@ impl SweepScope {
     /// (in HEAD or at the marker's HEAD) — a large file deleted or rewritten.
     /// Keeps the O(worktree) GC off the path of ordinary saves.
     fn may_orphan_chunks(&self, repo_path: &Path, key: Option<&crate::crypt::Crypto>) -> bool {
-        let SweepScope::Paths { paths, since } = self else {
+        let SweepScope::Paths { paths, since, .. } = self else {
             return true;
         };
         let Ok(repo) = git::open_repo(repo_path.to_str().unwrap_or("")) else {
@@ -2494,14 +2520,23 @@ fn sweep_scope(repo_path: &Path, fingerprint: &str) -> SweepScope {
         .recurse_untracked_dirs(true)
         .include_ignored(false);
     let Ok(statuses) = repo.statuses(Some(&mut opts)) else { return SweepScope::Full };
+    let mut dirty = Some(Vec::new());
     for entry in statuses.iter() {
-        if let Some(p) = entry.path() {
-            paths.insert(p.to_string());
+        match entry.path() {
+            Some(p) => {
+                paths.insert(p.to_string());
+                if let Some(d) = dirty.as_mut() {
+                    d.push(p.to_string());
+                }
+            }
+            // Not UTF-8: it cannot be staged by name.
+            None => dirty = None,
         }
     }
     SweepScope::Paths {
         paths: paths.into_iter().collect(),
         since,
+        dirty,
     }
 }
 
@@ -3167,6 +3202,26 @@ mod tests {
     }
 
     #[test]
+    fn a_drain_whose_sweeps_changed_nothing_stages_only_what_its_scan_found() {
+        let (dir, repo) =
+            repo_with_commit(&[("a.txt", b"a"), ("d/b.txt", b"b"), ("gone.txt", b"g")]);
+        let root = dir.path();
+        write_sweep_marker(root, "fp1");
+        // A pull after the marker: in the sweep scope, but already committed.
+        std::fs::write(root.join("d/b.txt"), b"pulled").unwrap();
+        commit_all(&repo);
+        std::fs::write(root.join("a.txt"), b"changed").unwrap();
+        std::fs::write(root.join("d/new.txt"), b"n").unwrap();
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+
+        let scope = sweep_scope(root, "fp1");
+        let staged: Vec<String> = ["a.txt", "d/new.txt", "gone.txt"].map(String::from).to_vec();
+        assert_eq!(scope.staged_paths(false), Some(staged.as_slice()));
+        assert_eq!(scope.staged_paths(true), None, "a sweep changed the tree after the scan");
+        assert_eq!(SweepScope::Full.staged_paths(false), None, "no scan on a full pass");
+    }
+
+    #[test]
     fn incremental_migration_only_touches_scoped_files() {
         let c = crate::crypt::Crypto::from_master_key(&[9u8; 32]);
         let (dir, _repo) = repo_with_commit(&[("old.txt", b"left alone")]);
@@ -3175,6 +3230,7 @@ mod tests {
         let scope = SweepScope::Paths {
             paths: vec!["new.txt".to_string()],
             since: git2::Oid::zero(),
+            dirty: None,
         };
         assert_eq!(migrate_worktree_to_encrypted(root, &c, &scope).items, 1);
         assert!(root.join("old.txt").exists(), "outside the scope: not visited");
@@ -3194,6 +3250,7 @@ mod tests {
         let scope = SweepScope::Paths {
             paths: vec!["new.txt".to_string(), "old.txt".to_string()],
             since: git2::Oid::zero(),
+            dirty: None,
         };
         let sealed = migrate_worktree_to_encrypted(root, &c, &scope);
         assert_eq!(sealed, Sealed { items: 2, from_history: 1, orphaned_chunks: false });
@@ -3212,7 +3269,7 @@ mod tests {
         let clear = crate::chunk::chunk_reader_into_repo_with(&mut &[7u8; 100][..], 32, root, None).unwrap();
         std::fs::write(root.join("big.bin"), clear.serialize()).unwrap();
 
-        let only = |p: &str| SweepScope::Paths { paths: vec![p.to_string()], since: git2::Oid::zero() };
+        let only = |p: &str| SweepScope::Paths { paths: vec![p.to_string()], since: git2::Oid::zero(), dirty: None };
         let sealed = migrate_worktree_to_encrypted(root, &c, &only("fresh.bin"));
         assert_eq!((sealed.items, sealed.orphaned_chunks), (1, false), "sealed chunks stay in use");
         let sealed = migrate_worktree_to_encrypted(root, &c, &only("big.bin"));

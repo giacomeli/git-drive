@@ -106,6 +106,34 @@ pub fn commit_working_tree(
     user_email: &str,
     message: &str,
 ) -> Result<Option<git2::Oid>, Error> {
+    commit_staged(repo, branch, user_name, user_email, message, None)
+}
+
+/// `commit_working_tree` staging only `paths` (relative to the working tree;
+/// a missing one is staged as a delete), for a caller that already knows every
+/// path that changed — the drain's status scan. `add_all` diffs the whole
+/// working tree whatever its pathspec says: 10.7 s on the 219k-entry drive,
+/// against 1.2 s for the same one-file commit staged by path (2026-10-18).
+/// A directory or nested `.git` in the list stages everything instead.
+pub fn commit_working_tree_paths(
+    repo: &Repository,
+    branch: &str,
+    user_name: &str,
+    user_email: &str,
+    message: &str,
+    paths: &[String],
+) -> Result<Option<git2::Oid>, Error> {
+    commit_staged(repo, branch, user_name, user_email, message, Some(paths))
+}
+
+fn commit_staged(
+    repo: &Repository,
+    branch: &str,
+    user_name: &str,
+    user_email: &str,
+    message: &str,
+    paths: Option<&[String]>,
+) -> Result<Option<git2::Oid>, Error> {
     // An update a crash or I/O error cut short is finished or undone first,
     // so the guard below only sees states no git-drive update explains.
     recover_interrupted_update(repo)?;
@@ -137,23 +165,39 @@ pub fn commit_working_tree(
     // The whole commit failed in a loop, leaving the files untracked.
     // With the filter, the contents of `athena-docs/` (Dockerfile, _media/, etc.)
     // are committed normally; only the inner `.git/` subdir is left out.
+    let is_git_path = |s: &str| {
+        s == ".git" || s.starts_with(".git/") || s.contains("/.git/") || s.ends_with("/.git")
+    };
     let mut filter = |path: &std::path::Path, _matched: &[u8]| -> i32 {
-        let s = path.to_string_lossy();
-        if s == ".git"
-            || s.starts_with(".git/")
-            || s.contains("/.git/")
-            || s.ends_with("/.git")
-        {
+        if is_git_path(&path.to_string_lossy()) {
             1 // skip
         } else {
             0 // include
         }
     };
-    index.add_all(
-        ["*"].iter(),
-        git2::IndexAddOption::DEFAULT,
-        Some(&mut filter),
-    )?;
+    let workdir = repo.workdir().map(Path::to_path_buf);
+    let by_path = match (paths, &workdir) {
+        (Some(paths), Some(wd)) => paths.iter().all(|p| {
+            !is_git_path(p) && !std::fs::symlink_metadata(wd.join(p)).is_ok_and(|m| m.is_dir())
+        }),
+        _ => false,
+    };
+    match (paths, &workdir) {
+        (Some(paths), Some(wd)) if by_path => {
+            for p in paths {
+                if std::fs::symlink_metadata(wd.join(p)).is_ok() {
+                    index.add_path(Path::new(p))?;
+                } else {
+                    index.remove_path(Path::new(p))?;
+                }
+            }
+        }
+        _ => index.add_all(
+            ["*"].iter(),
+            git2::IndexAddOption::DEFAULT,
+            Some(&mut filter),
+        )?,
+    }
     let tree_id = index.write_tree()?;
     let tree = repo.find_tree(tree_id)?;
 
@@ -785,12 +829,16 @@ fn fast_forward(repo: &Repository, target: git2::Oid) -> Result<(), Error> {
     let tree = commit.tree()?;
     ensure_materializable(repo, &tree)?;
     begin_update(repo, UpdateKind::Checkout, target)?;
-    let advanced = repo
-        .checkout_tree(
+    let checkout = match repo.head().and_then(|h| h.peel_to_tree()) {
+        Ok(head_tree) => checkout_tree_changes(repo, &head_tree, &tree),
+        // Unborn HEAD: there is no tree to diff against.
+        Err(_) => repo.checkout_tree(
             commit.as_object(),
             Some(git2::build::CheckoutBuilder::new().force()),
-        )
-        .and_then(|()| move_head_branch(repo, target, "git-drive: fast-forward"));
+        ),
+    };
+    let advanced =
+        checkout.and_then(|()| move_head_branch(repo, target, "git-drive: fast-forward"));
     if let Err(e) = advanced {
         if rollback_to_head(repo, &tree) {
             end_update(repo);
@@ -799,6 +847,54 @@ fn fast_forward(repo: &Repository, target: git2::Oid) -> Result<(), Error> {
     }
     end_update(repo);
     Ok(())
+}
+
+/// Checks `to` out over a working tree that holds `from`, touching only the
+/// paths that differ between the two trees. A full forced checkout compares
+/// every file of the working tree: 9.9 s for a one-file fast-forward on the
+/// 219k-entry drive, against 0.15 s limited to the diff (2026-10-18). Callers
+/// only use it over a tree that holds `from`: the pull guard proved it clean,
+/// or the merge has just written it.
+fn checkout_tree_changes(
+    repo: &Repository,
+    from: &git2::Tree,
+    to: &git2::Tree,
+) -> Result<(), Error> {
+    let diff = repo.diff_tree_to_tree(Some(from), Some(to), None)?;
+    let mut paths = std::collections::BTreeSet::new();
+    for delta in diff.deltas() {
+        for file in [delta.old_file(), delta.new_file()] {
+            if let Some(p) = file.path() {
+                paths.insert(p.to_path_buf());
+            }
+        }
+    }
+    // libgit2 reads an empty path list as "every path".
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut builder = git2::build::CheckoutBuilder::new();
+    builder.force();
+    // git2 0.18 cannot mark the paths literal, and libgit2 then matches them
+    // as pathspecs: a name like `\back.txt` was never checked out while HEAD
+    // moved on. Such a name (cleartext drives only — encrypted names are
+    // base32) takes the full checkout.
+    if paths.iter().all(|p| is_literal_pathspec(&p.to_string_lossy())) {
+        for p in &paths {
+            builder.path(p.as_path());
+        }
+    }
+    repo.checkout_tree(to.as_object(), Some(&mut builder))
+}
+
+/// Whether libgit2 matches `path` as itself when given as a pathspec: no
+/// escape or glob character, no leading `!` (negation), `#` or `:`, and no
+/// surrounding whitespace.
+fn is_literal_pathspec(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains(['\\', '*', '?', '[', ']'])
+        && !path.starts_with(['!', '#', ':'])
+        && path.trim() == path
 }
 
 /// `.git/git-drive-update`: the commit an update is moving HEAD to. Every
@@ -1199,12 +1295,10 @@ fn merge_into_head(
         &[&head_commit, &their_commit],
     )?;
 
-    // Working tree first, ref last (see `fast_forward`).
+    // Working tree first, ref last (see `fast_forward`). The merge wrote the
+    // merged tree over HEAD's: only the paths where the two differ remain.
     begin_update(repo, UpdateKind::Checkout, merge_oid)?;
-    repo.checkout_tree(
-        tree.as_object(),
-        Some(git2::build::CheckoutBuilder::new().force()),
-    )?;
+    checkout_tree_changes(repo, &head_commit.tree()?, &tree)?;
     move_head_branch(repo, merge_oid, &message)?;
     repo.cleanup_state()?;
 
@@ -2012,6 +2106,90 @@ mod tests {
             pull_and_merge(&repo_a, &branch, "origin", "A", "a@x.com", "conflict-test").unwrap();
         assert!(matches!(outcome, MergeOutcome::FastForwarded));
         assert!(repo_a.workdir().unwrap().join("from_b.txt").exists());
+    }
+
+    #[test]
+    fn fast_forward_checks_out_only_the_paths_that_changed() {
+        let (_local_a, repo_a, bare) = setup_local_with_bare_remote();
+        let branch = current_branch_name(&repo_a).unwrap();
+        commit_file(&repo_a, "keep.txt", b"k");
+        commit_file(&repo_a, "edit.txt", b"v1");
+        commit_file(&repo_a, "gone/inner.txt", b"x");
+        push_to_remote(&repo_a, &branch, "origin", None).unwrap();
+        let (_dir_b, repo_b) = clone_of(&bare, "Bob");
+        commit_file(&repo_b, "edit.txt", b"v2");
+        delete_and_commit(&repo_b, "gone/inner.txt");
+        commit_file(&repo_b, "new/dir/added.txt", b"n");
+        push_to_remote(&repo_b, &branch, "origin", None).unwrap();
+
+        // A file the remote did not touch, changed behind the index's back:
+        // a checkout limited to the diff never looks at it (the pull guard
+        // keeps such changes from existing in the first place).
+        let wd = repo_a.workdir().unwrap().to_path_buf();
+        std::fs::write(wd.join("keep.txt"), b"untouched").unwrap();
+        fetch_remote(&repo_a, &branch, "origin", None).unwrap();
+        assert!(merge_ff_only(&repo_a, &branch).unwrap());
+
+        assert_eq!(std::fs::read(wd.join("edit.txt")).unwrap(), b"v2");
+        assert!(!wd.join("gone/inner.txt").exists(), "a remote delete reaches the tree");
+        assert_eq!(std::fs::read(wd.join("new/dir/added.txt")).unwrap(), b"n");
+        assert_eq!(std::fs::read(wd.join("keep.txt")).unwrap(), b"untouched", "outside the diff");
+        let statuses = repo_a.statuses(None).unwrap();
+        let dirty: Vec<String> = statuses.iter().filter_map(|e| e.path().map(String::from)).collect();
+        assert_eq!(dirty, vec!["keep.txt".to_string()], "index follows the new HEAD everywhere else");
+    }
+
+    #[test]
+    fn fast_forward_updates_names_that_read_as_pathspec_patterns() {
+        // Cleartext drives keep the user's names: a leading `!` negates a
+        // pathspec, `*`/`?`/`[` make it a glob.
+        // Each name alone, as the only path of the fast-forward.
+        for name in ["!bang.txt", "a[1].txt", "star*.txt", "q?.txt", "\\back.txt"] {
+            let (_local_a, repo_a, bare) = setup_local_with_bare_remote();
+            let branch = current_branch_name(&repo_a).unwrap();
+            commit_file(&repo_a, name, b"old");
+            commit_file(&repo_a, "bang.txt", b"old");
+            push_to_remote(&repo_a, &branch, "origin", None).unwrap();
+            let (_dir_b, repo_b) = clone_of(&bare, "Bob");
+            commit_file(&repo_b, name, b"new");
+            push_to_remote(&repo_b, &branch, "origin", None).unwrap();
+
+            fetch_remote(&repo_a, &branch, "origin", None).unwrap();
+            assert!(merge_ff_only(&repo_a, &branch).unwrap());
+            let wd = repo_a.workdir().unwrap();
+            assert_eq!(std::fs::read(wd.join(name)).unwrap(), b"new", "{}", name);
+            assert!(is_working_tree_clean(&repo_a).unwrap(), "{}", name);
+        }
+    }
+
+    #[test]
+    fn commit_working_tree_paths_stages_only_the_given_paths() {
+        let (_dir, repo) = init_repo_with_commit();
+        let branch = current_branch_name(&repo).unwrap();
+        commit_file(&repo, "a.txt", b"a1");
+        commit_file(&repo, "b.txt", b"b1");
+        commit_file(&repo, "sub/d.txt", b"d1");
+        let wd = repo.workdir().unwrap().to_path_buf();
+        std::fs::write(wd.join("a.txt"), b"a2").unwrap();
+        std::fs::write(wd.join("new.txt"), b"n").unwrap();
+        std::fs::remove_file(wd.join("sub/d.txt")).unwrap();
+        std::fs::write(wd.join("b.txt"), b"b2").unwrap(); // not in the list
+
+        let paths = ["a.txt", "new.txt", "sub/d.txt"].map(String::from);
+        let oid = commit_working_tree_paths(&repo, &branch, "T", "t@x.com", "msg", &paths)
+            .unwrap()
+            .expect("a commit");
+
+        let tree = repo.find_commit(oid).unwrap().tree().unwrap();
+        let content = |p: &str| {
+            let id = tree.get_path(Path::new(p)).unwrap().id();
+            repo.find_blob(id).unwrap().content().to_vec()
+        };
+        assert_eq!(content("a.txt"), b"a2");
+        assert_eq!(content("new.txt"), b"n");
+        assert!(tree.get_path(Path::new("sub/d.txt")).is_err(), "the delete is committed");
+        assert_eq!(content("b.txt"), b"b1", "a path outside the list stays as it was");
+        assert_eq!(repo.head().unwrap().target().unwrap(), oid);
     }
 
     #[test]
