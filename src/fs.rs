@@ -531,6 +531,8 @@ impl GitDriveFS {
             t_local - t_index,
             t0.elapsed() - t_local
         );
+        // The listing, the decryption buffers and the mtime revwalk are gone.
+        crate::release_freed_memory();
         Ok(fs)
     }
 
@@ -1627,6 +1629,8 @@ impl GitDriveFS {
             t0.elapsed(),
             self.files_by_inode.len()
         );
+        // The previous index and the tree listing are gone.
+        crate::release_freed_memory();
     }
 
     pub fn apply_mkdir(&mut self, parent: u64, name: &str) -> Result<(u64, FileAttr), i32> {

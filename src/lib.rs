@@ -103,6 +103,22 @@ pub fn init_logging(
     Ok((handle, current))
 }
 
+/// Hands the memory freed since the last call back to the OS. glibc keeps
+/// what a thread frees in that thread's arena for reuse, and every libgit2
+/// pass over the drive's index (status, `add_all`, checkout: 250-480 MB each
+/// on a 219k-entry index) left its peak resident in the arena of whichever
+/// tokio worker ran it: 4.3 GB on a 28-core Linux machine, 64 MB of it live
+/// (2026-10-18). Called at the end of each heavy cycle (drain, pull, index
+/// rebuild). macOS's allocator returns freed pages on its own: a no-op there.
+pub fn release_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim only walks the allocator's own free lists, under
+    // each arena's lock.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// Newest `git-drive*.log` in `dir` by modification time. At startup this is
 /// the file flexi_logger just created (the active one), whatever its exact
 /// name.
@@ -161,6 +177,47 @@ mod tests {
             }
             assert!(flexi_logger::LogSpecification::parse(&spec).is_ok(), "{}", spec);
         }
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn release_freed_memory_returns_what_a_thread_arena_kept() {
+        fn rss_anon_kb() -> u64 {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find_map(|l| l.strip_prefix("RssAnon:"))
+                .and_then(|v| v.split_whitespace().next()?.parse().ok())
+                .unwrap()
+        }
+        // 64 MiB of 16 KiB blocks (below the mmap threshold, so they live in
+        // the thread's arena), each followed by a small block that stays
+        // alive, as a status interleaves index entries with longer-lived
+        // allocations: once the big ones are freed the arena is all holes
+        // between live blocks, which glibc cannot trim from the top and keeps
+        // resident.
+        let pins = std::thread::spawn(|| {
+            let mut blocks = Vec::new();
+            let mut pins = Vec::new();
+            for i in 0..4096 {
+                blocks.push(std::hint::black_box(vec![i as u8; 16 * 1024]));
+                pins.push(std::hint::black_box(vec![i as u8; 32]));
+            }
+            drop(blocks);
+            pins
+        })
+        .join()
+        .unwrap();
+        let before = rss_anon_kb();
+        release_freed_memory();
+        let after = rss_anon_kb();
+        drop(pins);
+        assert!(
+            before.saturating_sub(after) > 32 * 1024,
+            "freed memory still resident: {} kB before, {} kB after",
+            before,
+            after
+        );
     }
 
     #[test]

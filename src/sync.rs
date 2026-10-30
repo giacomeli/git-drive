@@ -495,6 +495,9 @@ impl SyncManager {
             // 2026-10-14). Only a cycle that ran to the end clears it.
             let mut retry_soon = false;
             loop {
+                // Whatever path the previous cycle left by, its status scan
+                // and checkout are freed by now: return that memory.
+                crate::release_freed_memory();
                 let delay = if first {
                     interval_secs.min(3)
                 } else if retry_soon {
@@ -1101,6 +1104,9 @@ impl DrainCtx {
             pushed,
             pending,
         );
+        // The status scan and add_all freed hundreds of MB this thread's
+        // arena would otherwise keep.
+        crate::release_freed_memory();
     }
 }
 
