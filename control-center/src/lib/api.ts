@@ -31,6 +31,13 @@ export interface PullInfo {
   outcome: string;
 }
 
+export interface SyncingInfo {
+  since: number;
+  ops: number;
+  /** "committing", then "publishing". */
+  stage: string;
+}
+
 export interface SyncStatus {
   pid: number;
   repo: string;
@@ -43,12 +50,29 @@ export interface SyncStatus {
   /** null while the session boots; absent in status files of older daemons. */
   mounted_at?: number | null;
   pending_ops: number;
+  /** A drain at work (its changes left the queue); absent in status files of older daemons. */
+  syncing?: SyncingInfo | null;
   unpushed: number;
   last_drain: DrainInfo | null;
   last_pull: PullInfo | null;
   conflicts: string[];
   commit_blocked: string | null;
   p2p: P2pInfo | null;
+  /** The repository against what its host accepts; absent in status files of older daemons. */
+  repo_usage?: RepoUsage | null;
+}
+
+/** The repository's object store against its host's limits (the daemon measures it at boot and after each commit and pull). */
+export interface RepoUsage {
+  used: number;
+  measured_at: number;
+  /** "GitHub", "GitLab.com", or the remote's host name. */
+  host: string;
+  /** The host's recommended maximum, or `repo_quota_gb`; null when unknown. */
+  limit: number | null;
+  /** A lower size the host strongly recommends staying under. */
+  recommended: number | null;
+  from_config: boolean;
 }
 
 export interface Volume {
@@ -101,6 +125,8 @@ export interface Config {
   p2p_key_file?: string | null;
   p2p_device_name?: string | null;
   p2p_relay_url?: string | null;
+  /** How much the repository may hold, in GB; null = the host's limit. */
+  repo_quota_gb?: number | null;
 }
 
 export interface ConfigView {

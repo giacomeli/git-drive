@@ -94,6 +94,17 @@ pub fn next_pull_delay(pull_interval_secs: u64, idle_secs: Option<u64>, online: 
     }
 }
 
+/// Measures the repository again (its object store) once the boot set what
+/// its host accepts: after a drain committed, or a pull moved HEAD.
+fn remeasure_repo(status: &StatusState, repo_path: &Path) {
+    if !status.measures_repo() {
+        return;
+    }
+    if let Ok(repo) = git::open_repo(repo_path.to_str().unwrap_or("")) {
+        status.record_repo_size(crate::storage::objects_size(repo.path()), None);
+    }
+}
+
 /// Announces HEAD to the channel after a successful push (no-op without it).
 fn announce_head(p2p: &Mutex<Option<P2pHooks>>, repo_path: &Path) {
     let Some(hooks) = p2p.lock().clone() else { return };
@@ -426,6 +437,21 @@ impl SyncManager {
     }
 
     /// Access to the observable state (snapshot for tests/embedded CLI).
+    /// At boot: what the host of `remote` accepts (or the user's quota) and
+    /// the repository's size now; drains that commit and pulls that move
+    /// HEAD measure it again (`remeasure_repo`).
+    pub fn publish_repo_size(&self, remote: Option<&str>, quota_gb: Option<u64>) {
+        let Ok(repo) = git::open_repo(self.repo_path.to_str().unwrap_or("")) else {
+            return;
+        };
+        let url = remote
+            .and_then(|name| repo.find_remote(name).ok())
+            .and_then(|r| r.url().map(str::to_string));
+        let host = url.as_deref().and_then(crate::storage::remote_host);
+        let capacity = crate::storage::repo_capacity(host.as_deref(), quota_gb);
+        self.status.record_repo_size(crate::storage::objects_size(repo.path()), Some(capacity));
+    }
+
     pub fn status_state(&self) -> Arc<StatusState> {
         self.status.clone()
     }
@@ -581,12 +607,14 @@ impl SyncManager {
                         status.record_pull("fast-forward");
                         refresh_flag.store(true, Ordering::SeqCst);
                         head_changed(&p2p);
+                        remeasure_repo(&status, &repo_path);
                     }
                     Ok(git::MergeOutcome::Merged) => {
                         log::info!("pull: 3-way merge, no conflicts");
                         status.record_pull("3-way merge");
                         refresh_flag.store(true, Ordering::SeqCst);
                         head_changed(&p2p);
+                        remeasure_repo(&status, &repo_path);
                     }
                     Ok(git::MergeOutcome::Conflicted { resolved, suffix }) => {
                         log::warn!(
@@ -603,6 +631,7 @@ impl SyncManager {
                         notifier.notify(NotifyEvent::Conflicts { copies });
                         refresh_flag.store(true, Ordering::SeqCst);
                         head_changed(&p2p);
+                        remeasure_repo(&status, &repo_path);
                     }
                     Err(e) => {
                         log::error!("pull: merge error: {}", e);
@@ -791,11 +820,30 @@ fn take_queue(inner: &Mutex<Inner>) -> (Vec<SyncOp>, Option<u64>) {
     (changes, boundary)
 }
 
+/// Shows a drain in the status from its start and clears it however the
+/// drain ends: a blocked commit, an early return, a panic.
+struct Syncing<'a>(&'a StatusState);
+
+impl<'a> Syncing<'a> {
+    fn start(status: &'a StatusState, ops: usize) -> Self {
+        status.start_syncing(ops);
+        Syncing(status)
+    }
+}
+
+impl Drop for Syncing<'_> {
+    fn drop(&mut self) {
+        self.0.end_syncing();
+    }
+}
+
 impl DrainCtx {
     fn run(&self, changes: Vec<SyncOp>, journal_boundary: Option<u64>) {
         // Serialize the whole cycle (apply + commit + push + reconcile) with
         // the pull watcher (RF4 of Phase 0). No .await in the guard's scope.
         let _repo_guard = self.repo_lock.lock();
+        // The queue no longer counts these changes: the status shows the drain instead.
+        let _syncing = Syncing::start(&self.status, changes.len());
         let crypto = self.crypto.lock().clone();
         let migration_crypto = self.migration_crypto.lock().clone();
         let chunk_threshold = self.chunk_threshold_bytes.load(Ordering::SeqCst);
@@ -989,6 +1037,7 @@ impl DrainCtx {
         let mut pushed: Option<bool> = None;
         if last_commit.is_some() {
             if let Some(ref remote) = self.remote_name {
+                self.status.set_sync_stage("publishing");
                 let ok = publish_progressive(
                     &self.repo_path,
                     &self.branch,
@@ -1026,6 +1075,9 @@ impl DrainCtx {
             }
         }
         let pending = self.inner.lock().buffer.len();
+        if last_commit.is_some() {
+            remeasure_repo(&self.status, &self.repo_path);
+        }
         self.status.record_drain(
             total_ops,
             last_commit.map(|o| o.to_string()),

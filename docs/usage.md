@@ -227,6 +227,7 @@ by `install`.
 | `p2p_key_file` | Device key of the channel. Default: `peer.key` next to the `config.json` in use, created on first start (0600). |
 | `p2p_device_name` | Name of this device in the registry. Default: the short hostname. |
 | `p2p_relay_url` | Your own relay server. Default: the public relays of n0 (they only see device ids and IP addresses, never content). |
+| `repo_quota_gb` | How much the repository may hold, in GB, shown against its size in the Control Center and in git-drive Files. Default: the host's (GitHub: 10 GB, the maximum it recommends, with a mark at the 5 GB it strongly recommends staying under; GitLab.com: 10 GB; no limit elsewhere). GitHub enforces no total: it refuses only a push over 2 GB or a file over 100 MB. |
 | `log_level` | Base level of the log file (`off`, `error`, `warn`, `info`, `debug`, `trace`). Default `info`. |
 | `log_categories` | Level per area: `sync`, `git`, `fuse`, `crypto`, `p2p`, `network` (the P2P network stack, `warn` unless set) and `service`. An unset area follows `log_level`; `off` keeps it out of the file. Easiest to edit in the Control Center (section 9.1.4). |
 
@@ -517,7 +518,7 @@ git-drive — branch main
   conflicts this session: none
 ```
 
-The daemon writes `status.json` (atomic write) on every boot, drain, pull, and stop event. If `updated_at` is old and the pid does not respond, the subcommand flags "POSSIBLY STOPPED". A recurring pull "skipped: dirty working tree" in identity-less mode indicates local writes that were never committed are blocking the pull (see the limitations).
+While a drain runs, a `syncing:` line above `pending ops` shows how many changes it took from the queue (they no longer count as pending), its stage (`committing`, then `publishing` during the push) and when it started — a large file can take a few minutes from the save to the remote. The daemon writes `status.json` (atomic write) on every boot, drain, pull, and stop event. If `updated_at` is old and the pid does not respond, the subcommand flags "POSSIBLY STOPPED". A recurring pull "skipped: dirty working tree" in identity-less mode indicates local writes that were never committed are blocking the pull (see the limitations).
 
 ### 9.1.2. Menu bar tray
 
@@ -565,7 +566,7 @@ git-drive control-center --page logs  # straight to the log
 
 | Page | What it shows and does |
 | --- | --- |
-| Overview | State headline, last commit, storage ring (repository, other data, free), devices of the P2P channel, commits per hour, uptime, last pull, changes waiting, conflicts. "Starting" while the daemon boots and the drive is not mounted yet. |
+| Overview | State headline, last commit, storage ring (repository, other data, free) and below it the repository against what its host accepts (its object store, measured by the daemon at boot and after every commit and pull; amber past the host's recommended size, coral past the limit; `repo_quota_gb` sets your own), devices of the P2P channel, commits per hour, uptime, last pull, changes waiting, conflicts. "Starting" while the daemon boots and the drive is not mounted yet. |
 | Logs | Live tail of the session log with filters by level, area and text, pause, and the Recording panel: base level and a level per area (`log_categories`). |
 | Settings | Theme: the accent color, picked like in macOS (Multicolor, Blue, Purple, Pink, Red, Orange, Yellow, Green, Graphite), applied at once and kept in `~/.config/git-drive/control-center.json`. Then every field of `config.json`, validated, saved atomically (permission 0600: it can hold the token). |
 | About | Version, login service, window effect, encryption and P2P state, and every file and folder git-drive uses, each with a Reveal button. |

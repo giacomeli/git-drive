@@ -1,0 +1,17 @@
+[package]
+name = "git-drive-state"
+version = "0.3.0"
+edition = "2021"
+description = "The git-drive daemon's observable state (status.json), where git-drive keeps its files, and disk figures: shared by the daemon and its apps, without FUSE or Git"
+license = "MIT"
+publish = false
+
+[dependencies]
+libc = "0.2"
+log = "0.4"
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3"

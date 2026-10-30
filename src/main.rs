@@ -417,6 +417,9 @@ fn run_mount(matches: &ArgMatches) -> anyhow::Result<()> {
     let journal_dir = git::open_repo(&repo_path)?.path().join("git-drive-journal");
     sync.enable_journal(&journal_dir)?;
     sync.recover_at_boot();
+    // The repository's size against what its host accepts (Control Center,
+    // git-drive Files); measured again after every commit and pull.
+    sync.publish_repo_size(Some("origin"), config.repo_quota_gb);
 
     // P2P notification channel (opt-in): devices tell each other about their
     // pushes and polling stretches while it is online. Any failure leaves the

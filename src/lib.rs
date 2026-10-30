@@ -8,14 +8,14 @@ pub mod journal;
 pub mod logview;
 pub mod launchd;
 pub mod notify;
-pub mod paths;
 pub mod peer;
 pub mod range_read;
 pub mod reserved;
 pub mod service;
-pub mod status;
-pub mod storage;
 pub mod sync;
+// The observable state lives in its own crate, which the apps link alone
+// (no FUSE, no Git); these keep its modules under their old paths.
+pub use git_drive_state::{paths, status, storage};
 pub mod systemd;
 pub mod tray;
 pub mod viewer;

@@ -10,13 +10,16 @@ categories = ["filesystem", "command-line-utilities"]
 
 # The Control Center and the file manager POC (Tauri GUIs) are workspace
 # members outside the default members: `cargo build`/`test`/`clippy` at the
-# root build only the daemon and never need Node or a webview. Build each with
+# root build only the daemon (and `state/`, its observable state, which the
+# apps share) and never need Node or a webview. Build each GUI with
 # `npm run tauri build` in `control-center/` or `file-manager/`.
 [workspace]
-members = [".", "control-center/src-tauri", "file-manager/src-tauri"]
-default-members = ["."]
+members = [".", "state", "control-center/src-tauri", "file-manager/src-tauri"]
+default-members = [".", "state"]
 
 [dependencies]
+# status.json, paths and disk figures; also linked by the apps, alone.
+git-drive-state = { path = "state" }
 fuser = { version = "0.14", features = ["abi-7-21"] }
 libc = "0.2"
 git2 = "0.18"

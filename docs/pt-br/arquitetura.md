@@ -90,8 +90,8 @@ sempre roda a cópia instalada em `~/.local/bin/git-drive`.
 | Sincronização | `src/sync.rs`, `src/journal.rs` | Fila causal de `SyncOp` (coalescing só de Write, barreiras no resto) com journal write-ahead, drain com tradução claro->cifrado, varredura de chunking, migrações de criptografia nos dois sentidos (inclusive reparo de conflicted copies cifradas duas vezes), GC de chunks órfãos, push com reconcile em várias rodadas, pull watcher que também publica commits pendentes, recuperação no boot. |
 | Chunking | `src/chunk.rs` | Manifest texto versionado, sharding `.chunks/<2 hex>/<sha256>`, fatiamento em streaming com transform opcional (selagem) e dedup por content-addressing. |
 | Criptografia | `src/crypt.rs` | XChaCha20-Poly1305 convergente (nonce derivado do plaintext), HKDF de subchaves, nomes por componente em base32 lowercase com fallback literal, arquivo de chave 0600. |
-| Observabilidade | `src/status.rs`, `src/notify.rs`, `src/tray.rs` | `status.json` atômico, notificações com rate limit (osascript no macOS, notify-send no Linux; processos filhos colhidos), tray com 4 estados, tempos de índice/refresh no log. |
-| Instalação / Paths | `src/service.rs`, `src/launchd.rs`, `src/systemd.rs`, `src/paths.rs` | Dispatch por plataforma, binário instalado em `~/.local/bin/git-drive`, LaunchAgents por template (macOS) e units de usuário do systemd (Linux), migração de config/chave dos locais legados, resolução XDG. |
+| Observabilidade | `state/src/status.rs`, `src/notify.rs`, `src/tray.rs` | `status.json` atômico, notificações com rate limit (osascript no macOS, notify-send no Linux; processos filhos colhidos), tray com 4 estados, tempos de índice/refresh no log. |
+| Instalação / Paths | `src/service.rs`, `src/launchd.rs`, `src/systemd.rs`, `state/src/paths.rs` | Dispatch por plataforma, binário instalado em `~/.local/bin/git-drive`, LaunchAgents por template (macOS) e units de usuário do systemd (Linux), migração de config/chave dos locais legados, resolução XDG. |
 | Configuração | `src/config.rs` | Loader com `#[serde(default)]` por campo (16 campos). Arquivo ausente = defaults; arquivo existente e inválido aborta o modo mount. |
 
 ---
@@ -264,7 +264,7 @@ pub struct Config {
 | `src/chunk.rs` | Manifest + fatiamento content-addressed |
 | `src/crypt.rs` | Criptografia em repouso |
 | `src/config.rs` | Loader de `config.json` |
-| `src/paths.rs` | Resolução XDG + plataforma + legados |
+| `state/src/paths.rs` | Resolução XDG + plataforma + legados |
 | `src/service.rs` | Dispatch do serviço de login e instalação do binário |
 | `src/launchd.rs` / `src/systemd.rs` | LaunchAgents (macOS) / units de usuário do systemd (Linux) |
 | `tests/common/mod.rs` | Helpers de repositório Git para testes |

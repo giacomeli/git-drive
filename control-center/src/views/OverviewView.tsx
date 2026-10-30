@@ -14,7 +14,7 @@ import {
   UploadCloud,
 } from "lucide-react";
 import type { ReactNode } from "react";
-import { api, errorText, type Overview, type PeerInfo } from "../lib/api";
+import { api, errorText, type Overview, type PeerInfo, type RepoUsage } from "../lib/api";
 import { ago, bytes, bytesText, duration, shortId, tildify } from "../lib/format";
 import { health } from "../lib/health";
 import { AreaChart, DiskRing, HeroWaves, MeterBar } from "../components/Charts";
@@ -150,7 +150,60 @@ function StorageCard({ overview }: { overview: Overview | null }) {
       ) : (
         <Empty>Start the daemon to read the repository volume.</Empty>
       )}
+      {v && overview?.status?.repo_usage && <RepoCapacity usage={overview.status.repo_usage} />}
     </Card>
+  );
+}
+
+/**
+ * The repository against what its host accepts: GitHub publishes no quota,
+ * so its recommended maximum (10 GB) is the bar's end and the size it
+ * strongly recommends staying under (5 GB) a mark on it; `repo_quota_gb`
+ * replaces the end. Amber past the mark or 80%, coral past the end.
+ */
+function RepoCapacity({ usage: u }: { usage: RepoUsage }) {
+  const where = u.host ? ` on ${u.host}` : "";
+  const over = u.limit != null && u.used >= u.limit;
+  const warn = !over && ((u.recommended != null && u.used >= u.recommended) || (u.limit != null && u.used > 0.8 * u.limit));
+  const [from, to] = over
+    ? ["var(--color-coral)", "var(--color-coral)"]
+    : warn
+      ? ["var(--color-amber)", "var(--color-amber)"]
+      : ["var(--a3)", "var(--a1)"];
+  const note =
+    u.limit == null
+      ? `${u.host || "This host"} publishes no size limit; set repo_quota_gb in the config to show one.`
+      : u.from_config
+        ? `Your quota (repo_quota_gb).${u.recommended != null ? ` ${u.host} strongly recommends staying under ${bytesText(u.recommended)} (the mark).` : ""}`
+        : over
+          ? u.host === "GitHub"
+            ? "Past GitHub's recommended maximum. Pushes still go through; GitHub refuses only a push over 2 GB or a file over 100 MB."
+            : `Past ${u.host}'s limit: pushes may be refused.`
+          : u.recommended != null
+            ? `${u.host} recommends at most ${bytesText(u.limit)} and strongly recommends staying under ${bytesText(u.recommended)} (the mark).`
+            : `${u.host} accepts up to ${bytesText(u.limit)} per repository.`;
+  return (
+    <div className="mt-5 border-t border-line pt-4">
+      <div className="flex items-baseline justify-between gap-3">
+        <p className="text-[0.8rem] font-semibold text-ink">Repository{where}</p>
+        <p className="whitespace-nowrap text-[0.74rem] tabular-nums text-muted">
+          {bytesText(u.used)}
+          {u.limit != null && ` of ${u.from_config ? "your " : ""}${bytesText(u.limit)}`}
+        </p>
+      </div>
+      {u.limit != null && (
+        <div className="relative mt-2">
+          <MeterBar fraction={u.used / u.limit} from={from} to={to} />
+          {u.recommended != null && u.recommended < u.limit && (
+            <span
+              className="absolute -top-0.5 h-2.5 w-0.5 rounded-full bg-white/70"
+              style={{ left: `calc(${(u.recommended / u.limit) * 100}% - 1px)` }}
+            />
+          )}
+        </div>
+      )}
+      <p className="mt-2 text-[0.68rem] leading-relaxed text-dim">{note}</p>
+    </div>
   );
 }
 

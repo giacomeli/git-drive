@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::storage::RepoCapacity;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SyncStatus {
     pub pid: u32,
@@ -29,6 +31,10 @@ pub struct SyncStatus {
     #[serde(default)]
     pub mounted_at: Option<u64>,
     pub pending_ops: usize,
+    /// A drain at work on the changes it took from the queue (so they no
+    /// longer count in `pending_ops`). `None` between drains.
+    #[serde(default)]
+    pub syncing: Option<SyncingInfo>,
     /// Local commits still awaiting publication to the remote (progressive
     /// push catch-up in flight or interrupted). 0 = remote at the local tip.
     #[serde(default)]
@@ -44,6 +50,30 @@ pub struct SyncStatus {
     /// P2P notification channel; `None` = off (or a build without it).
     #[serde(default)]
     pub p2p: Option<P2pInfo>,
+    /// The repository's size against what its host accepts. `None` until
+    /// the boot measured it.
+    #[serde(default)]
+    pub repo_usage: Option<RepoUsage>,
+}
+
+/// The repository's size (`storage::objects_size`), measured at boot and
+/// after every change of HEAD, against its host's limits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepoUsage {
+    pub used: u64,
+    pub measured_at: u64,
+    #[serde(flatten)]
+    pub capacity: RepoCapacity,
+}
+
+/// A drain in progress.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SyncingInfo {
+    pub since: u64,
+    pub ops: usize,
+    /// `committing` while the changes reach the working tree and become
+    /// commits, then `publishing` while they are pushed.
+    pub stage: String,
 }
 
 /// State of the P2P channel as published by the daemon.
@@ -184,6 +214,53 @@ impl StatusState {
         let snapshot = s.clone();
         drop(s);
         self.persist(&snapshot);
+    }
+
+    /// A drain took `ops` changes from the queue and starts on them.
+    pub fn start_syncing(&self, ops: usize) {
+        let now = now_unix();
+        self.update(|s| s.syncing = Some(SyncingInfo { since: now, ops, stage: "committing".into() }));
+    }
+
+    /// The drain moved on (`publishing` once its commits exist).
+    pub fn set_sync_stage(&self, stage: &str) {
+        self.update(|s| {
+            if let Some(sy) = s.syncing.as_mut() {
+                sy.stage = stage.to_string();
+            }
+        });
+    }
+
+    /// The drain ended, however it ended.
+    pub fn end_syncing(&self) {
+        self.update(|s| s.syncing = None);
+    }
+
+    fn update(&self, change: impl FnOnce(&mut SyncStatus)) {
+        let mut s = self.inner.lock();
+        s.updated_at = now_unix();
+        change(&mut s);
+        let snapshot = s.clone();
+        drop(s);
+        self.persist(&snapshot);
+    }
+
+    /// The repository measured `used` bytes. `capacity` comes once, at boot;
+    /// later measurements keep it (and before it, nothing is published).
+    pub fn record_repo_size(&self, used: u64, capacity: Option<RepoCapacity>) {
+        let mut s = self.inner.lock();
+        let Some(capacity) = capacity.or_else(|| s.repo_usage.as_ref().map(|u| u.capacity.clone())) else {
+            return;
+        };
+        s.repo_usage = Some(RepoUsage { used, measured_at: now_unix(), capacity });
+        let snapshot = s.clone();
+        drop(s);
+        self.persist(&snapshot);
+    }
+
+    /// Whether the boot set the capacity, so a measurement would be published.
+    pub fn measures_repo(&self) -> bool {
+        self.inner.lock().repo_usage.is_some()
     }
 
     /// Commits still awaiting publication (progressive push). Doubles as a
@@ -341,6 +418,14 @@ pub fn format_status(s: &SyncStatus, now: u64, alive: Option<bool>) -> String {
     ));
     if alive == Some(true) && now.saturating_sub(s.updated_at) > 600 {
         out.push_str("  warning: no update in over 10 min — check the logs\n");
+    }
+    if let Some(sy) = &s.syncing {
+        out.push_str(&format!(
+            "  syncing: {} op(s) — {}, started {}\n",
+            sy.ops,
+            sy.stage,
+            format_ago(now, sy.since)
+        ));
     }
     out.push_str(&format!("  pending ops: {}\n", s.pending_ops));
     if s.unpushed > 0 {
@@ -509,6 +594,66 @@ mod tests {
         json.as_object_mut().unwrap().remove("p2p");
         std::fs::write(&path, json.to_string()).unwrap();
         assert!(read_from(&path).unwrap().p2p.is_none());
+    }
+
+    #[test]
+    fn a_drain_in_progress_shows_as_syncing_until_it_ends() {
+        // The drain empties the queue as it starts: without this, a 3-minute
+        // commit and push of a large file read as "pending ops: 0" and an
+        // old "last drain" (2026-10-16).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let state = StatusState::new();
+        state.enable_file(path.clone());
+        state.start_syncing(2);
+        let s = read_from(&path).unwrap();
+        let since = s.syncing.as_ref().expect("syncing published").since;
+        let text = format_status(&s, since + 30, Some(true));
+        assert!(text.contains("syncing: 2 op(s) — committing, started 30 s ago"), "{}", text);
+        state.set_sync_stage("publishing");
+        assert_eq!(read_from(&path).unwrap().syncing.unwrap().stage, "publishing");
+        state.end_syncing();
+        let s = read_from(&path).unwrap();
+        assert!(s.syncing.is_none());
+        assert!(!format_status(&s, since + 60, Some(true)).contains("syncing"));
+    }
+
+    #[test]
+    fn status_without_the_syncing_field_still_loads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let mut json = serde_json::to_value(sample()).unwrap();
+        json.as_object_mut().unwrap().remove("syncing");
+        std::fs::write(&path, json.to_string()).unwrap();
+        assert!(read_from(&path).unwrap().syncing.is_none());
+    }
+
+    #[test]
+    fn the_repository_size_is_published_against_its_capacity() {
+        use crate::storage::{repo_capacity, GB};
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let state = StatusState::new();
+        state.enable_file(path.clone());
+        state.record_repo_size(GB, None);
+        assert!(read_from(&path).unwrap().repo_usage.is_none(), "nothing to compare with before the boot sets the capacity");
+        state.record_repo_size(5 * GB, Some(repo_capacity(Some("github.com"), None)));
+        let u = read_from(&path).unwrap().repo_usage.expect("published");
+        assert_eq!((u.used, u.capacity.limit, u.capacity.host.as_str()), (5 * GB, Some(10 * GB), "GitHub"));
+        assert!(u.measured_at > 0);
+        state.record_repo_size(6 * GB, None);
+        let u = read_from(&path).unwrap().repo_usage.unwrap();
+        assert_eq!((u.used, u.capacity.recommended), (6 * GB, Some(5 * GB)), "the capacity stays for the session");
+    }
+
+    #[test]
+    fn status_without_the_repository_usage_still_loads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let mut json = serde_json::to_value(sample()).unwrap();
+        json.as_object_mut().unwrap().remove("repo_usage");
+        std::fs::write(&path, json.to_string()).unwrap();
+        assert!(read_from(&path).unwrap().repo_usage.is_none());
     }
 
     #[test]

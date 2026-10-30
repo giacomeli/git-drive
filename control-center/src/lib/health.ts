@@ -28,6 +28,14 @@ export function health(o: Overview | null): Health {
   if (s.commit_blocked) {
     return { tone: "coral", title: "Commit blocked", detail: s.commit_blocked };
   }
+  // A drain at work: the queue it took is empty meanwhile, so it shows here.
+  if (s.syncing) {
+    const n = s.syncing.ops;
+    const changes = `${n} change${n === 1 ? "" : "s"}`;
+    return s.syncing.stage === "publishing"
+      ? { tone: "amber", title: "Publishing", detail: `${changes} committed, being pushed to the remote` }
+      : { tone: "cyan", title: "Syncing", detail: `${changes} being committed` };
+  }
   if (s.pending_ops > 0) {
     const n = s.pending_ops;
     return { tone: "cyan", title: "Syncing", detail: `${n} change${n === 1 ? "" : "s"} waiting to be committed` };

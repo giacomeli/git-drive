@@ -90,8 +90,8 @@ service always runs the copy installed at `~/.local/bin/git-drive`.
 | Synchronization | `src/sync.rs`, `src/journal.rs` | Causal queue of `SyncOp` (coalescing only for Write, barriers for everything else) backed by a write-ahead journal, drain with clear->encrypted translation, chunking sweep, encryption migrations in both directions (including the repair of double-encrypted conflicted copies), orphaned-chunk GC, push with multi-round reconcile, pull watcher that also publishes pending commits, boot recovery. |
 | Chunking | `src/chunk.rs` | Versioned text manifest, `.chunks/<2 hex>/<sha256>` sharding, streaming slicing with an optional transform (sealing) and dedup via content-addressing. |
 | Encryption | `src/crypt.rs` | Convergent XChaCha20-Poly1305 (nonce derived from the plaintext), HKDF subkeys, per-component names in lowercase base32 with a literal fallback, 0600 key file. |
-| Observability | `src/status.rs`, `src/notify.rs`, `src/tray.rs` | Atomic `status.json`, rate-limited notifications (osascript on macOS, notify-send on Linux; children reaped), a tray with 4 states, index/refresh timing in the logs. |
-| Installation / Paths | `src/service.rs`, `src/launchd.rs`, `src/systemd.rs`, `src/paths.rs` | Platform dispatch, binary installed at `~/.local/bin/git-drive`, template-based LaunchAgents (macOS) and systemd user units (Linux), config/key migration from legacy locations, XDG resolution. |
+| Observability | `state/src/status.rs`, `src/notify.rs`, `src/tray.rs` | Atomic `status.json`, rate-limited notifications (osascript on macOS, notify-send on Linux; children reaped), a tray with 4 states, index/refresh timing in the logs. |
+| Installation / Paths | `src/service.rs`, `src/launchd.rs`, `src/systemd.rs`, `state/src/paths.rs` | Platform dispatch, binary installed at `~/.local/bin/git-drive`, template-based LaunchAgents (macOS) and systemd user units (Linux), config/key migration from legacy locations, XDG resolution. |
 | Configuration | `src/config.rs` | Loader with per-field `#[serde(default)]` (16 fields). Missing file = defaults; an existing invalid file aborts the mount mode. |
 
 ---
@@ -265,7 +265,7 @@ pub struct Config {
 | `src/chunk.rs` | Manifest + content-addressed slicing |
 | `src/crypt.rs` | Encryption at rest |
 | `src/config.rs` | `config.json` loader |
-| `src/paths.rs` | XDG + platform + legacy path resolution |
+| `state/src/paths.rs` | XDG + platform + legacy path resolution |
 | `src/service.rs` | Login-service dispatch and binary installation |
 | `src/launchd.rs` / `src/systemd.rs` | LaunchAgents (macOS) / systemd user units (Linux) |
 | `tests/common/mod.rs` | Git repository helpers for tests |

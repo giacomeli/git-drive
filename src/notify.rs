@@ -172,16 +172,9 @@ fn applescript_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Waits for a fire-and-forget child on a background thread. Without the
-/// wait, every spawned helper (osascript, xdg-open, the viewer) stays as a
-/// zombie for the life of the parent — seen on the Arch tray (2026-10).
-pub fn reap_in_background(child: std::io::Result<std::process::Child>) {
-    if let Ok(mut child) = child {
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
-    }
-}
+/// Waits for a fire-and-forget child (kept in `git-drive-state`, which the
+/// apps share; see there).
+pub use git_drive_state::reap_in_background;
 
 #[cfg(target_os = "macos")]
 fn dispatch_osascript(title: &str, body: &str) {

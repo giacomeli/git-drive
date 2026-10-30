@@ -227,6 +227,7 @@ identidade). Instalações antigas (`~/.config/drive-sync/`, Application Support
 | `p2p_key_file` | Chave do dispositivo no canal. Padrão: `peer.key` ao lado do `config.json` em uso, criada na primeira subida (0600). |
 | `p2p_device_name` | Nome deste dispositivo no registro. Padrão: o hostname curto. |
 | `p2p_relay_url` | Servidor de relay próprio. Padrão: os relays públicos da n0 (veem só IDs e IPs dos dispositivos, nunca conteúdo). |
+| `repo_quota_gb` | Quanto o repositório pode ocupar, em GB, comparado ao tamanho dele na Central de Controle e no git-drive Files. Padrão: o do host (GitHub: 10 GB, o máximo que ele recomenda, com uma marca nos 5 GB abaixo dos quais ele recomenda fortemente ficar; GitLab.com: 10 GB; sem limite nos demais). O GitHub não impõe um total: só recusa push acima de 2 GB ou arquivo acima de 100 MB. |
 | `log_level` | Nível base do arquivo de log (`off`, `error`, `warn`, `info`, `debug`, `trace`). Padrão `info`. |
 | `log_categories` | Nível por área: `sync`, `git`, `fuse`, `crypto`, `p2p`, `network` (a pilha de rede do P2P, `warn` se não definido) e `service`. Área sem nível segue o `log_level`; `off` tira a área do arquivo. Mais fácil de editar na Central de Controle (seção 9.1.4). |
 
@@ -515,7 +516,7 @@ git-drive — branch main
   conflitos na sessão: nenhum
 ```
 
-O daemon grava o `status.json` (escrita atômica) a cada evento de boot, drain, pull e parada. Se `updated_at` estiver velho e o pid não responder, o subcomando sinaliza "POSSIVELMENTE PARADO". Um pull com "pulado: working tree sujo" recorrente no modo sem identidade indica escritas locais nunca commitadas bloqueando o pull (ver limitações).
+Enquanto um drain roda, uma linha `syncing:` acima de `pending ops` mostra quantas mudanças ele tirou da fila (elas deixam de contar como pendentes), a etapa (`committing`, depois `publishing` durante o push) e desde quando — um arquivo grande pode levar alguns minutos do salvamento ao remoto. O daemon grava o `status.json` (escrita atômica) a cada evento de boot, drain, pull e parada. Se `updated_at` estiver velho e o pid não responder, o subcomando sinaliza "POSSIVELMENTE PARADO". Um pull com "pulado: working tree sujo" recorrente no modo sem identidade indica escritas locais nunca commitadas bloqueando o pull (ver limitações).
 
 ### 9.1.2. Tray na barra de menus
 
@@ -564,7 +565,7 @@ git-drive control-center --page logs  # direto no log
 
 | Página | O que mostra e faz |
 | --- | --- |
-| Overview | Estado do drive, último commit, anel de armazenamento (repositório, outros dados, livre), dispositivos do canal P2P, commits por hora, tempo no ar, último pull, mudanças esperando e conflitos. Mostra "Starting" enquanto o daemon sobe e o drive ainda não montou. |
+| Overview | Estado do drive, último commit, anel de armazenamento (repositório, outros dados, livre) e, abaixo dele, o repositório comparado ao que o host aceita (o armazém de objetos, medido pelo daemon no boot e depois de cada commit e pull; âmbar acima do tamanho recomendado pelo host, coral acima do limite; `repo_quota_gb` define o seu), dispositivos do canal P2P, commits por hora, tempo no ar, último pull, mudanças esperando e conflitos. Mostra "Starting" enquanto o daemon sobe e o drive ainda não montou. |
 | Logs | Final ao vivo do log da sessão com filtros por nível, área e texto, pausa e o painel Recording: nível base e um nível por área (`log_categories`). |
 | Settings | Theme: a cor de destaque, escolhida como no macOS (Multicolor, Blue, Purple, Pink, Red, Orange, Yellow, Green, Graphite), aplicada na hora e guardada em `~/.config/git-drive/control-center.json`. Depois, todos os campos do `config.json`, validados e salvos de forma atômica (permissão 0600: pode conter o token). |
 | About | Versão, serviço de login, efeito da janela, estado da criptografia e do P2P, e cada arquivo e pasta que o git-drive usa, com botão Reveal. |

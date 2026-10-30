@@ -34,6 +34,7 @@ function validate(c: Config): Errors {
     e.user_name = "Name and email go together";
   }
   if (c.p2p_relay_url && !/^https?:\/\//.test(c.p2p_relay_url)) e.p2p_relay_url = "Must start with http:// or https://";
+  if (c.repo_quota_gb != null && (!Number.isInteger(c.repo_quota_gb) || c.repo_quota_gb < 0)) e.repo_quota_gb = "Whole number of GB, or empty";
   return e;
 }
 
@@ -113,6 +114,14 @@ export function SettingsView({ daemonRunning }: { daemonRunning: boolean }) {
             </Row>
             <Row label="Access token" hint="HTTPS token (GitHub PAT). Empty = SSH agent or credential helper">
               <SecretField {...text("remote_token")} />
+            </Row>
+            <Row label="Repository quota" hint="How much the repository may hold, shown on the Overview. Empty = the host's (GitHub, GitLab.com: 10 GB)">
+              <NumberField
+                value={c.repo_quota_gb ?? NaN}
+                onChange={(v) => cfg.update("repo_quota_gb", Number.isNaN(v) ? null : v)}
+                unit="GB"
+                error={errors.repo_quota_gb}
+              />
             </Row>
             <Row label="Transport" hint="auto uses the system git when it is installed">
               <select className="field !w-44" value={c.git_transport} onChange={(e) => cfg.update("git_transport", e.target.value)}>

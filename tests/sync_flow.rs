@@ -652,6 +652,38 @@ async fn status_file_updated_after_drain() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn the_repository_size_is_measured_at_boot_and_after_a_commit() {
+    // The repository against its host's limit (Control Center, git-drive
+    // Files): the object store grows with each commit the drain makes.
+    let test = init_repo();
+    test.repo.remote("origin", "git@github.com:someone/drive.git").unwrap();
+    let status_dir = tempfile::tempdir().unwrap();
+    let status_path = status_dir.path().join("status.json");
+    let sync = mgr(test.dir.path().to_str().unwrap(), "main", Some(("Alice", "a@x.com")));
+    sync.enable_status_file(status_path.clone());
+    sync.publish_repo_size(Some("origin"), None);
+
+    let at_boot = git_drive::status::read_from(&status_path).unwrap().repo_usage.expect("measured at boot");
+    assert_eq!(at_boot.capacity.host, "GitHub");
+    assert_eq!(at_boot.capacity.limit, Some(10 * git_drive::storage::GB));
+    assert!(at_boot.used > 0, "the initial commit is in the object store");
+
+    // Bytes zlib can't shrink (a run of one byte would pack to almost nothing).
+    let mut x: u32 = 1;
+    let noise: Vec<u8> = (0..200_000)
+        .map(|_| {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (x >> 16) as u8
+        })
+        .collect();
+    sync.queue_write("big.bin", noise);
+    wait_flush().await;
+    let after = git_drive::status::read_from(&status_path).unwrap().repo_usage.unwrap();
+    assert!(after.used > at_boot.used + 1_000, "{} -> {}", at_boot.used, after.used);
+    assert_eq!(after.capacity, at_boot.capacity, "the capacity stays for the session");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn status_file_records_pull_outcome() {
     let test = init_repo();
     let bare = init_bare_remote();
@@ -1580,6 +1612,7 @@ async fn journal_is_kept_when_the_commit_is_refused() {
     assert!(std::fs::read_dir(&journal_dir).unwrap().count() > 0, "journal kept");
     let blocked = sync.status_state().snapshot().commit_blocked;
     assert!(blocked.is_some_and(|r| r.contains("does not match HEAD")), "status shows the refusal");
+    assert!(sync.status_state().snapshot().syncing.is_none(), "a drain that ends blocked is not syncing anymore");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

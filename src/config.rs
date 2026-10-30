@@ -140,6 +140,10 @@ pub struct Config {
     /// Own relay server. Absent = the public n0 relays and DNS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p2p_relay_url: Option<String>,
+    /// How much the repository may hold, in decimal GB, shown against its
+    /// size. Absent = the host's (GitHub 10, GitLab.com 10; none elsewhere).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_quota_gb: Option<u64>,
 }
 
 impl Default for Config {
@@ -167,6 +171,7 @@ impl Default for Config {
             p2p_key_file: None,
             p2p_device_name: None,
             p2p_relay_url: None,
+            repo_quota_gb: None,
         }
     }
 }
@@ -209,6 +214,7 @@ impl Config {
             p2p_key_file: Some(String::new()),
             p2p_device_name: Some(String::new()),
             p2p_relay_url: Some(String::new()),
+            repo_quota_gb: Some(0),
             log_categories: BTreeMap::from([(String::new(), String::new())]),
             ..Config::default()
         })?
@@ -282,6 +288,20 @@ mod tests {
         assert!(cfg.user_name.is_none());
         assert!(cfg.user_email.is_none());
         assert!(cfg.remote_token.is_none());
+    }
+
+    #[test]
+    fn a_repository_quota_is_optional() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        assert_eq!(Config::default().repo_quota_gb, None, "the host's limit applies");
+        std::fs::write(&path, r#"{"repo_quota_gb": 50}"#).unwrap();
+        assert_eq!(Config::try_load_from(path.to_str().unwrap()).unwrap().repo_quota_gb, Some(50));
+        let saved = serde_json::to_value(Config::default()).unwrap();
+        assert!(saved.get("repo_quota_gb").is_none(), "absent from a saved config until set");
+        // Cleared in the Control Center: the host's limit applies again.
+        Config::default().save_to(&path).unwrap();
+        assert_eq!(Config::try_load_from(path.to_str().unwrap()).unwrap().repo_quota_gb, None);
     }
 
     #[test]

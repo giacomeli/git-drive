@@ -123,7 +123,7 @@ struct Inner {
 - `refresh_flag` — `AtomicBool` set when HEAD advances via pull or reconcile; consumed by `GitDriveFS::refresh_if_needed`.
 - `commit_generation` — `AtomicU64` incremented on every commit created by the drain; `GitDriveFS` compares it with the last value it observed to discard write buffers whose content is already in HEAD.
 - `repo_lock` — serializes the complete drain and pull cycles. The atomic unit is the cycle, not the individual git call: a commit landing between the pull's fetch and its checkout was the race window.
-- `status` — observable state (`src/status.rs`): boot/drain/pull events and the session's conflicted copies, persisted atomically to `logs/status.json` when `enable_status_file` is called (main enables it at boot). Read by the `git-drive status` subcommand.
+- `status` — observable state (`state/src/status.rs`): boot/drain/pull events and the session's conflicted copies, persisted atomically to `logs/status.json` when `enable_status_file` is called (main enables it at boot). Read by the `git-drive status` subcommand.
 
 ### `SyncOp` and the causal queue
 
@@ -388,7 +388,7 @@ The only coalescing today is Write-over-Write (`push_coalescing` in `src/sync.rs
 | `src/journal.rs` | Write-ahead journal: `prepare`/`commit`/`truncate_through`/`open` (replay) |
 | `src/fs.rs` | `write_buffers` + dirty flags, `refresh_if_needed` (buffer gc + rebuild), `sync.queue_*` calls in the `apply_*` methods |
 | `src/git.rs` | `commit_working_tree`, transport (`Transport`, `run_git_net`, `CredAttempts`), `push_progressive`, `fetch_remote`, `merge_ff_only`, `pull_and_merge`, `is_working_tree_clean`, `commit_times_between` |
-| `src/status.rs` | `SyncStatus`/`StatusState`, atomic write of `status.json`, subcommand formatting |
+| `state/src/status.rs` | `SyncStatus`/`StatusState`, atomic write of `status.json`, subcommand formatting |
 | `src/notify.rs` | Notifications (osascript on macOS, notify-send on Linux) with rate limiting for persistent events |
 | `src/config.rs` | Source of `write_debounce_secs`, `pull_interval_secs`, `read_cache_mb`, `large_file_threshold_mb`, `chunk_threshold_mb`, `chunk_size_mb`, `commit_batch_mb`, `encryption_enabled`, `encryption_key_file`, identity, token and `git_transport` |
 
