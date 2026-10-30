@@ -1,0 +1,25 @@
+{
+  "fileops.driveNoTrash": "O drive não tem Lixeira no Linux. Um item apagado continua no histórico Git do drive.",
+  "fileops.trashNoPutBack": "Itens apagados da Lixeira não podem ser devolvidos.",
+  "fileops.putBack": "\"{name}\" voltou para {folder}.",
+  "fileops.trashOne": "Mover \"{name}\" para a Lixeira?",
+  "fileops.trashMany": "Mover {count} itens para a Lixeira?",
+  "fileops.deleteOne": "Apagar \"{name}\" imediatamente?",
+  "fileops.deleteMany": "Apagar {count} itens imediatamente?",
+  "fileops.emptyTitle": "Esvaziar a Lixeira?",
+  "fileops.emptyReason": {
+    "one": "{count} item da Lixeira será apagado de vez.",
+    "other": "{count} itens da Lixeira serão apagados de vez."
+  },
+  "fileops.emptyConfirm": "Esvaziar Lixeira",
+  "fileops.untitled": "pasta sem título",
+  "fileops.newFolder": "Nova Pasta",
+  "fileops.newFolderIn": "Em {where}",
+  "fileops.folderName": "Nome da pasta",
+  "fileops.create": "Criar",
+  "fileops.cantUndo": "Esta ação não pode ser desfeita aqui.",
+  "fileops.delete": "Apagar",
+  "fileops.staysOne": "O item fica na Lixeira até ela ser esvaziada.",
+  "fileops.staysMany": "Os itens ficam na Lixeira até ela ser esvaziada.",
+  "fileops.moveToTrash": "Mover para a Lixeira"
+}

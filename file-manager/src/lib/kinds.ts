@@ -12,8 +12,9 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import type { Entry } from "./api";
+import { language, t, type Key } from "../i18n";
 
-type Family = "folder" | "image" | "video" | "audio" | "pdf" | "code" | "text" | "sheet" | "archive" | "other";
+export type Family = "folder" | "image" | "video" | "audio" | "pdf" | "code" | "text" | "sheet" | "archive" | "other";
 
 const FAMILY_BY_EXT: Record<string, Family> = {};
 const add = (family: Family, exts: string) => exts.split(" ").forEach((e) => (FAMILY_BY_EXT[e] = family));
@@ -26,7 +27,7 @@ add("text", "txt md markdown rst log ini cfg conf env srt vtt tex rtf doc docx p
 add("sheet", "csv tsv xls xlsx numbers ods");
 add("archive", "zip tar gz tgz bz2 xz 7z rar dmg iso");
 
-function family(entry: Entry): Family {
+export function family(entry: Entry): Family {
   if (entry.is_dir) return "folder";
   return FAMILY_BY_EXT[entry.ext] ?? "other";
 }
@@ -64,60 +65,78 @@ export function iconFor(entry: Entry): { Icon: LucideIcon; color: string } {
   return { Icon, color: TINT[fam] };
 }
 
-const KIND_LABEL: Record<string, string> = {
-  png: "PNG image",
-  jpg: "JPEG image",
-  jpeg: "JPEG image",
-  gif: "GIF image",
-  webp: "WebP image",
-  svg: "SVG image",
-  heic: "HEIC image",
-  mp4: "MPEG-4 movie",
-  mov: "QuickTime movie",
-  webm: "WebM movie",
-  mp3: "MP3 audio",
-  m4a: "Apple MPEG-4 audio",
-  wav: "WAV audio",
-  flac: "FLAC audio",
-  pdf: "PDF document",
-  md: "Markdown document",
-  txt: "Plain text",
-  json: "JSON document",
-  yaml: "YAML document",
-  yml: "YAML document",
-  toml: "TOML document",
-  rs: "Rust source",
-  ts: "TypeScript source",
-  tsx: "TypeScript JSX",
-  js: "JavaScript source",
-  py: "Python script",
-  sh: "Shell script",
-  html: "HTML document",
-  css: "CSS stylesheet",
-  csv: "CSV document",
-  zip: "ZIP archive",
-  dmg: "Disk image",
-  log: "Log file",
+/** The name of a file's kind, by its extension (what Finder's Kind column says). */
+const KIND_KEY: Record<string, Key> = {
+  png: "kinds.png",
+  jpg: "kinds.jpeg",
+  jpeg: "kinds.jpeg",
+  gif: "kinds.gif",
+  webp: "kinds.webp",
+  svg: "kinds.svg",
+  heic: "kinds.heic",
+  mp4: "kinds.mp4",
+  mov: "kinds.mov",
+  webm: "kinds.webm",
+  mp3: "kinds.mp3",
+  m4a: "kinds.m4a",
+  wav: "kinds.wav",
+  flac: "kinds.flac",
+  pdf: "kinds.pdf",
+  md: "kinds.md",
+  txt: "kinds.txt",
+  json: "kinds.json",
+  yaml: "kinds.yaml",
+  yml: "kinds.yaml",
+  toml: "kinds.toml",
+  rs: "kinds.rs",
+  ts: "kinds.ts",
+  tsx: "kinds.tsx",
+  js: "kinds.js",
+  py: "kinds.py",
+  sh: "kinds.sh",
+  html: "kinds.html",
+  css: "kinds.css",
+  csv: "kinds.csv",
+  zip: "kinds.zip",
+  dmg: "kinds.dmg",
+  log: "kinds.log",
 };
 
 export function kindLabel(entry: Entry): string {
-  if (entry.is_dir) return entry.kind === "symlink" ? "Alias" : "Folder";
-  if (!entry.ext) return "Document";
-  return KIND_LABEL[entry.ext] ?? `${entry.ext.toUpperCase()} file`;
+  if (entry.is_dir) return t(entry.kind === "symlink" ? "kinds.alias" : "kinds.folder");
+  if (!entry.ext) return t("kinds.document");
+  const key = KIND_KEY[entry.ext];
+  return key ? t(key) : t("kinds.extFile", { ext: entry.ext.toUpperCase() });
 }
 
 const sameDay = (a: Date, b: Date) =>
   a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 
-/** "Today, 14:05", "Yesterday, 09:12", "12 Oct 2026, 10:01" (as Finder writes them). */
+/** "Today, 14:05", "Yesterday, 09:12", "12 Oct 2026, 10:01" (as Finder writes them), in the app's language. */
 export function dateLabel(secs: number | null): string {
   if (secs == null) return "--";
   const d = new Date(secs * 1000);
   const now = new Date();
-  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  if (sameDay(d, now)) return `Today, ${time}`;
+  const time = d.toLocaleTimeString(language(), { hour: "2-digit", minute: "2-digit" });
+  if (sameDay(d, now)) return t("kinds.today", { time });
   const yesterday = new Date(now);
   yesterday.setDate(now.getDate() - 1);
-  if (sameDay(d, yesterday)) return `Yesterday, ${time}`;
-  return `${d.toLocaleDateString([], { day: "numeric", month: "short", year: "numeric" })}, ${time}`;
+  if (sameDay(d, yesterday)) return t("kinds.yesterday", { time });
+  return t("kinds.dateTime", { date: d.toLocaleDateString(language(), { day: "numeric", month: "short", year: "numeric" }), time });
 }
+
+/** Archive endings bsdtar reads, longest first (mirrors archive.rs). */
+const ARCHIVE_ENDINGS = [".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tgz", ".tbz2", ".tbz", ".txz", ".zip", ".tar", ".7z", ".rar"];
+
+/** An archive's name without its ending (`backup.tar.gz` -> `backup`); null for anything else. */
+export function archiveStem(name: string): string | null {
+  const lower = name.toLowerCase();
+  const ending = ARCHIVE_ENDINGS.find((e) => lower.endsWith(e));
+  const stem = ending ? name.slice(0, name.length - ending.length) : "";
+  return stem === "" ? null : stem;
+}
+
+/** Pictures macOS and GNOME take as a desktop picture. */
+const WALLPAPER_EXTS = new Set(["jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "webp", "gif", "bmp", "jxl"]);
+
+export const isWallpaper = (entry: Entry) => !entry.is_dir && WALLPAPER_EXTS.has(entry.ext);

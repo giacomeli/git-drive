@@ -1,0 +1,21 @@
+{
+  "sidebar.show": "Show sidebar",
+  "sidebar.hide": "Hide sidebar",
+  "sidebar.bookmarks": "Bookmarks",
+  "sidebar.locations": "Locations",
+  "sidebar.computer": "Computer",
+  "sidebar.trash": "Trash",
+  "sidebar.notFoundPath": "{path} (not found)",
+  "sidebar.folderNotFound": "Folder not found",
+  "sidebar.dropHere": "Drop a folder here to bookmark it.",
+  "sidebar.freeOf": "{free} free of {total}",
+  "sidebar.repo.onHost": " on {host}",
+  "sidebar.repo.of": "{used} of {limit}{where}",
+  "sidebar.repo.ofYour": "{used} of your {limit}{where}",
+  "sidebar.repo.noLimit": "{host} publishes no size limit; set repo_quota_gb in the config to show one.",
+  "sidebar.repo.thisHost": "This host",
+  "sidebar.repo.yourQuota": "{limit} is your quota (repo_quota_gb){mark}.",
+  "sidebar.repo.github": "{limit} is GitHub's recommended maximum (it refuses only a push over 2 GB or a file over 100 MB){mark}.",
+  "sidebar.repo.hostLimit": "{limit} is {host}'s limit{mark}.",
+  "sidebar.repo.mark": "; {host} strongly recommends staying under {size} (the mark)"
+}

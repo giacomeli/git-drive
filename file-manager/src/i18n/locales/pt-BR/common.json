@@ -1,0 +1,24 @@
+{
+  "common.cancel": "Cancelar",
+  "common.close": "Fechar",
+  "common.save": "Salvar",
+  "common.apply": "Aplicar",
+  "common.revert": "Desfazer",
+  "common.open": "Abrir",
+  "common.item": {
+    "one": "{count} item",
+    "other": "{count} itens"
+  },
+  "common.folder": {
+    "one": "{count} pasta",
+    "other": "{count} pastas"
+  },
+  "common.file": {
+    "one": "{count} arquivo",
+    "other": "{count} arquivos"
+  },
+  "common.image": {
+    "one": "{count} imagem",
+    "other": "{count} imagens"
+  }
+}

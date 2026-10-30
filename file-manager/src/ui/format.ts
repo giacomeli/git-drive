@@ -1,5 +1,8 @@
 // Copied from control-center/src/lib/format.ts (file manager POC, decision 2): keep the two
-// in sync until the design system moves to a shared package.
+// in sync until the design system moves to a shared package. Numbers and words follow the
+// app's language (the units stay as they are written everywhere).
+import { num, t } from "../i18n";
+
 const UNITS = ["B", "KB", "MB", "GB", "TB"];
 
 /** Bytes in decimal units, the way Finder and GNOME Files report sizes. */
@@ -12,7 +15,7 @@ export function bytes(n: number | null | undefined): { value: string; unit: stri
     i++;
   }
   const digits = v >= 100 || i === 0 ? 0 : 1;
-  return { value: v.toFixed(digits), unit: UNITS[i] };
+  return { value: num(v, digits), unit: UNITS[i] };
 }
 
 export function bytesText(n: number | null | undefined): string {
@@ -23,20 +26,20 @@ export function bytesText(n: number | null | undefined): string {
 /** "12 s", "4 min", "3 h 05 min", "2 d 4 h". */
 export function duration(secs: number): string {
   const s = Math.max(0, Math.floor(secs));
-  if (s < 60) return `${s} s`;
+  if (s < 60) return t("format.seconds", { s: String(s) });
   const m = Math.floor(s / 60);
-  if (m < 60) return `${m} min`;
+  if (m < 60) return t("format.minutes", { m: String(m) });
   const h = Math.floor(m / 60);
-  if (h < 24) return `${h} h ${String(m % 60).padStart(2, "0")} min`;
+  if (h < 24) return t("format.hours", { h: String(h), m: String(m % 60).padStart(2, "0") });
   const d = Math.floor(h / 24);
-  return `${d} d ${h % 24} h`;
+  return t("format.days", { d: String(d), h: String(h % 24) });
 }
 
 export function ago(at: number | null | undefined, now: number): string {
-  if (!at) return "never";
+  if (!at) return t("format.never");
   const secs = now - at;
-  if (secs < 5) return "just now";
-  return `${duration(secs)} ago`;
+  if (secs < 5) return t("format.justNow");
+  return t("format.ago", { time: duration(secs) });
 }
 
 export function shortId(id: string): string {

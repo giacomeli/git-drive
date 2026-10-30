@@ -1,0 +1,568 @@
+/* File manager additions to the copied design system (src/ui/styles.css stays
+   a verbatim copy of the Control Center's). */
+
+/* Range slider: a thin track filled with the accent up to the thumb (`--fill`). */
+.range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 9999px;
+  outline: none;
+  background:
+    linear-gradient(90deg, var(--a1), var(--a3)) 0 0 / var(--fill, 50%) 100% no-repeat,
+    rgb(var(--fg-rgb) / 0.14);
+}
+
+.range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 13px;
+  height: 13px;
+  border-radius: 9999px;
+  background: #fff;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.45);
+}
+
+.range:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px rgb(var(--a1-rgb) / 0.45);
+}
+
+/* Floating panels (the path popover, the context menu, dialogs): opaque
+   enough to read over the icons, in the window's glass. */
+.float-panel {
+  background: var(--panel);
+  border: 1px solid rgb(var(--fg-rgb) / 0.12);
+  border-radius: 12px;
+  box-shadow:
+    0 18px 40px -16px rgb(5 6 25 / 0.85),
+    inset 0 1px 0 rgb(255 255 255 / 0.06);
+  -webkit-backdrop-filter: blur(24px) saturate(150%);
+  backdrop-filter: blur(24px) saturate(150%);
+  animation: float-in 120ms ease-out both;
+}
+
+.dialog-panel {
+  border-radius: 18px;
+}
+
+@keyframes float-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Rename in place (NameField): the item's name turned into a field, ringed in
+   the accent (coral while the name is refused). */
+.name-field {
+  min-width: 0;
+  border-radius: 5px;
+  background: var(--field-strong);
+  color: var(--color-ink);
+  caret-color: var(--color-ink);
+  outline: none;
+  box-shadow:
+    0 0 0 1.5px rgb(var(--a1-rgb) / 0.9),
+    0 0 0 4px rgb(var(--a1-rgb) / 0.22);
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.name-field::selection {
+  background: rgb(var(--a1-rgb) / 0.65);
+}
+
+.name-field.invalid {
+  box-shadow:
+    0 0 0 1.5px rgb(255 92 122 / 0.9),
+    0 0 0 4px rgb(255 92 122 / 0.2);
+}
+
+textarea.name-field {
+  display: block;
+  resize: none;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+/* Drag and drop. WebKit's own drag of text and images never starts: a drag
+   here is the native one (native_drag.rs). */
+body,
+body * {
+  -webkit-user-drag: none;
+}
+
+/* The folder a drag is over: a row, a tile's icon, a sidebar place. */
+.drop-target {
+  background: rgb(var(--a1-rgb) / 0.5) !important;
+  box-shadow: inset 0 0 0 1.5px rgb(var(--a1-rgb) / 0.95) !important;
+  color: #fff !important;
+}
+
+/* The empty space of the folder in view, or a column, taking a drop. */
+.drop-zone {
+  background: rgb(var(--a1-rgb) / 0.08);
+  box-shadow: inset 0 0 0 2px rgb(var(--a1-rgb) / 0.7);
+}
+
+/* Column view: the divider that resizes a column, centred on its border.
+   Drag resizes, a double-click fits the names; the line lights up in the
+   accent, and a grip of two lines marks it at the bottom, as in Finder. */
+.col-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: -4px;
+  width: 8px;
+  z-index: 20;
+  cursor: col-resize;
+}
+
+.col-handle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 2px;
+  border-radius: 1px;
+  transition: background 120ms;
+}
+
+.col-handle:hover::after,
+.col-handle.active::after {
+  background: rgb(var(--a1-rgb) / 0.85);
+}
+
+.col-grip {
+  position: absolute;
+  bottom: 10px;
+  left: 1px;
+  width: 6px;
+  height: 14px;
+  border-left: 1px solid rgb(var(--fg-rgb) / 0.35);
+  border-right: 1px solid rgb(var(--fg-rgb) / 0.35);
+}
+
+/* While a column is being resized, the cursor keeps its shape everywhere. */
+body.col-resizing,
+body.col-resizing * {
+  cursor: col-resize !important;
+}
+
+/* The selection rectangle drawn over the empty space of the icon and list views. */
+.marquee {
+  position: absolute;
+  z-index: 15;
+  pointer-events: none;
+  border: 1px solid rgb(var(--a1-rgb) / 0.9);
+  border-radius: 3px;
+  background: rgb(var(--a1-rgb) / 0.18);
+}
+
+/* A drag that can't start (an item that stays where it is): not-allowed until the button is let go. */
+.drag-refused,
+.drag-refused * {
+  cursor: not-allowed !important;
+}
+
+/* The terminal panel: xterm.js over the panel's glass, with the app's thin scroll bar. */
+.terminal-body .xterm {
+  height: 100%;
+  padding: 8px 4px 4px 14px;
+}
+.terminal-body .xterm .xterm-viewport {
+  background-color: transparent !important;
+  scrollbar-width: thin;
+  scrollbar-color: rgb(var(--fg-rgb) / 0.18) transparent;
+}
+/* Dragging the panel's top edge. */
+.resizing-row,
+.resizing-row * {
+  cursor: row-resize !important;
+  user-select: none !important;
+}
+
+/* Terminal panes: the wrapper fills its leaf; a pane without the keys is dimmed, as in iTerm. */
+.term-wrapper {
+  position: absolute;
+  inset: 0;
+}
+.term-leaf[data-dim] .xterm-screen {
+  opacity: 0.55;
+  transition: opacity 0.15s;
+}
+.term-divider {
+  position: relative;
+  background: rgb(var(--fg-rgb) / 0.1);
+}
+/* A wider grip than the 1px line. */
+.term-divider::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+}
+.resizing-col,
+.resizing-col * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+/* Tabs (folders and terminal): an inactive tab and the + button keep a faint
+   edge on the glass; the tab in front takes a light wash of the accent. */
+.tab-off {
+  background: rgb(var(--fg-rgb) / 0.02);
+  box-shadow: inset 0 0 0 1px rgb(var(--fg-rgb) / 0.04);
+}
+.tab-off:hover {
+  background: rgb(var(--fg-rgb) / 0.05);
+}
+.tab-on {
+  background: rgb(var(--a1-rgb) / 0.16);
+  box-shadow: inset 0 0 0 1px rgb(var(--a1-rgb) / 0.38);
+}
+.tab-add {
+  background: rgb(var(--fg-rgb) / 0.03);
+  box-shadow: inset 0 0 0 1px rgb(var(--fg-rgb) / 0.09);
+}
+.tab-add:hover {
+  background: rgb(var(--fg-rgb) / 0.09);
+}
+
+/* The file operations at the foot of the sidebar. */
+.task-card {
+  background: rgb(var(--fg-rgb) / 0.05);
+  box-shadow: inset 0 0 0 1px rgb(var(--fg-rgb) / 0.08);
+  animation: float-in 160ms ease-out both;
+}
+/* A bar that can't tell how far: a sweep of the accent. */
+.task-sweep {
+  background: linear-gradient(90deg, transparent, var(--a2), transparent);
+  animation: task-sweep 1.2s ease-in-out infinite;
+}
+@keyframes task-sweep {
+  from {
+    left: -35%;
+  }
+  to {
+    left: 100%;
+  }
+}
+
+/* The listings fade out at their top and bottom edges, where they scroll
+   under the pane's header and its status bar, instead of being cut there;
+   their padding keeps the first and last rows clear of the fade at rest. */
+.fade-edges {
+  -webkit-mask-image: linear-gradient(to bottom, rgb(0 0 0 / 0.25), #000 12px, #000 calc(100% - 12px), rgb(0 0 0 / 0.25));
+  mask-image: linear-gradient(to bottom, rgb(0 0 0 / 0.25), #000 12px, #000 calc(100% - 12px), rgb(0 0 0 / 0.25));
+}
+/* On the light theme the content fades into a pale glass, which reads as a glow: shorter and fainter. */
+[data-theme="light"] .fade-edges {
+  -webkit-mask-image: linear-gradient(to bottom, rgb(0 0 0 / 0.6), #000 8px, #000 calc(100% - 8px), rgb(0 0 0 / 0.6));
+  mask-image: linear-gradient(to bottom, rgb(0 0 0 / 0.6), #000 8px, #000 calc(100% - 8px), rgb(0 0 0 / 0.6));
+}
+/* A drop's outline stays whole. */
+.fade-edges.drop-zone {
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+
+/* In a split, the pane without the keys steps back; a hover brings it a little closer. */
+.pane-dim > * {
+  opacity: 0.55;
+  transition: opacity 150ms;
+}
+.pane-dim:hover > * {
+  opacity: 0.72;
+}
+
+/* Light theme: the dark wells of the dark one (the view switcher, segmented
+   controls, a text preview's page) become faint ink ones. */
+[data-theme="light"] .bg-black\/20 {
+  background-color: rgb(26 28 63 / 0.06);
+}
+[data-theme="light"] .bg-black\/25 {
+  background-color: rgb(255 255 255 / 0.6);
+}
+
+/* Dialogs over the window (Settings, Properties, About, the map, Quick
+   Look): opaque enough that small text reads over the blurred files. */
+.glass.sheet {
+  background: rgb(28 30 62 / 0.9);
+}
+[data-theme="light"] .glass.sheet {
+  background: rgb(250 251 255 / 0.94);
+}
+
+/* The terminal stays dark on the light theme: its colors, and what remote
+   shells and tmux draw, are made for a dark ground. */
+[data-theme="light"] .term-dark {
+  color-scheme: dark;
+  color: var(--color-ink);
+  --color-ink: #eceefb;
+  --color-muted: #a3a8cc;
+  --color-dim: #8186ab;
+  --color-line: rgb(255 255 255 / 0.09);
+  --color-white: #ffffff;
+  --fg-rgb: 255 255 255;
+  --glass: rgb(27 29 58 / 0.94);
+  --glass-border: rgb(255 255 255 / 0.1);
+  --field-bg: rgb(10 12 36 / 0.35);
+  --panel: rgb(26 28 60 / 0.94);
+}
+
+/* A terminal pane's close button: barely there until the pointer is on it. */
+.term-close {
+  opacity: 0.22;
+  transition: opacity 140ms, background 140ms;
+}
+.term-leaf:hover .term-close {
+  opacity: 0.45;
+}
+.term-leaf .term-close:hover {
+  opacity: 1;
+  background: rgb(255 92 122 / 0.85);
+  color: #fff;
+}
+
+/* A folder's previews: prints with a white frame, a short shadow and a thin
+   dark edge that keeps them apart on light accents and white pages. */
+.folder-print {
+  background: #fff;
+  border-radius: 2px;
+  box-shadow:
+    0 2px 5px -1px rgb(0 0 0 / 0.45),
+    0 0 0 0.5px rgb(0 0 0 / 0.35);
+}
+.print-in {
+  animation: print-in 260ms cubic-bezier(0.2, 0.8, 0.3, 1.2) both;
+}
+@keyframes print-in {
+  from {
+    opacity: 0;
+    scale: 0.82;
+  }
+  to {
+    opacity: 1;
+    scale: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .print-in {
+    animation-name: print-fade;
+  }
+  @keyframes print-fade {
+    from {
+      opacity: 0;
+    }
+  }
+}
+
+
+/* Video controls: dark glass over the picture in both themes, white marks. */
+.player-glass {
+  color: #fff;
+  background: rgb(18 18 30 / 0.55);
+  -webkit-backdrop-filter: blur(14px) saturate(1.4);
+  backdrop-filter: blur(14px) saturate(1.4);
+  box-shadow:
+    inset 0 0 0 1px rgb(255 255 255 / 0.12),
+    0 6px 18px -6px rgb(0 0 0 / 0.55);
+}
+.player-btn {
+  opacity: 0.9;
+  transition: background-color 120ms, opacity 120ms;
+}
+.player-btn:hover {
+  opacity: 1;
+  background: rgb(255 255 255 / 0.16);
+}
+.player-rail {
+  background: rgb(255 255 255 / 0.28);
+}
+.player-knob {
+  background: #fff;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.5);
+}
+
+/* Formatted JSON: one color per part, readable on the dark and the light well. */
+.json-gutter {
+  color: rgb(var(--fg-rgb) / 0.28);
+}
+.json-key {
+  color: #9ecbff;
+}
+.json-string {
+  color: #a8dba8;
+}
+.json-number {
+  color: #f6c177;
+}
+.json-literal {
+  color: #d4a5ff;
+}
+.json-punct {
+  color: rgb(var(--fg-rgb) / 0.5);
+}
+[data-theme="light"] .json-key {
+  color: #1a5fb4;
+}
+[data-theme="light"] .json-string {
+  color: #2a7a3b;
+}
+[data-theme="light"] .json-number {
+  color: #a75400;
+}
+[data-theme="light"] .json-literal {
+  color: #7a3db0;
+}
+
+/* Rendered Markdown, in the app's type: compact in the panel, roomier in Quick Look. */
+.md {
+  font-size: 0.74rem;
+  line-height: 1.6;
+  color: var(--color-ink);
+  overflow-wrap: anywhere;
+}
+.md.md-large {
+  font-size: 0.86rem;
+  line-height: 1.7;
+}
+.md > :first-child {
+  margin-top: 0;
+}
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+  margin: 1.4em 0 0.5em;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.md h1 {
+  font-size: 1.6em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--color-line);
+}
+.md h2 {
+  font-size: 1.3em;
+  padding-bottom: 0.25em;
+  border-bottom: 1px solid var(--color-line);
+}
+.md h3 {
+  font-size: 1.12em;
+}
+.md h4,
+.md h5,
+.md h6 {
+  font-size: 1em;
+  color: var(--color-muted);
+}
+.md p,
+.md ul,
+.md ol,
+.md blockquote,
+.md pre,
+.md table {
+  margin: 0 0 0.9em;
+}
+.md ul,
+.md ol {
+  padding-left: 1.5em;
+}
+.md ul {
+  list-style: disc;
+}
+.md ol {
+  list-style: decimal;
+}
+.md li + li {
+  margin-top: 0.2em;
+}
+.md li > ul,
+.md li > ol {
+  margin: 0.2em 0 0;
+}
+.md li:has(> input[type="checkbox"]) {
+  list-style: none;
+  margin-left: -1.3em;
+}
+.md input[type="checkbox"] {
+  margin-right: 0.45em;
+  vertical-align: -0.1em;
+  accent-color: var(--a2);
+}
+.md a {
+  color: var(--a1);
+  text-decoration: underline;
+  text-decoration-color: rgb(var(--a2-rgb) / 0.45);
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.md a.md-remote {
+  display: inline-block;
+  padding: 0.05em 0.5em;
+  border-radius: 6px;
+  background: rgb(var(--fg-rgb) / 0.08);
+  text-decoration: none;
+  font-size: 0.92em;
+}
+.md strong {
+  font-weight: 600;
+}
+.md code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  padding: 0.12em 0.36em;
+  border-radius: 5px;
+  background: rgb(var(--fg-rgb) / 0.09);
+}
+.md pre {
+  padding: 0.8em 1em;
+  border-radius: 10px;
+  background: rgb(0 0 0 / 0.28);
+  overflow-x: auto;
+}
+[data-theme="light"] .md pre {
+  background: rgb(26 28 63 / 0.06);
+}
+.md pre code {
+  padding: 0;
+  background: none;
+  font-size: 0.86em;
+  line-height: 1.55;
+}
+.md blockquote {
+  padding: 0.1em 1em;
+  border-left: 3px solid rgb(var(--a2-rgb) / 0.6);
+  color: var(--color-muted);
+}
+.md hr {
+  margin: 1.5em 0;
+  border: 0;
+  border-top: 1px solid var(--color-line);
+}
+.md table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+.md th,
+.md td {
+  padding: 0.35em 0.75em;
+  border: 1px solid var(--color-line);
+}
+.md th {
+  font-weight: 600;
+  background: rgb(var(--fg-rgb) / 0.05);
+}
+.md img {
+  max-width: 100%;
+  border-radius: 8px;
+}
+.md del {
+  opacity: 0.7;
+}

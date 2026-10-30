@@ -1,0 +1,24 @@
+{
+  "common.cancel": "Cancel",
+  "common.close": "Close",
+  "common.save": "Save",
+  "common.apply": "Apply",
+  "common.revert": "Revert",
+  "common.open": "Open",
+  "common.item": {
+    "one": "{count} item",
+    "other": "{count} items"
+  },
+  "common.folder": {
+    "one": "{count} folder",
+    "other": "{count} folders"
+  },
+  "common.file": {
+    "one": "{count} file",
+    "other": "{count} files"
+  },
+  "common.image": {
+    "one": "{count} image",
+    "other": "{count} images"
+  }
+}

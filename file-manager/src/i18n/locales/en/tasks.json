@@ -1,0 +1,74 @@
+{
+  "tasks.done": "Done",
+  "tasks.cancelled": "Cancelled",
+  "tasks.failed": "Failed",
+  "tasks.cancelling": "Cancelling…",
+  "tasks.preparing": "Preparing…",
+  "tasks.working": "Working…",
+  "tasks.fewSecondsLeft": "a few seconds left",
+  "tasks.left": "{time} left",
+  "tasks.bytesOf": "{done} of {total}",
+  "tasks.filesOf": {
+    "one": "{done} of {count} file",
+    "other": "{done} of {count} files"
+  },
+  "tasks.itemsOf": {
+    "one": "{done} of {count} item",
+    "other": "{done} of {count} items"
+  },
+  "tasks.filesSoFar": {
+    "one": "{count} file so far",
+    "other": "{count} files so far"
+  },
+  "tasks.title.copy": "Copying {what}",
+  "tasks.title.move": "Moving {what}",
+  "tasks.title.duplicate": "Duplicating {what}",
+  "tasks.title.trash": "Moving {what} to the Trash",
+  "tasks.title.delete": "Deleting {what}",
+  "tasks.title.compress": "Compressing {what}",
+  "tasks.title.extract": "Extracting {what}",
+  "tasks.title.empty": "Emptying the Trash",
+  "tasks.title.putBack": "Putting back {what}",
+  "tasks.title.permissions": "Changing permissions of {what}",
+  "tasks.title.metadata": "Saving metadata of {what}",
+  "tasks.showDetails": "Show details",
+  "tasks.cancellingLabel": "Cancelling",
+  "tasks.dismiss": "Dismiss",
+  "tasks.ringLabel": {
+    "one": "{count} operation: show details",
+    "other": "{count} operations: show details"
+  },
+  "tasks.underWayCount": {
+    "one": "{count} operation under way",
+    "other": "{count} operations under way"
+  },
+  "tasks.operations": "Operations",
+  "tasks.underWay": "Under way",
+  "tasks.row.items": "Items",
+  "tasks.row.from": "From",
+  "tasks.row.in": "In",
+  "tasks.row.to": "To",
+  "tasks.row.now": "Now",
+  "tasks.row.size": "Size",
+  "tasks.row.files": "Files",
+  "tasks.row.speed": "Speed",
+  "tasks.row.timeLeft": "Time left",
+  "tasks.row.elapsed": "Elapsed",
+  "tasks.andMore": "and {count} more",
+  "tasks.countOf": "{done} of {total}",
+  "tasks.bytesPerSecond": "{size}/s",
+  "tasks.filesPerSecond": {
+    "one": "{count} file/s",
+    "other": "{count} files/s"
+  },
+  "tasks.fewSeconds": "A few seconds",
+  "tasks.underASecond": "Under a second",
+  "tasks.stoppedNote": "Stopped before the end: what was done stays, the item under way was removed.",
+  "tasks.none": "No operations under way.",
+  "tasks.cancelOperations": {
+    "one": "Cancel Operation",
+    "other": "Cancel {count} Operations"
+  },
+  "tasks.toFolder": "to {name}",
+  "tasks.inFolder": "in {name}"
+}

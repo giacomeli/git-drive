@@ -1,0 +1,25 @@
+{
+  "fileops.driveNoTrash": "The drive has no Trash on Linux. A deleted item stays in the drive's Git history.",
+  "fileops.trashNoPutBack": "Items deleted from the Trash can't be put back.",
+  "fileops.putBack": "\"{name}\" is back in {folder}.",
+  "fileops.trashOne": "Move \"{name}\" to the Trash?",
+  "fileops.trashMany": "Move {count} items to the Trash?",
+  "fileops.deleteOne": "Delete \"{name}\" immediately?",
+  "fileops.deleteMany": "Delete {count} items immediately?",
+  "fileops.emptyTitle": "Empty the Trash?",
+  "fileops.emptyReason": {
+    "one": "The {count} item in the Trash will be deleted for good.",
+    "other": "The {count} items in the Trash will be deleted for good."
+  },
+  "fileops.emptyConfirm": "Empty Trash",
+  "fileops.untitled": "untitled folder",
+  "fileops.newFolder": "New Folder",
+  "fileops.newFolderIn": "In {where}",
+  "fileops.folderName": "Folder name",
+  "fileops.create": "Create",
+  "fileops.cantUndo": "You can't undo this action here.",
+  "fileops.delete": "Delete",
+  "fileops.staysOne": "It stays in the Trash until the Trash is emptied.",
+  "fileops.staysMany": "They stay in the Trash until it is emptied.",
+  "fileops.moveToTrash": "Move to Trash"
+}

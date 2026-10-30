@@ -1,0 +1,74 @@
+{
+  "tasks.done": "Concluído",
+  "tasks.cancelled": "Cancelado",
+  "tasks.failed": "Falhou",
+  "tasks.cancelling": "Cancelando…",
+  "tasks.preparing": "Preparando…",
+  "tasks.working": "Trabalhando…",
+  "tasks.fewSecondsLeft": "alguns segundos restantes",
+  "tasks.left": "{time} restantes",
+  "tasks.bytesOf": "{done} de {total}",
+  "tasks.filesOf": {
+    "one": "{done} de {count} arquivo",
+    "other": "{done} de {count} arquivos"
+  },
+  "tasks.itemsOf": {
+    "one": "{done} de {count} item",
+    "other": "{done} de {count} itens"
+  },
+  "tasks.filesSoFar": {
+    "one": "{count} arquivo até agora",
+    "other": "{count} arquivos até agora"
+  },
+  "tasks.title.copy": "Copiando {what}",
+  "tasks.title.move": "Movendo {what}",
+  "tasks.title.duplicate": "Duplicando {what}",
+  "tasks.title.trash": "Movendo {what} para a Lixeira",
+  "tasks.title.delete": "Apagando {what}",
+  "tasks.title.compress": "Comprimindo {what}",
+  "tasks.title.extract": "Extraindo {what}",
+  "tasks.title.empty": "Esvaziando a Lixeira",
+  "tasks.title.putBack": "Devolvendo {what}",
+  "tasks.title.permissions": "Alterando as permissões de {what}",
+  "tasks.title.metadata": "Salvando os metadados de {what}",
+  "tasks.showDetails": "Mostrar detalhes",
+  "tasks.cancellingLabel": "Cancelando",
+  "tasks.dismiss": "Dispensar",
+  "tasks.ringLabel": {
+    "one": "{count} operação: mostrar detalhes",
+    "other": "{count} operações: mostrar detalhes"
+  },
+  "tasks.underWayCount": {
+    "one": "{count} operação em andamento",
+    "other": "{count} operações em andamento"
+  },
+  "tasks.operations": "Operações",
+  "tasks.underWay": "Em andamento",
+  "tasks.row.items": "Itens",
+  "tasks.row.from": "De",
+  "tasks.row.in": "Em",
+  "tasks.row.to": "Para",
+  "tasks.row.now": "Agora",
+  "tasks.row.size": "Tamanho",
+  "tasks.row.files": "Arquivos",
+  "tasks.row.speed": "Velocidade",
+  "tasks.row.timeLeft": "Tempo restante",
+  "tasks.row.elapsed": "Decorrido",
+  "tasks.andMore": "e mais {count}",
+  "tasks.countOf": "{done} de {total}",
+  "tasks.bytesPerSecond": "{size}/s",
+  "tasks.filesPerSecond": {
+    "one": "{count} arquivo/s",
+    "other": "{count} arquivos/s"
+  },
+  "tasks.fewSeconds": "Alguns segundos",
+  "tasks.underASecond": "Menos de um segundo",
+  "tasks.stoppedNote": "Parou antes do fim: o que foi feito fica, o item em andamento foi removido.",
+  "tasks.none": "Nenhuma operação em andamento.",
+  "tasks.cancelOperations": {
+    "one": "Cancelar Operação",
+    "other": "Cancelar {count} Operações"
+  },
+  "tasks.toFolder": "para {name}",
+  "tasks.inFolder": "em {name}"
+}

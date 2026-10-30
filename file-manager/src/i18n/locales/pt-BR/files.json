@@ -1,0 +1,32 @@
+{
+  "files.computer": "Computador",
+  "files.trash": "Lixeira",
+  "files.pathCopied": "Caminho copiado.",
+  "files.pathsCopied": "{count} caminhos copiados.",
+  "files.alwaysOpenExt": "Arquivos .{ext} abrem com {app} daqui em diante.",
+  "files.alwaysOpenAny": "Arquivos como este abrem com {app} daqui em diante.",
+  "files.desktopPicture": "\"{name}\" agora é o fundo de tela.",
+  "files.closePane": "Fechar este painel",
+  "files.trashEmpty": "A Lixeira está vazia",
+  "files.emptyFolder": "Pasta vazia",
+  "files.searching": "Buscando",
+  "files.nothingNamed": "Nada com nome como \"{query}\" em {folder}",
+  "files.computerFooter": "{folders}, {disks}",
+  "files.disks": {
+    "one": "{count} disco",
+    "other": "{count} discos"
+  },
+  "files.trashAsFinder": "A Lixeira, como o Finder a mantém",
+  "files.searchingIn": "Buscando em {folder}: {count} encontrados até agora",
+  "files.results": {
+    "one": "{count} resultado em {folder}",
+    "other": "{count} resultados em {folder}"
+  },
+  "files.resultsMore": "{count}+ resultados em {folder}",
+  "files.selectedOf": "{selected} de {count} selecionados",
+  "files.hiddenShown": "Arquivos ocultos visíveis",
+  "files.hideTerminal": "Ocultar terminal",
+  "files.showTerminal": "Mostrar terminal",
+  "files.terminalTitleHide": "Ocultar terminal ({keys})",
+  "files.terminalTitleShow": "Mostrar terminal ({keys})"
+}

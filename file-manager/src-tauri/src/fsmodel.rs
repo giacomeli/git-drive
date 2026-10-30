@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fs::{self, Metadata};
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
@@ -29,9 +29,13 @@ pub struct Entry {
     pub size: u64,
     /// Unix seconds.
     pub modified: Option<u64>,
+    /// Unix seconds; `None` where the file system keeps no birth time.
+    pub created: Option<u64>,
     pub hidden: bool,
     /// Lowercase extension of a file; empty for folders and files without one.
     pub ext: String,
+    /// The icon view can draw a thumbnail of it (`thumbs::source_for`).
+    pub thumb: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,14 +127,18 @@ pub fn entry_for(path: &Path, name: String) -> Option<Entry> {
         (EntryKind::File, meta)
     };
     let is_dir = shown.is_dir();
+    let ext = if is_dir { String::new() } else { ext_of(path) };
+    let size = if is_dir { 0 } else { shown.len() };
     Some(Entry {
-        ext: if is_dir { String::new() } else { ext_of(path) },
+        thumb: !is_dir && crate::thumbs::source_for(&ext, size).is_some(),
+        ext,
         path: path.to_string_lossy().into_owned(),
         name,
         kind,
         is_dir,
-        size: if is_dir { 0 } else { shown.len() },
+        size,
         modified: unix_secs(&shown),
+        created: shown.created().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()),
         hidden,
     })
 }
@@ -167,6 +175,12 @@ pub enum PreviewKind {
     Audio,
     Pdf,
     Text,
+    /// Text the window renders (headings, lists, tables).
+    Markdown,
+    /// Text the window formats when it parses.
+    Json,
+    /// A 3D model the window draws (STL, 3MF, OBJ).
+    Model,
     Other,
 }
 
@@ -174,8 +188,12 @@ const IMAGE: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico
 // Only containers the webviews play; others open in the default app.
 const VIDEO: &[&str] = &["mp4", "m4v", "mov", "webm"];
 const AUDIO: &[&str] = &["mp3", "m4a", "aac", "wav", "ogg", "oga", "opus", "flac", "aif", "aiff"];
+const MARKDOWN: &[&str] = &["md", "markdown", "mdown", "mkd"];
+// Strict JSON only: `.jsonc` keeps its comments as written (plain text).
+const JSON: &[&str] = &["json", "geojson", "webmanifest"];
+const MODEL: &[&str] = &["stl", "3mf", "obj"];
 const TEXT: &[&str] = &[
-    "txt", "md", "markdown", "rst", "json", "jsonc", "yaml", "yml", "toml", "ini", "cfg", "conf", "env", "csv",
+    "txt", "rst", "jsonc", "yaml", "yml", "toml", "ini", "cfg", "conf", "env", "csv",
     "tsv", "log", "xml", "html", "htm", "css", "scss", "js", "mjs", "cjs", "ts", "tsx", "jsx", "rs", "py", "rb",
     "go", "java", "kt", "swift", "c", "h", "cpp", "hpp", "cc", "cs", "php", "sh", "bash", "zsh", "fish", "sql",
     "lua", "r", "dart", "vue", "svelte", "gradle", "properties", "lock", "plist", "srt", "vtt", "tex", "diff",
@@ -198,6 +216,12 @@ pub fn classify(path: &Path) -> PreviewKind {
         PreviewKind::Audio
     } else if ext == "pdf" {
         PreviewKind::Pdf
+    } else if MARKDOWN.contains(&ext) {
+        PreviewKind::Markdown
+    } else if JSON.contains(&ext) {
+        PreviewKind::Json
+    } else if MODEL.contains(&ext) {
+        PreviewKind::Model
     } else if TEXT.contains(&ext) || looks_like_text(path) {
         PreviewKind::Text
     } else {
@@ -222,22 +246,50 @@ fn looks_like_text(path: &Path) -> bool {
     }
 }
 
+/// What a text preview reads when the window names no budget.
+pub const TEXT_PREVIEW_BYTES: usize = 256 * 1024;
+/// The most a text preview ever reads, whatever the window asks (Quick
+/// Look's largest setting).
+pub const TEXT_MAX_BYTES: usize = 100 << 20;
+
+/// The bytes a text preview reads: the window's budget (a Markdown or JSON
+/// file within the preview's size limit is read whole), else the default.
+pub fn text_budget(max: Option<u64>) -> usize {
+    match max {
+        None => TEXT_PREVIEW_BYTES,
+        Some(n) => n.clamp(1, TEXT_MAX_BYTES as u64) as usize,
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TextPreview {
     pub text: String,
     pub truncated: bool,
+    /// Binary data follows: the text stops before it.
+    pub binary: bool,
     /// Size of the whole file.
     pub bytes: u64,
 }
 
-/// The first `max` bytes as text, cut back to a character boundary.
+/// The first `max` bytes as text, cut back to a character boundary. Text
+/// never holds a NUL byte: from the first one on, the file is binary data
+/// (an installer's payload after its script), which is left out. Laid out as
+/// text, that garbage froze the preview for over a second.
 pub fn read_text(path: &Path, max: usize) -> io::Result<TextPreview> {
     let file = fs::File::open(path)?;
     let bytes = file.metadata()?.len();
     let mut buf = Vec::with_capacity(max.min(bytes as usize));
     file.take(max as u64).read_to_end(&mut buf)?;
-    let truncated = (buf.len() as u64) < bytes;
-    let text = match String::from_utf8(buf) {
+    let mut truncated = (buf.len() as u64) < bytes;
+    let binary = match buf.iter().position(|&b| b == 0) {
+        Some(nul) => {
+            buf.truncate(nul);
+            truncated = true;
+            true
+        }
+        None => false,
+    };
+    let mut text = match String::from_utf8(buf) {
         Ok(text) => text,
         Err(e) => {
             let (valid, cut_at_end) = (e.utf8_error().valid_up_to(), e.utf8_error().error_len().is_none());
@@ -248,7 +300,24 @@ pub fn read_text(path: &Path, max: usize) -> io::Result<TextPreview> {
             String::from_utf8_lossy(&raw).into_owned()
         }
     };
-    Ok(TextPreview { text, truncated, bytes })
+    if binary {
+        drop_garbage_tail(&mut text);
+    }
+    Ok(TextPreview { text, truncated, binary, bytes })
+}
+
+/// Drops the last lines while they hold a replacement or control character:
+/// binary data seldom starts with its NUL byte, so some of it comes before.
+fn drop_garbage_tail(text: &mut String) {
+    let garbage = |c: char| c == '\u{FFFD}' || (c.is_control() && !matches!(c, '\n' | '\r' | '\t' | '\u{c}' | '\u{1b}'));
+    loop {
+        let body = text.strip_suffix('\n').unwrap_or(text);
+        let start = body.rfind('\n').map_or(0, |i| i + 1);
+        if start == text.len() || !body[start..].chars().any(garbage) {
+            break;
+        }
+        text.truncate(start);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -331,32 +400,36 @@ pub fn search(
     out
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct Place {
-    pub label: String,
-    pub path: String,
-    /// Icon id for the frontend: drive, home, desktop, documents, downloads, computer.
-    pub icon: &'static str,
-}
-
-/// Sidebar places: the git-drive mount first, then home folders that exist,
-/// then the root.
-pub fn places(home: &Path, drive: Option<&Path>) -> Vec<Place> {
-    let place = |label: &str, path: &Path, icon| Place { label: label.to_string(), path: path.to_string_lossy().into_owned(), icon };
-    let mut out = Vec::new();
-    if let Some(drive) = drive.filter(|d| d.is_dir()) {
-        let label = drive.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Drive".into());
-        out.push(place(&label, drive, "drive"));
+/// A path typed in the location field: `~` (alone or before a slash) is the
+/// home folder, a relative path starts at `base` (the folder in view), `.`
+/// and `..` resolve by name (the folder above a link is the link's own) and
+/// trailing slashes go. Returns the path and whether it is a folder (a link
+/// to one counts); an error says what is not there.
+pub fn resolve_typed(input: &str, home: &Path, base: &Path) -> Result<(PathBuf, bool), String> {
+    let typed = input.trim();
+    if typed.is_empty() {
+        return Err(t!("fsmodel.type_a_path"));
     }
-    out.push(place("Home", home, "home"));
-    for (dir, icon) in [("Desktop", "desktop"), ("Documents", "documents"), ("Downloads", "downloads")] {
-        let path = home.join(dir);
-        if path.is_dir() {
-            out.push(place(dir, &path, icon));
+    let expanded = match typed.strip_prefix('~') {
+        Some("") => home.to_path_buf(),
+        Some(rest) if rest.starts_with('/') => home.join(rest.trim_start_matches('/')),
+        _ => base.join(typed),
+    };
+    let mut path = PathBuf::from("/");
+    for part in expanded.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                path.pop();
+            }
+            std::path::Component::Normal(name) => path.push(name),
+            _ => {}
         }
     }
-    out.push(place("Computer", Path::new("/"), "computer"));
-    out
+    match std::fs::metadata(&path) {
+        Ok(meta) => Ok((path, meta.is_dir())),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err(t!("fsmodel.permission_denied", path = path.display())),
+        Err(_) => Err(t!("fsmodel.nothing_at", path = path.display())),
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +474,19 @@ mod tests {
     }
 
     #[test]
+    fn entries_say_whether_the_icon_view_can_draw_a_thumbnail() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("photo.JPG"), "x").unwrap();
+        fs::write(dir.path().join("main.rs"), "x").unwrap();
+        fs::create_dir(dir.path().join("pics.png")).unwrap();
+        let l = list_dir(dir.path(), false).unwrap();
+        let thumb = |name: &str| l.entries.iter().find(|e| e.name == name).unwrap().thumb;
+        assert!(thumb("photo.JPG"));
+        assert!(!thumb("main.rs"));
+        assert!(!thumb("pics.png"), "a folder never has one");
+    }
+
+    #[test]
     fn files_are_classified_for_preview_by_extension_then_content() {
         let dir = tempfile::tempdir().unwrap();
         let text = dir.path().join("notes");
@@ -412,9 +498,25 @@ mod tests {
         assert_eq!(classify(Path::new("song.flac")), PreviewKind::Audio);
         assert_eq!(classify(Path::new("doc.pdf")), PreviewKind::Pdf);
         assert_eq!(classify(Path::new("main.rs")), PreviewKind::Text);
+        assert_eq!(classify(Path::new("README.md")), PreviewKind::Markdown);
+        assert_eq!(classify(Path::new("notes.MARKDOWN")), PreviewKind::Markdown);
+        assert_eq!(classify(Path::new("package.json")), PreviewKind::Json);
+        assert_eq!(classify(Path::new("map.geojson")), PreviewKind::Json);
+        assert_eq!(classify(Path::new("tsconfig.jsonc")), PreviewKind::Text, "comments: shown as written");
+        for model in ["part.stl", "Bracket.STL", "plate.3mf", "chair.obj"] {
+            assert_eq!(classify(Path::new(model)), PreviewKind::Model, "{model}");
+        }
         assert_eq!(classify(&text), PreviewKind::Text, "sniffed");
         assert_eq!(classify(&bin), PreviewKind::Other, "binary content");
         assert_eq!(classify(dir.path()), PreviewKind::Directory);
+    }
+
+    #[test]
+    fn the_text_budget_defaults_and_is_capped() {
+        assert_eq!(text_budget(None), TEXT_PREVIEW_BYTES);
+        assert_eq!(text_budget(Some(1 << 20)), 1 << 20);
+        assert_eq!(text_budget(Some(0)), 1, "at least a byte");
+        assert_eq!(text_budget(Some(u64::MAX)), TEXT_MAX_BYTES, "never past the cap");
     }
 
     #[test]
@@ -427,6 +529,43 @@ mod tests {
         let cut = read_text(&path, 8).unwrap(); // byte 8 falls inside an 'é'
         assert!(cut.truncated);
         assert_eq!(cut.text, "aéaé".to_string() + "a", "{:?}", cut.text);
+    }
+
+    #[test]
+    fn binary_data_after_a_text_header_is_left_out() {
+        // A self-extracting installer (Miniforge3.sh): a script, then a binary
+        // payload whose garbage froze the preview's layout for over a second.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("installer.sh");
+        let header = "#!/bin/sh\necho installing\n@@END_HEADER@@\n";
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.extend([0x9c, 0xff, b'\n', 0x41, 0x8f, 0x01, 0x00, 0x02, 0xfe, b'\n', 0x00, 0x7f]);
+        fs::write(&path, &bytes).unwrap();
+        let preview = read_text(&path, 1024).unwrap();
+        assert_eq!(preview.text, header, "only the script, without the garbage lines before the first NUL");
+        assert!(preview.binary && preview.truncated);
+        assert_eq!(preview.bytes, bytes.len() as u64);
+    }
+
+    #[test]
+    fn a_file_of_binary_data_previews_no_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.txt");
+        fs::write(&path, [0x00, 0x13, 0xff, 0x00, b'a']).unwrap();
+        let preview = read_text(&path, 1024).unwrap();
+        assert_eq!(preview.text, "");
+        assert!(preview.binary);
+    }
+
+    #[test]
+    fn a_stray_invalid_byte_stays_a_replacement_character() {
+        // Latin-1 text: one bad byte must not hide the rest of the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("latin1.csv");
+        fs::write(&path, b"caf\xe9 com leite\nsegunda linha\n").unwrap();
+        let preview = read_text(&path, 1024).unwrap();
+        assert_eq!(preview.text, "caf\u{FFFD} com leite\nsegunda linha\n");
+        assert!(!preview.binary && !preview.truncated);
     }
 
     #[test]
@@ -480,16 +619,19 @@ mod tests {
     }
 
     #[test]
-    fn places_list_existing_standard_folders_and_the_drive() {
-        let home = tempfile::tempdir().unwrap();
-        fs::create_dir(home.path().join("Documents")).unwrap();
-        fs::create_dir(home.path().join("Downloads")).unwrap();
-        let drive = home.path().join("GitDrive");
-        fs::create_dir(&drive).unwrap();
-        let p = places(home.path(), Some(&drive));
-        let labels: Vec<&str> = p.iter().map(|p| p.label.as_str()).collect();
-        assert_eq!(labels, vec!["GitDrive", "Home", "Documents", "Downloads", "Computer"], "missing folders are left out");
-        assert_eq!(p[0].icon, "drive");
-        assert_eq!(p.last().unwrap().path, "/");
+    fn typed_paths_resolve_like_a_shell_would() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(home.join("Documents/Work")).unwrap();
+        fs::write(home.join("Documents/notes.md"), "n").unwrap();
+        let docs = home.join("Documents");
+        assert_eq!(resolve_typed("~", &home, Path::new("/")).unwrap(), (home.clone(), true));
+        assert_eq!(resolve_typed(" ~/Documents/ ", &home, Path::new("/")).unwrap(), (docs.clone(), true));
+        assert_eq!(resolve_typed("Work", &home, &docs).unwrap(), (docs.join("Work"), true), "relative to the folder in view");
+        assert_eq!(resolve_typed("../Documents/./notes.md", &home, &docs).unwrap(), (docs.join("notes.md"), false));
+        assert_eq!(resolve_typed(&format!("{}//Work", docs.display()), &home, Path::new("/")).unwrap(), (docs.join("Work"), true));
+        assert!(resolve_typed("~/Nope", &home, Path::new("/")).unwrap_err().contains("no folder or file"));
+        assert!(resolve_typed("   ", &home, Path::new("/")).is_err());
+        assert_eq!(resolve_typed("~user", &home, &docs).unwrap_err(), format!("There is no folder or file at {}.", docs.join("~user").display()), "only ~ and ~/ are the home");
     }
 }

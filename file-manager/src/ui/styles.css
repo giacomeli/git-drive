@@ -9,13 +9,15 @@
   --color-ink: #eceefb;
   --color-muted: #a3a8cc;
   --color-dim: #8186ab;
-  --color-line: rgb(255 255 255 / 0.09);
+  --color-line: rgb(var(--fg-rgb) / 0.09);
 
   --color-orchid: #c86bf0;
   --color-cyan: #3fd0f0;
   --color-mint: #46e3a4;
   --color-amber: #ffb547;
   --color-coral: #ff5c7a;
+  /* White that stays white in both themes: text and marks on the accent. */
+  --color-paper: #ffffff;
 }
 
 :root {
@@ -40,6 +42,44 @@
   --s2-rgb: 91 140 255;
   --hero: linear-gradient(135deg, var(--a1) 0%, var(--a2) 46%, var(--a3) 100%);
   --accent: linear-gradient(135deg, var(--a1) 0%, var(--a3) 100%);
+  /* What overlays, edges and hovers are drawn with (white on the dark theme). */
+  --fg-rgb: 255 255 255;
+  --panel: rgb(26 28 60 / 0.94);
+  --panel-solid: #22254d;
+  --field-bg: rgb(10 12 36 / 0.35);
+  --field-strong: rgb(8 10 30 / 0.85);
+  --danger-text: #ff9db0;
+  --orb-opacity: 0.55;
+}
+
+/* The light theme (git-drive Files): the same glass, cards and accent over a
+   pale surface. White overlays turn into ink ones by redefining Tailwind's
+   white (bg-white/8, ring-white/10, ...); white that must stay white is
+   "paper". */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --color-ink: #1c1f3d;
+  --color-muted: #4f5479;
+  --color-dim: #73789c;
+  --color-line: rgb(26 28 63 / 0.1);
+  --color-white: #1a1c3f;
+  --color-mint: #12a86e;
+  --color-amber: #d98a07;
+  --color-coral: #e0365c;
+  --fg-rgb: 26 28 63;
+  --bg-0: #e4e7f5;
+  --bg-1: #eef0fa;
+  --bg-2: #f9faff;
+  --glass: rgb(255 255 255 / 0.55);
+  --glass-strong: rgb(255 255 255 / 0.74);
+  --glass-border: rgb(26 28 63 / 0.09);
+  --shadow: 0 24px 60px -28px rgb(60 64 120 / 0.3), 0 2px 10px -2px rgb(60 64 120 / 0.12);
+  --panel: rgb(252 252 255 / 0.97);
+  --panel-solid: #ffffff;
+  --field-bg: rgb(255 255 255 / 0.75);
+  --field-strong: #ffffff;
+  --danger-text: #c42850;
+  --orb-opacity: 0.32;
 }
 
 html,
@@ -72,9 +112,25 @@ body {
     linear-gradient(160deg, var(--bg-2) 0%, var(--bg-1) 45%, var(--bg-0) 100%);
 }
 
+[data-theme="light"] .surface {
+  background:
+    radial-gradient(60rem 40rem at -10% -20%, rgb(var(--a1-rgb) / 0.2), transparent 60%),
+    radial-gradient(50rem 36rem at 110% 115%, rgb(var(--a3-rgb) / 0.16), transparent 60%),
+    radial-gradient(40rem 30rem at 70% 10%, rgb(var(--s1-rgb) / 0.1), transparent 65%),
+    linear-gradient(160deg, var(--bg-2) 0%, var(--bg-1) 45%, var(--bg-0) 100%);
+}
+
+[data-theme="light"].glass-native .surface,
+[data-theme="light"] .glass-native .surface {
+  background:
+    radial-gradient(60rem 40rem at -10% -20%, rgb(var(--a1-rgb) / 0.12), transparent 60%),
+    radial-gradient(50rem 36rem at 110% 115%, rgb(var(--a3-rgb) / 0.1), transparent 60%),
+    linear-gradient(160deg, rgb(250 251 255 / 0.4) 0%, rgb(232 235 250 / 0.55) 100%);
+}
+
 .platform-linux .surface {
   border-radius: 14px;
-  border: 1px solid rgb(255 255 255 / 0.08);
+  border: 1px solid rgb(var(--fg-rgb) / 0.08);
 }
 
 .glass-native .surface {
@@ -93,7 +149,7 @@ body {
   position: absolute;
   border-radius: 9999px;
   filter: blur(70px);
-  opacity: 0.55;
+  opacity: var(--orb-opacity);
   pointer-events: none;
 }
 
@@ -164,19 +220,19 @@ body {
   }
 
   .btn-ghost {
-    background: rgb(255 255 255 / 0.07);
-    border: 1px solid rgb(255 255 255 / 0.1);
+    background: rgb(var(--fg-rgb) / 0.07);
+    border: 1px solid rgb(var(--fg-rgb) / 0.1);
     color: var(--color-ink);
   }
 
   .btn-ghost:hover:not(:disabled) {
-    background: rgb(255 255 255 / 0.12);
+    background: rgb(var(--fg-rgb) / 0.12);
   }
 
   .btn-danger {
     background: rgb(255 92 122 / 0.14);
     border: 1px solid rgb(255 92 122 / 0.3);
-    color: #ff9db0;
+    color: var(--danger-text);
   }
 
   .btn-danger:hover:not(:disabled) {
@@ -188,8 +244,8 @@ body {
     height: 2.5rem;
     padding: 0 0.9rem;
     border-radius: 12px;
-    background: rgb(10 12 36 / 0.35);
-    border: 1px solid rgb(255 255 255 / 0.1);
+    background: var(--field-bg);
+    border: 1px solid rgb(var(--fg-rgb) / 0.1);
     color: var(--color-ink);
     font-size: 0.8125rem;
     outline: none;
@@ -217,7 +273,7 @@ body {
   }
 
   select.field option {
-    background: #22254d;
+    background: var(--panel-solid);
     color: var(--color-ink);
   }
 
@@ -231,8 +287,8 @@ body {
     font-size: 0.75rem;
     font-weight: 500;
     color: var(--color-muted);
-    background: rgb(255 255 255 / 0.05);
-    border: 1px solid rgb(255 255 255 / 0.08);
+    background: rgb(var(--fg-rgb) / 0.05);
+    border: 1px solid rgb(var(--fg-rgb) / 0.08);
     transition: all 140ms ease;
     white-space: nowrap;
     cursor: default;
@@ -240,11 +296,11 @@ body {
 
   .chip:hover {
     color: var(--color-ink);
-    background: rgb(255 255 255 / 0.09);
+    background: rgb(var(--fg-rgb) / 0.09);
   }
 
   .chip.on {
-    color: white;
+    color: var(--color-ink);
     background: rgb(var(--a1-rgb) / 0.28);
     border-color: rgb(var(--a1-rgb) / 0.55);
   }
@@ -260,7 +316,7 @@ body {
   .scroll {
     overflow-y: auto;
     scrollbar-width: thin;
-    scrollbar-color: rgb(255 255 255 / 0.15) transparent;
+    scrollbar-color: rgb(var(--fg-rgb) / 0.15) transparent;
   }
 
   .scroll::-webkit-scrollbar {
@@ -269,7 +325,7 @@ body {
   }
 
   .scroll::-webkit-scrollbar-thumb {
-    background: rgb(255 255 255 / 0.14);
+    background: rgb(var(--fg-rgb) / 0.14);
     border-radius: 9999px;
     border: 2px solid transparent;
     background-clip: padding-box;

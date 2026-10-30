@@ -91,7 +91,7 @@ export function Toggle({
       }}
     >
       <span
-        className="absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-all duration-200"
+        className="absolute top-0.5 h-5 w-5 rounded-full bg-paper shadow transition-all duration-200"
         style={{ left: checked ? "1.375rem" : "0.125rem" }}
       />
     </button>
@@ -118,7 +118,7 @@ export function Segmented<T extends string>({
           type="button"
           onClick={() => onChange(opt)}
           className={`rounded-full px-2.5 py-1 text-[0.68rem] font-medium capitalize transition-all ${
-            opt === value ? "text-white shadow" : "text-dim hover:text-muted"
+            opt === value ? "text-paper shadow" : "text-dim hover:text-muted"
           }`}
           style={opt === value ? { background: "var(--accent)" } : undefined}
         >

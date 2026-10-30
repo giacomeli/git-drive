@@ -1,0 +1,32 @@
+{
+  "files.computer": "Computer",
+  "files.trash": "Trash",
+  "files.pathCopied": "Path copied.",
+  "files.pathsCopied": "{count} paths copied.",
+  "files.alwaysOpenExt": ".{ext} files open with {app} from now on.",
+  "files.alwaysOpenAny": "Files like this open with {app} from now on.",
+  "files.desktopPicture": "\"{name}\" is the desktop picture now.",
+  "files.closePane": "Close this pane",
+  "files.trashEmpty": "The Trash is empty",
+  "files.emptyFolder": "Empty folder",
+  "files.searching": "Searching",
+  "files.nothingNamed": "Nothing named like \"{query}\" in {folder}",
+  "files.computerFooter": "{folders}, {disks}",
+  "files.disks": {
+    "one": "{count} disk",
+    "other": "{count} disks"
+  },
+  "files.trashAsFinder": "The Trash, as Finder keeps it",
+  "files.searchingIn": "Searching {folder}: {count} found so far",
+  "files.results": {
+    "one": "{count} result in {folder}",
+    "other": "{count} results in {folder}"
+  },
+  "files.resultsMore": "{count}+ results in {folder}",
+  "files.selectedOf": "{selected} of {count} selected",
+  "files.hiddenShown": "Hidden files shown",
+  "files.hideTerminal": "Hide terminal",
+  "files.showTerminal": "Show terminal",
+  "files.terminalTitleHide": "Hide terminal ({keys})",
+  "files.terminalTitleShow": "Show terminal ({keys})"
+}
